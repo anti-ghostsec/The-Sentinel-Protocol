@@ -1,0 +1,55 @@
+[package]
+name = "sentinel-app"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "sentinel_app_lib"
+path = "src/lib.rs"
+# Android loads the app as a library.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "Sentinel"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# Automated tests only: keep the browser engine's debugging switches.
+# Never used for builds people get (scripts/build-release.ps1 doesn't).
+test-hooks = []
+
+[dependencies]
+tauri = { version = "2", features = ["image-png"] }
+vodozemac.workspace = true
+serde = { workspace = true }
+serde_json = "1"
+sentinel-core.workspace = true
+sentinel-net.workspace = true
+pillar = { path = "../pillar" }
+arti-client.workspace = true
+tokio = { workspace = true, features = ["process", "io-std"] }
+anyhow.workspace = true
+ed25519-dalek.workspace = true
+blake3.workspace = true
+chacha20poly1305.workspace = true
+zeroize.workspace = true
+ciborium.workspace = true
+futures.workspace = true
+data-encoding.workspace = true
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_ErrorReporting", "Win32_System_Diagnostics_Debug", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_UI_WindowsAndMessaging", "Win32_Storage_FileSystem", "Win32_System_Registry"] }
+webview2-com = "0.39"
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+
+# Linux, macOS and phones: the system's own file pickers and clipboard (on
+# Windows, Sentinel uses its own trace-free versions).
+[target.'cfg(not(windows))'.dependencies]
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"

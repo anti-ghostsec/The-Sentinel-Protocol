@@ -1,0 +1,10 @@
+/target
+/dist
+/vendor/ffmpeg/linux64/ffmpeg
+/vendor/ffmpeg/linux64/ffprobe
+/vendor/ffmpeg/linux64/LICENSE.txt
+# FFmpeg programs are fetched by scripts/get-ffmpeg.ps1 (too big for GitHub);
+# only their fingerprints (SHA256SUMS.txt) and license are kept.
+/vendor/ffmpeg/win64/*.dll
+/vendor/ffmpeg/win64/*.exe
+/apps/*/target

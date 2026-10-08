@@ -1,0 +1,4 @@
+# arti 0.47 requires Rust >= 1.92. Pinned per-project so the global toolchain is untouched.
+[toolchain]
+channel = "1.92.0"
+profile = "minimal"

@@ -1,0 +1,17 @@
+{
+  "bundle": {
+    "targets": [
+      "deb",
+      "appimage"
+    ],
+    "resources": {
+      "../../vendor/ffmpeg/win64/*": null,
+      "../../vendor/ffmpeg/linux64/*": "ffmpeg/"
+    },
+    "linux": {
+      "deb": {
+        "depends": []
+      }
+    }
+  }
+}

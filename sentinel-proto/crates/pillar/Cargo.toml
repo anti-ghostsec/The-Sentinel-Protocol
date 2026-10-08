@@ -1,0 +1,31 @@
+[package]
+name = "pillar"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+sentinel-core.workspace = true
+sentinel-net.workspace = true
+arti-client.workspace = true
+tor-hsservice.workspace = true
+tor-cell.workspace = true
+tor-proto.workspace = true
+safelog.workspace = true
+tokio.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+data-encoding.workspace = true
+tor-rtcompat = "0.47"
+blake3.workspace = true
+serde.workspace = true
+serde_json = "1"
+
+[features]
+# Test builds only: a sped-up clock for live earning tests
+# (SENTINEL_TEST_DAY_SECS) and --check-credits. Never in releases.
+test-hooks = []

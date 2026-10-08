@@ -1,0 +1,791 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>The Sentinel Protocol</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<!-- WELCOME -->
+<section id="welcome" class="screen center" hidden>
+  <div class="narrow stack-28">
+    <div class="brand"><span class="icon logo" data-icon="logo"></span><span class="wordmark">The Sentinel Protocol</span></div>
+    <div class="stack-10">
+      <h1 class="display">Say what you think.<br>Nobody needs to know where you are.</h1>
+      <p class="muted lead">No phone number, no email. Your account lives on this device.</p>
+    </div>
+    <div class="stack-10" role="radiogroup" aria-label="Connection">
+      <span class="label">How should Sentinel connect?</span>
+      <button type="button" class="choice" data-mode="tor" role="radio">
+        <span class="choice-text"><span class="choice-title">Standard</span><span class="muted">Private by default. Every connection goes through Tor.</span></span>
+        <span class="radio"></span>
+      </button>
+      <button type="button" class="choice" data-mode="bridges" role="radio">
+        <span class="choice-text"><span class="choice-title">Restricted network</span><span class="muted">Tor is blocked or risky where you are. Your connection is disguised as an ordinary video call.</span></span>
+        <span class="radio"></span>
+      </button>
+    </div>
+    <button type="button" id="welcome-continue" class="btn primary block">Continue</button>
+    <div class="already stack-4">
+      <span class="muted small">Already use Sentinel?</span>
+      <button type="button" id="welcome-link" class="link-btn">Use my account from another device</button>
+      <button type="button" id="welcome-recover" class="link-btn">Recover it with my recovery words</button>
+      <button type="button" id="welcome-restore" class="link-btn">Restore it from a backup file</button>
+    </div>
+    <p id="restore-msg" class="small muted" role="status"></p>
+    <span class="mono note"><span class="icon" data-icon="lock"></span>Nothing has been sent over the network yet.</span>
+  </div>
+</section>
+
+<!-- CREATE ACCOUNT -->
+<section id="account" class="screen center" hidden>
+  <form id="account-form" class="narrow stack-24" autocomplete="off">
+    <button type="button" id="account-back" class="btn ghost back"><span class="icon" data-icon="back"></span>Back</button>
+    <div class="stack-8">
+      <h1 id="account-title" class="title">Create your account</h1>
+      <p id="account-sub" class="muted">Pick any name. It doesn't have to be your real one.</p>
+    </div>
+    <label id="account-recover-row" class="field" hidden>
+      <span class="label">Your 21 recovery words</span>
+      <textarea id="account-recover-words" rows="4" class="bio-input mono-input" autocomplete="off" spellcheck="false" placeholder="word word word …"></textarea>
+      <span class="hint">Your account comes back with the same identity, so people who follow you keep following you. Your posts and messages on the lost device don't come back (a backup does that).</span>
+    </label>
+    <label class="field">
+      <span class="label">Display name</span>
+      <input id="account-name" type="text" autocomplete="off" maxlength="40" placeholder="e.g. Nightjar" spellcheck="false">
+    </label>
+    <label class="field">
+      <span class="label">Passphrase</span>
+      <div class="pass-row">
+        <input id="account-pass" type="password" autocomplete="off" placeholder="At least 12 characters" spellcheck="false">
+        <button type="button" id="account-generate" class="btn outline small-btn">Generate</button>
+      </div>
+      <div class="strength" aria-hidden="true"><span id="account-strength-bar"></span></div>
+      <span id="account-strength" class="hint">Use 7 random words (press Generate). Anyone who seizes this device can try to guess it offline.</span>
+      <span class="hint">It never leaves this device and can't be reset. Write it down on paper and keep it somewhere safe.</span>
+    </label>
+    <div id="account-words" class="words-box stack-8" hidden>
+      <span class="label">Write these words down, in order</span>
+      <ol id="account-word-list" class="word-list"></ol>
+      <label class="check"><input id="account-wrote" type="checkbox"> I've written these words down somewhere safe</label>
+    </div>
+    <details class="advanced-inline">
+      <summary class="muted small">Also require a key file (optional)</summary>
+      <div class="stack-8">
+        <span class="hint">A key file is any file you choose, like a photo, or a new random one. Unlocking then needs your passphrase <b>and</b> that exact file, so someone who seizes this device can't guess their way in without it. Keep it somewhere else (a USB stick, or among many other photos), never edit it, and keep a copy: without it, your account can't be opened. Nothing on this device says a key file is used.</span>
+        <div class="inline-actions">
+          <button type="button" id="account-keyfile" class="btn outline small-btn">Choose a file</button>
+          <button type="button" id="account-keyfile-new" class="btn ghost small-btn">Make a new one</button>
+          <span id="account-keyfile-name" class="muted small"></span>
+        </div>
+      </div>
+    </details>
+    <p id="account-error" class="error" role="alert" hidden></p>
+    <button type="submit" id="account-create" class="btn primary block" disabled>Create account</button>
+  </form>
+</section>
+
+<!-- HOST A PILLAR (signup step) -->
+<section id="host" class="screen center" hidden>
+  <div class="narrow stack-24">
+    <div class="stack-8">
+      <h1 class="title">Help keep Sentinel running?</h1>
+      <p class="muted">Sentinel has no company servers. It runs on Pillars hosted by people like you. You can run one from this app while it's open.</p>
+    </div>
+    <div class="warning stack-10" role="note">
+      <span class="warning-title"><span class="icon sm" data-icon="alert"></span>Read this before turning it on</span>
+      <ul class="warn-list">
+        <li>Your Pillar keeps other people's public posts and sealed messages (which nobody can read, not even you) and passes them along over Tor.</li>
+        <li>Your IP address and location stay hidden: Pillars can only be reached through Tor.</li>
+        <li>Someone watching very closely could notice your Pillar goes offline when you do.</li>
+        <li>If your computer is taken, it will show that you ran a Pillar.</li>
+        <li><b>Only do this where it's legal and safe</b> to use Tor and keep other people's content. If you're not sure, choose "Not now".</li>
+        <li>Uses up to 2 GB of disk. Old data is deleted after 60 days.</li>
+      </ul>
+    </div>
+    <div class="stack-10">
+      <button type="button" id="host-no" class="btn primary block">Not now</button>
+      <button type="button" id="host-yes" class="btn outline block">I understand, run a Pillar</button>
+      <span class="hint">You can change this any time in Privacy → Help run Sentinel, where you can also lend disk space as an Archive.</span>
+    </div>
+  </div>
+</section>
+
+<!-- DISGUISE: a working calculator; the person's code then = opens the unlock screen -->
+<section id="disguise" class="screen center" hidden>
+  <div class="calc" role="application" aria-label="Calculator">
+    <div id="calc-display" class="calc-display" aria-live="polite">0</div>
+    <div class="calc-keys">
+      <button type="button" data-k="C" class="calc-fn">C</button><button type="button" data-k="neg" class="calc-fn">±</button><button type="button" data-k="%" class="calc-fn">%</button><button type="button" data-k="/" class="calc-op">÷</button>
+      <button type="button" data-k="7">7</button><button type="button" data-k="8">8</button><button type="button" data-k="9">9</button><button type="button" data-k="*" class="calc-op">×</button>
+      <button type="button" data-k="4">4</button><button type="button" data-k="5">5</button><button type="button" data-k="6">6</button><button type="button" data-k="-" class="calc-op">−</button>
+      <button type="button" data-k="1">1</button><button type="button" data-k="2">2</button><button type="button" data-k="3">3</button><button type="button" data-k="+" class="calc-op">+</button>
+      <button type="button" data-k="0" class="calc-wide">0</button><button type="button" data-k=".">.</button><button type="button" data-k="=" class="calc-eq">=</button>
+    </div>
+  </div>
+</section>
+
+<!-- UNLOCK -->
+<section id="unlock" class="screen center" hidden>
+  <form id="unlock-form" class="narrow stack-24" autocomplete="off">
+    <div class="brand"><span class="icon logo" data-icon="logo"></span><span class="wordmark">The Sentinel Protocol</span></div>
+    <div class="stack-8">
+      <h1 class="title">Welcome back</h1>
+      <p class="muted">Enter your passphrase to unlock this device.</p>
+    </div>
+    <label class="field">
+      <span class="label">Passphrase</span>
+      <input id="unlock-pass" type="password" autocomplete="off" autofocus>
+    </label>
+    <div class="inline-actions">
+      <button type="button" id="unlock-keyfile" class="link-btn small">Use a key file</button>
+      <span id="unlock-keyfile-name" class="muted small"></span>
+    </div>
+    <p id="unlock-error" class="error" role="alert" hidden></p>
+    <button type="submit" class="btn primary block">Unlock</button>
+  </form>
+</section>
+
+<!-- LINK THIS DEVICE TO AN ACCOUNT -->
+<section id="linkdev" class="screen center" hidden>
+  <form id="linkdev-form" class="narrow stack-24" autocomplete="off">
+    <button type="button" id="linkdev-back" class="btn ghost back"><span class="icon" data-icon="back"></span>Back</button>
+    <div class="stack-8">
+      <h1 class="title">Use your account here too</h1>
+      <p class="muted">On your other device, open Settings → Safety → Your devices → <b>Link a new device</b>, then copy the code it shows into the box below.</p>
+    </div>
+    <label class="field"><span class="label">Link code</span><input id="linkdev-code" type="text" autocomplete="off" class="mono-input" spellcheck="false" placeholder="sentinel://link/…"></label>
+    <label class="field"><span class="label">A name for this device</span><input id="linkdev-name" type="text" autocomplete="off" maxlength="40" placeholder="e.g. Phone, Laptop"></label>
+    <label class="field">
+      <span class="label">A passphrase for this device</span>
+      <div class="pass-row"><input id="linkdev-pass" type="password" autocomplete="off" placeholder="At least 12 characters" spellcheck="false"><button type="button" id="linkdev-generate" class="btn outline small-btn">Generate</button></div>
+      <span class="hint">Each device has its own passphrase. Write it down.</span>
+    </label>
+    <p id="linkdev-error" class="error" role="alert" hidden></p>
+    <button type="submit" class="btn primary block">Continue</button>
+  </form>
+</section>
+
+<section id="linkwait" class="screen center" hidden>
+  <div class="narrow stack-24">
+    <div class="stack-8">
+      <h1 class="title">Almost there</h1>
+      <p class="muted">On your other device, a request from this device appears under Settings → Safety → Your devices. Check that it shows this code, then press <b>Allow</b> there.</p>
+    </div>
+    <p id="linkwait-code" class="check-code mono">····-····</p>
+    <p class="muted small" id="linkwait-state">Connecting through Tor…</p>
+    <button type="button" id="linkwait-cancel" class="btn ghost block">Cancel</button>
+  </div>
+</section>
+
+<!-- CONNECTING -->
+<section id="connecting" class="screen center" hidden>
+  <div class="narrow-sm stack-28">
+    <div class="stack-8">
+      <h1 class="title">Connecting privately</h1>
+      <p class="muted">Usually under a minute the first time, a few seconds after that.</p>
+    </div>
+    <div class="progress" aria-hidden="true"><span id="connect-bar"></span></div>
+    <p id="connect-text" class="mono note" role="status">Starting Tor on this device</p>
+    <p id="connect-detail" class="muted small mono"></p>
+    <button type="button" id="connect-retry" class="btn primary block" hidden>Try again</button>
+    <div id="connect-help" class="stack-8" hidden>
+      <p class="small">Sentinel can't reach the network's starting Pillars right now. It keeps trying by itself. If someone you trust runs a Pillar, you can paste its address here and Sentinel will try it first.</p>
+      <form id="connect-pillar-form" class="inline-form">
+        <label class="sr-only" for="connect-pillar">Pillar address</label>
+        <input id="connect-pillar" type="text" autocomplete="off" class="mono-input" placeholder="xxxxxxxx….onion" spellcheck="false">
+        <button type="submit" class="btn outline">Try it</button>
+      </form>
+      <p id="connect-pillar-msg" class="small muted" role="status"></p>
+    </div>
+    <details id="connect-log-box" class="stack-8">
+      <summary class="small muted">Connection log (for whoever is helping you)</summary>
+      <p class="small muted">What Tor and Sentinel did while connecting. It stays on this device until you copy it. It doesn't contain your account, messages or IP address, but share it only with someone you trust.</p>
+      <pre id="connect-log" class="connect-log"></pre>
+      <button type="button" id="connect-log-copy" class="btn outline small-btn">Copy the log</button>
+    </details>
+  </div>
+</section>
+
+<!-- APP -->
+<section id="app" class="screen" hidden>
+  <div class="shell">
+    <nav class="nav" aria-label="Main">
+      <div class="brand nav-brand"><span class="icon logo" data-icon="logo"></span><span class="wordmark small">The Sentinel Protocol</span></div>
+      <button type="button" class="nav-item" data-tab="home"><span class="icon lg" data-icon="home"></span>Home</button>
+      <button type="button" class="nav-item" data-tab="discover"><span class="icon lg" data-icon="compass"></span>Discover</button>
+      <button type="button" class="nav-item" data-tab="messages"><span class="icon lg" data-icon="mail"></span>Messages</button>
+      <button type="button" class="nav-item" data-tab="rooms"><span class="icon lg" data-icon="hash"></span>Rooms</button>
+      <button type="button" class="nav-item" data-tab="profile"><span class="icon lg" data-icon="user"></span>Profile</button>
+      <button type="button" class="nav-item" data-tab="privacy"><span class="icon lg" data-icon="lock"></span>Settings</button>
+      <div class="me">
+        <span class="avatar me-avatar" id="me-avatar"></span>
+        <span class="me-text"><span class="me-name" id="me-name"></span><span class="muted small" id="me-handle"></span></span>
+        <button type="button" id="lock-btn" class="icon-btn" aria-label="Lock Sentinel" title="Lock"><span class="icon" data-icon="key"></span></button>
+      </div>
+    </nav>
+
+    <main class="main">
+      <!-- HOME -->
+      <div id="tab-home" class="tab">
+        <header class="bar"><h2>Home</h2></header>
+        <div id="getting-started" class="card start-card stack-8" hidden>
+          <div class="row-head"><span class="strong">Getting started</span><button type="button" id="gs-hide" class="link-btn small">Hide</button></div>
+          <ol id="gs-list" class="gs-list"></ol>
+        </div>
+        <form id="compose" class="compose">
+          <span class="avatar me-avatar"></span>
+          <div class="compose-body">
+            <label class="sr-only" for="compose-text">New post</label>
+            <textarea id="compose-text" rows="3" placeholder="What's happening?"></textarea>
+            <div id="compose-media" class="compose-media" hidden></div>
+            <div id="compose-files" class="stack-8" hidden></div>
+            <p id="compose-partial" class="muted small" hidden>Details like place, date and device were removed from this video or audio, but it wasn't fully rebuilt (the video tools aren't part of this copy of Sentinel), so the file's layout may still hint at the kind of phone or app that recorded it.</p>
+            <div class="compose-row">
+              <div class="compose-left">
+                <button type="button" id="compose-attach" class="icon-btn accent" aria-label="Attach photos, video, audio or files" title="Photos, video, audio or any file (up to 4). Metadata is removed where possible. Tip: dragging files onto the window leaves no trace in Windows recent-file lists."><span class="icon" data-icon="image"></span></button>
+                <button type="button" id="compose-discover" class="pill" aria-pressed="false"><span class="icon sm" data-icon="compass"></span><span id="compose-discover-label">People with your link</span></button>
+                <label class="sr-only" for="compose-topics">Topics</label>
+                <input id="compose-topics" type="text" autocomplete="off" class="topic-input" placeholder="topics: robotics, ai/llm" spellcheck="false" hidden>
+              </div>
+              <div class="compose-actions">
+                <span id="compose-count" class="mono count"></span>
+                <button type="submit" id="compose-post" class="btn primary" disabled>Post</button>
+              </div>
+            </div>
+            <p id="compose-error" class="error" role="alert" hidden></p>
+          </div>
+        </form>
+        <div id="feed" aria-live="polite"></div>
+        <div id="feed-empty" class="empty" hidden>
+          <p class="empty-title">Your timeline is quiet</p>
+          <p class="muted">Follow someone with their link, or write your first post. There's no global feed and no algorithm — only people you choose.</p>
+          <p class="muted small">People find you through your follow link. Share it only with people you trust: anyone with it can read your posts.</p>
+          <button type="button" id="empty-copy-link" class="btn outline small-btn">Copy my follow link</button>
+        </div>
+      </div>
+
+      <!-- DISCOVER -->
+      <div id="tab-discover" class="tab" hidden>
+        <header class="bar bar-row"><h2>Discover</h2><button type="button" id="discover-refresh" class="btn outline small-btn">Refresh</button></header>
+        <div class="topics-panel">
+          <p class="muted small">Topics you follow stay on this device. Nobody can see which ones you pick.</p>
+          <div id="topic-starters" class="chips"></div>
+          <div id="topic-chips" class="chips"></div>
+          <form id="topic-form" class="inline-form">
+            <label class="sr-only" for="topic-input">Add a topic</label>
+            <input id="topic-input" type="text" autocomplete="off" class="mono-input" placeholder="add a topic, e.g. robotics or ai/llm" spellcheck="false">
+            <button type="submit" class="btn outline">Add</button>
+          </form>
+          <p id="topic-msg" class="small muted" role="status"></p>
+        </div>
+        <div id="discover-rooms" class="stack-8" hidden></div>
+        <div id="discover-feed" aria-live="polite"></div>
+        <div id="discover-empty" class="empty">
+          <p class="empty-title">Nothing discovered yet</p>
+          <p class="muted">Add topics you care about (or tap one above). Posts and public rooms on those topics show up here, ranked on your device, plus a few random ones so you find things you didn't know to look for. Press Refresh to look now.</p>
+        </div>
+      </div>
+
+      <!-- MESSAGES -->
+      <div id="tab-messages" class="tab" hidden>
+        <header class="bar bar-row">
+          <h2>Messages</h2>
+          <span class="mono small e2e"><span class="icon sm" data-icon="lock"></span>end-to-end encrypted</span>
+        </header>
+        <div id="dm-empty" class="empty">
+          <p class="empty-title">No conversations yet</p>
+          <p class="muted">Follow someone with their link and you can message them here. Messages are end-to-end encrypted, and Pillars can't see who's talking to whom.</p>
+        </div>
+        <div id="conv-list" class="conv-list" role="list"></div>
+        <div id="dm-thread" class="dm-thread" hidden>
+          <div class="thread-head">
+            <button type="button" id="thread-back" class="icon-btn" aria-label="Back to conversations"><span class="icon" data-icon="back"></span></button>
+            <span id="thread-avatar" class="avatar small-av"></span>
+            <span class="stack-2 grow"><span id="thread-name" class="strong"></span><span id="thread-handle" class="muted small"></span></span>
+            <button type="button" id="dm-credits-btn" class="btn ghost small-btn">Send credits</button>
+            <button type="button" id="dm-select-btn" class="btn ghost small-btn">Select</button>
+          </div>
+          <div id="dm-select-bar" class="select-bar" hidden>
+            <span id="dm-select-count" class="muted small grow">Tap messages to select them</span>
+            <button type="button" id="dm-del-sel" class="btn outline small-btn">Delete selected</button>
+            <button type="button" id="dm-del-all" class="btn outline small-btn">Delete all</button>
+            <label class="check small"><input type="checkbox" id="dm-del-theirs"> Also ask their app to delete them</label>
+            <button type="button" id="dm-select-done" class="btn ghost small-btn">Done</button>
+          </div>
+          <div id="thread" class="thread" aria-live="polite"></div>
+          <form id="dm-credits" class="dm-credits" hidden>
+            <label class="muted small" for="dm-credits-n">Send credits (you have <span id="dm-credits-have">0</span>)</label>
+            <input id="dm-credits-n" type="text" inputmode="numeric" autocomplete="off" value="1" maxlength="2">
+            <button type="submit" class="btn primary small-btn">Send</button>
+            <button type="button" id="dm-credits-cancel" class="btn ghost small-btn">Cancel</button>
+          </form>
+          <form id="dm-form" class="dm-compose">
+            <label class="sr-only" for="dm-input">Message</label>
+            <input id="dm-input" type="text" autocomplete="off" placeholder="Write a message" maxlength="4000">
+            <button type="submit" class="send-btn" aria-label="Send"><span class="icon" data-icon="send"></span></button>
+          </form>
+          <p id="dm-error" class="error dm-error" role="alert" hidden></p>
+        </div>
+      </div>
+
+      <!-- ROOMS -->
+      <div id="tab-rooms" class="tab" hidden>
+        <header class="bar bar-row">
+          <h2>Rooms</h2>
+          <span class="mono small e2e"><span class="icon sm" data-icon="lock"></span>end-to-end encrypted</span>
+        </header>
+        <div id="rooms-home">
+          <div class="rooms-actions">
+            <form id="room-create" class="card stack-12">
+              <span class="strong">Create a room</span>
+              <label class="field tight">
+                <span class="muted small">Name</span>
+                <input id="room-name" type="text" autocomplete="off" maxlength="60" placeholder="e.g. Robotics builders">
+              </label>
+              <div class="stack-8">
+                <span class="muted small">Who can find it</span>
+                <div class="seg" role="radiogroup" aria-label="Visibility">
+                  <button type="button" class="seg-btn" data-vis="private" role="radio">Private</button>
+                  <button type="button" class="seg-btn" data-vis="public" role="radio">Public</button>
+                </div>
+                <span id="room-vis-help" class="muted small"></span>
+              </div>
+              <div id="room-public-fields" class="stack-8" hidden>
+                <label class="field tight"><span class="muted small">Description (shown in Discover)</span><textarea id="room-desc" rows="2" maxlength="300" class="bio-input" placeholder="What is this room about?"></textarea></label>
+                <label class="field tight"><span class="muted small">Topics (1–3, so people can find it)</span><input id="room-topics" type="text" autocomplete="off" class="mono-input" placeholder="e.g. robotics, ai/llm" spellcheck="false"></label>
+              </div>
+              <div class="stack-8">
+                <span class="muted small">Access</span>
+                <div class="seg" role="radiogroup" aria-label="Access">
+                  <button type="button" class="seg-btn" data-access="free" role="radio">Free</button>
+                  <button type="button" class="seg-btn" data-access="pass" role="radio">Pass</button>
+                  <button type="button" class="seg-btn" data-access="membership" role="radio">Membership</button>
+                </div>
+                <label id="room-price-row" class="field tight" hidden><span class="muted small">Price in credits (one-time for a Pass, every 30 days for a Membership)</span><input id="room-price" type="text" inputmode="numeric" autocomplete="off" value="5"></label>
+                <span id="room-paid-help" class="muted small" hidden>Paid with anonymous credits: nobody can link a payment to who made it. Membership rooms change their key every 30 days, so only paid-up members keep reading.</span>
+                <label id="room-approval-row" class="check"><input id="room-approval" type="checkbox"> People ask to join, and you (or a moderator) let them in</label>
+                <span id="room-approval-help" class="muted small" hidden>You'll share an ask-to-join link instead of the room key. You see each person's name, handle and note before letting them in. Members could still pass the room on themselves, so only invite people you trust.</span>
+              </div>
+              <button type="submit" class="btn primary block">Create room</button>
+              <p id="room-create-msg" class="small muted" role="status"></p>
+            </form>
+            <form id="room-join" class="card stack-12">
+              <span class="strong">Join with an invite, ask or buy link</span>
+              <label class="field tight">
+                <span class="sr-only">Invite link</span>
+                <input id="room-join-input" type="text" autocomplete="off" class="mono-input" placeholder="sentinel://room/…" spellcheck="false">
+              </label>
+              <label id="room-ask-row" class="field tight" hidden><span class="muted small">A note for the room's admin and moderators (optional). They'll also see your name and handle.</span><textarea id="room-ask-note" rows="2" maxlength="280" class="bio-input" placeholder="e.g. Sam sent me the link"></textarea></label>
+              <button type="submit" id="room-join-btn" class="btn outline block">Join</button>
+              <p id="room-join-msg" class="small muted" role="status"></p>
+            </form>
+          </div>
+          <div id="room-list" class="conv-list" role="list"></div>
+        </div>
+        <div id="room-view" class="dm-thread" hidden>
+          <div class="thread-head">
+            <button type="button" id="room-back" class="icon-btn" aria-label="Back to rooms"><span class="icon" data-icon="back"></span></button>
+            <span class="room-badge"><span class="icon" data-icon="hash"></span></span>
+            <span class="stack-2 grow"><span id="room-title" class="strong"></span><span id="room-sub" class="muted small"></span></span>
+            <button type="button" id="room-apps-btn" class="btn ghost small-btn">Apps</button>
+            <button type="button" id="room-members-btn" class="btn ghost small-btn" hidden>Members</button>
+            <button type="button" id="room-invite" class="btn outline small-btn"><span class="icon sm" data-icon="link"></span><span id="room-invite-label">Copy invite link</span></button>
+            <button type="button" id="room-leave" class="btn ghost small-btn">Leave</button>
+            <button type="button" id="room-select-btn" class="btn ghost small-btn">Select</button>
+          </div>
+          <div id="room-select-bar" class="select-bar" hidden>
+            <span id="room-select-count" class="muted small grow">Tap messages to select them</span>
+            <button type="button" id="room-del-sel" class="btn outline small-btn">Delete selected</button>
+            <button type="button" id="room-del-all" class="btn outline small-btn">Delete all</button>
+            <span class="muted small">Deletes them on your devices. Only the room's admin and moderators can hide messages for everyone.</span>
+            <button type="button" id="room-select-done" class="btn ghost small-btn">Done</button>
+          </div>
+          <div id="room-members" class="card stack-8 room-members" hidden></div>
+          <div id="room-apps" class="stack-12 room-apps" hidden></div>
+          <div id="room-thread" class="thread" aria-live="polite"></div>
+          <form id="room-form" class="dm-compose">
+            <label class="sr-only" for="room-input">Message</label>
+            <input id="room-input" type="text" autocomplete="off" placeholder="Message the room" maxlength="4000">
+            <button type="submit" class="send-btn" aria-label="Send"><span class="icon" data-icon="send"></span></button>
+          </form>
+          <p id="room-error" class="error dm-error" role="alert" hidden></p>
+        </div>
+      </div>
+
+      <!-- PROFILE -->
+      <div id="tab-profile" class="tab" hidden>
+        <header class="bar"><h2>Profile</h2></header>
+        <div class="banner" id="my-banner"></div>
+        <div class="profile">
+          <div class="profile-top">
+            <span class="avatar xl me-avatar overlap" id="my-avatar"></span>
+            <div class="inline-actions">
+              <button type="button" id="edit-profile" class="btn outline">Edit profile</button>
+              <button type="button" id="copy-link" class="btn outline"><span class="icon" data-icon="link"></span><span id="copy-link-label">Copy follow link</span></button>
+            </div>
+          </div>
+          <div class="stack-2">
+            <span class="profile-name" id="profile-name"></span>
+            <span class="muted" id="profile-handle"></span>
+          </div>
+          <p class="bio" id="profile-bio"></p>
+          <form id="profile-form" class="card stack-12" hidden>
+            <label class="field tight"><span class="muted small">Name</span><input id="pf-name" type="text" maxlength="40" autocomplete="off" spellcheck="false"></label>
+            <label class="field tight"><span class="muted small">Bio <span id="pf-bio-count" class="mono"></span></span><textarea id="pf-bio" rows="3" maxlength="300" class="bio-input"></textarea></label>
+            <div class="inline-actions">
+              <button type="button" class="btn outline small-btn" data-pick="avatar">Change picture</button>
+              <button type="button" class="btn ghost small-btn" data-remove="avatar">Remove</button>
+              <button type="button" class="btn outline small-btn" data-pick="banner">Change header</button>
+              <button type="button" class="btn ghost small-btn" data-remove="banner">Remove</button>
+            </div>
+            <span class="muted small">Pictures are cropped and re-encoded on this device (location and camera data removed), then encrypted. Only people with your link can see your profile.</span>
+            <div class="inline-actions"><button type="submit" class="btn primary small-btn">Save</button><button type="button" id="pf-cancel" class="btn ghost small-btn">Cancel</button></div>
+            <p id="pf-msg" class="small muted" role="status"></p>
+          </form>
+          <p class="soft">People follow you with your link. Posts not marked Discoverable can be read only by people who have your link, so share it with care. Who follows whom stays private.</p>
+          <div class="card stack-8" id="circle-card">
+            <div class="stack-4"><span class="setting-title">Approved followers</span><span class="muted small">A private audience you approve one by one. Posts for "Approved followers" can't be read by people who only have your link, or by Pillars. Removing someone gives everyone else a new key, so they can't read anything new.</span></div>
+            <div id="circle-requests" class="stack-4"></div>
+            <div id="circle-members" class="stack-4"></div>
+            <p id="circle-msg" class="small muted" role="status"></p>
+          </div>
+          <div class="stats"><span id="stat-followers-wrap"><b id="stat-followers">0</b> followers</span><span><b id="stat-following">0</b> following</span><span><b id="stat-posts">0</b> posts</span></div>
+        </div>
+        <div id="my-feed"></div>
+      </div>
+
+      <!-- SOMEONE'S PROFILE -->
+      <div id="tab-user" class="tab" hidden>
+        <header class="bar bar-row">
+          <button type="button" id="user-back" class="icon-btn" aria-label="Back"><span class="icon" data-icon="back"></span></button>
+          <h2 id="user-title" class="grow"></h2>
+        </header>
+        <div class="banner" id="user-banner"></div>
+        <div class="profile">
+          <div class="profile-top">
+            <span class="avatar xl overlap" id="user-avatar"></span>
+            <div class="inline-actions">
+              <button type="button" id="user-message" class="btn outline">Message</button>
+              <button type="button" id="user-verify" class="btn outline"><span class="icon sm" data-icon="shield"></span>Verify</button>
+              <button type="button" id="user-circle" class="btn outline">Ask to be approved</button>
+              <button type="button" id="user-unfollow" class="btn ghost" hidden>Unfollow</button>
+              <button type="button" id="user-mute" class="btn ghost">Mute</button>
+              <button type="button" id="user-block" class="btn ghost">Block</button>
+            </div>
+          </div>
+          <div class="stack-2"><span class="profile-name" id="user-name"></span><span class="muted" id="user-handle"></span></div>
+          <p class="bio" id="user-bio"></p>
+          <p class="muted small" id="user-note" hidden>You don't follow them, so their posts aren't shown here. To see them, ask them for their follow link.</p>
+          <div id="user-safety" class="card stack-8" hidden>
+            <span class="strong">Safety number</span>
+            <span class="mono safety" id="user-safety-digits"></span>
+            <span class="muted small">Compare these digits with this person in person or over a channel you trust. If they match on both devices, nobody is impersonating either of you.</span>
+          </div>
+        </div>
+        <div id="user-feed"></div>
+      </div>
+
+      <!-- PRIVACY -->
+      <div id="tab-privacy" class="tab" hidden>
+        <header class="bar"><h2>Settings</h2></header>
+        <div class="seg settings-nav" role="tablist" aria-label="Settings sections">
+          <button type="button" class="seg-btn" data-settings="privacy" role="tab">Privacy</button>
+          <button type="button" class="seg-btn" data-settings="safety" role="tab">Safety</button>
+          <button type="button" class="seg-btn" data-settings="connection" role="tab">Connection</button>
+          <button type="button" class="seg-btn desktop-only" data-settings="help" role="tab">Help run Sentinel</button>
+          <button type="button" class="seg-btn" data-settings="credits" role="tab">Credits</button>
+        </div>
+        <div data-group="privacy" id="privacy-list"></div>
+        <div data-group="privacy" class="row-setting">
+          <div class="stack-4"><span class="setting-title">Delete all messages</span><span class="muted small">Every private message and room message on this device and your other linked devices. Posts, follows and rooms stay. Other people's copies stay too (in a conversation, "Select" can ask their app to delete them).</span></div>
+          <button type="button" id="delete-all-msgs" class="btn outline small-btn">Delete all messages</button>
+        </div>
+        <p data-group="privacy" id="delete-all-msg" class="small muted" role="status"></p>
+        <div data-group="connection" class="row-setting">
+          <div class="stack-4"><span class="setting-title">Tor-lock</span><span class="muted small">This account can never connect without Tor, even if Tor fails.</span></div>
+          <span class="mono locked"><span class="icon sm" data-icon="lock"></span>locked</span>
+        </div>
+        <p data-group="help" id="phone-help-note" class="muted small phone-only" hidden>Running a Pillar or an Archive needs a computer that stays on and connected, so it isn't offered on phones. You can still hold a release key below.</p>
+        <div data-group="help" class="contribute stack-10 desktop-only">
+          <div class="stack-4"><span class="setting-title">Help run Sentinel</span><span class="muted small">Sentinel has no company servers. Everything runs on computers lent by people. All of these are optional, off unless you turn them on, and off in High-risk mode.</span></div>
+
+          <div class="row-setting column contrib-card">
+            <div class="row-head">
+              <div class="stack-4">
+                <span class="setting-title">Pillar</span>
+                <span class="muted small">Carries the network: keeps public posts and sealed messages for others and passes them along, while the app is open. Long-running Pillars kept by established operators also issue credits.</span>
+              </div>
+              <button type="button" id="host-toggle" class="toggle" role="switch" aria-label="Run a Pillar" aria-checked="false"></button>
+            </div>
+            <p id="host-status" class="mono small muted" role="status"></p>
+            <div class="warning stack-10" role="note">
+              <span class="warning-title"><span class="icon sm" data-icon="alert"></span>The risks of running a Pillar</span>
+              <ul class="warn-list">
+                <li>It stores other people's public posts and sealed messages on your computer (up to 2 GB, deleted after 60 days). Sealed messages can't be read, not even by you.</li>
+                <li>It's reachable only through Tor, so your IP address and location stay hidden.</li>
+                <li>Someone watching very closely could notice that your Pillar goes offline when you do, and use that to guess it's yours.</li>
+                <li>If your computer is taken, it will show that you ran a Pillar.</li>
+                <li><b>Only do this where it's legal and safe</b> to use Tor and to keep other people's content.</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="row-setting column contrib-card">
+            <div class="row-head">
+              <div class="stack-4">
+                <span class="setting-title">Archive</span>
+                <span class="muted small">Lends disk space for people's photos, videos and files, and earns credits every day. Runs inside your Pillar, so turning it on turns your Pillar on too.</span>
+              </div>
+              <button type="button" id="archive-toggle" class="toggle" role="switch" aria-label="Run an Archive" aria-checked="false"></button>
+            </div>
+            <label class="field tight"><span class="muted small">Space to lend</span>
+              <select id="archive-gb" class="select"><option value="5">5 GB</option><option value="20" selected>20 GB</option><option value="100">100 GB</option><option value="500">500 GB</option><option value="2000">2 TB</option></select></label>
+            <p id="archive-status" class="mono small muted" role="status"></p>
+            <div class="warning stack-10" role="note">
+              <span class="warning-title"><span class="icon sm" data-icon="alert"></span>The risks of running an Archive</span>
+              <ul class="warn-list">
+                <li>It keeps encrypted pieces of other people's files. Nobody can read them, including you and anyone who takes your computer, but that also means <b>you can't check what they are</b>.</li>
+                <li>In some places, keeping data you can't inspect is itself risky. <b>Only do this where it's legal and safe.</b></li>
+                <li>Archives are contacted more often than plain Pillars and checked at random times, so their online hours are easier to watch. Your IP address still stays hidden behind Tor.</li>
+                <li>It uses the disk space you choose and some internet bandwidth. Files are spread over several Archives, so nobody loses anything if yours goes away.</li>
+                <li>If your computer is taken, it will show that you ran an Archive.</li>
+              </ul>
+            </div>
+            <div class="row-head">
+              <div class="stack-4"><span class="setting-title small-title">Also keep my own uploads</span><span class="muted small">Faster and longer-lasting for your own files, but <b>anyone who sees your posts learns your Archive's address and can watch when it's online</b>. Off in High-risk mode.</span></div>
+              <button type="button" id="self-seed" class="toggle" role="switch" aria-label="Also keep my own uploads" aria-checked="false"></button>
+            </div>
+          </div>
+
+          <div class="row-setting column contrib-card">
+            <div class="row-head">
+              <div class="stack-4">
+                <span class="setting-title">Compute <span class="badge-explore">coming later</span></span>
+                <span class="muted small">Lend spare processing power for work like converting videos for others. Not available yet; nothing runs.</span>
+              </div>
+              <button type="button" class="toggle" role="switch" aria-label="Lend compute (coming later)" aria-checked="false" disabled></button>
+            </div>
+          </div>
+        </div>
+        <div data-group="help" class="row-setting column">
+          <details class="advanced-inline">
+            <summary class="setting-title">Release keys (for people who sign updates)</summary>
+            <div class="stack-12">
+              <span class="muted small">Updates only install when most release key holders have signed them, so no single person (or stolen key) can push one. If you've been asked to hold a release key, do it here. Keep the key on a USB stick that stays unplugged, never on this computer.</span>
+              <div class="stack-8">
+                <span class="strong small">1. Become a key holder</span>
+                <span class="muted small">Plug in a USB stick, press the button and save the key there. Then send the line that appears to whoever builds releases. It's public: it can only check signatures, not make them.</span>
+                <div class="inline-actions"><button type="button" id="rk-create" class="btn outline small-btn">Make my release key</button></div>
+                <div id="rk-line-box" class="stack-4" hidden>
+                  <textarea id="rk-line" rows="3" class="bio-input mono-input" readonly></textarea>
+                  <div class="inline-actions"><button type="button" id="rk-copy" class="btn ghost small-btn">Copy this line</button><span id="rk-create-msg" class="muted small"></span></div>
+                </div>
+              </div>
+              <div class="stack-8">
+                <span class="strong small">2. Sign an update you were sent</span>
+                <span class="muted small">Choose the update file. You'll see what's inside before signing. Only sign if you expected this update (ask the person who sent it if unsure).</span>
+                <div class="inline-actions"><button type="button" id="rk-pick" class="btn outline small-btn">Choose the update file</button></div>
+                <div id="rk-bundle" class="words-box stack-4" hidden></div>
+                <div class="inline-actions"><button type="button" id="rk-sign" class="btn primary small-btn" hidden>Sign with my USB key</button><button type="button" id="rk-revoke" class="btn ghost small-btn" hidden>Revoke this update instead</button></div>
+                <p id="rk-msg" class="small muted" role="status"></p>
+              </div>
+            </div>
+          </details>
+        </div>
+        <div data-group="credits" class="row-setting column">
+          <div class="row-head">
+            <div class="stack-4"><span class="setting-title">Credits</span><span class="muted small">Anonymous credits for keeping files longer and joining paid rooms. Nobody can link your credits to you or to each other, and they're built to stay safe against future quantum computers. New credits can be spent after a few minutes.</span></div>
+            <span class="credits-balance mono" id="credit-balance">0</span><span id="credit-pending" class="muted small"></span>
+          </div>
+          <p class="muted small">Credits come only from work or from people: running an Archive (Help run Sentinel) earns some every day, and anyone can send you credits in a private message. There are no free ones, so nobody can create credits out of thin air.</p>
+          <div class="inline-actions"><button type="button" id="import-credits-btn" class="btn outline small-btn desktop-only">Import credits from my Pillar…</button><span class="muted small desktop-only">For a Pillar you run on a server: run <span class="mono">pillar --take-credits credits.json</span> there, bring the file here, and delete it afterwards.</span></div>
+          <p id="credit-msg" class="small muted" role="status"></p>
+        </div>
+        <div data-group="privacy" class="row-setting column">
+          <div class="stack-4"><span class="setting-title">Muted and blocked</span><span class="muted small">Muted people's posts are hidden. Blocked people are hidden everywhere and their messages are dropped unread. This list stays on this device, and nobody is told.</span></div>
+          <div id="hidden-list" class="stack-4"></div>
+        </div>
+        <div data-group="credits" class="row-setting column">
+          <div class="stack-4"><span class="setting-title">Storage checks</span><span class="muted small">Your app quietly tests, at random times, that Archives still hold your files. Archives that fail stop getting new files.</span></div>
+          <p id="storage-health" class="small mono muted"></p>
+          <div class="inline-actions"><button type="button" id="check-storage" class="btn ghost small-btn">Check one now</button><span id="check-msg" class="muted small"></span></div>
+        </div>
+        <div data-group="connection" class="row-setting column">
+          <div class="stack-4"><span class="setting-title">Connection</span><span class="muted small">Changes apply the next time you unlock Sentinel.</span></div>
+          <div class="seg" role="radiogroup" aria-label="Connection mode">
+            <button type="button" class="seg-btn" data-conn="tor" role="radio">Standard Tor</button>
+            <button type="button" class="seg-btn" data-conn="bridges" role="radio">Bridges (restricted network)</button>
+          </div>
+          <div id="bridge-opts" class="stack-8" hidden>
+            <div class="seg" role="radiogroup" aria-label="Built-in bridges">
+              <button type="button" class="seg-btn" data-bset="snowflake" role="radio">Snowflake</button>
+              <button type="button" class="seg-btn" data-bset="obfs4" role="radio">obfs4</button>
+            </div>
+            <div class="warning stack-8">
+              <span class="warning-title"><span class="icon sm" data-icon="alert"></span>Built-in bridges are public</span>
+              <span class="small soft">Censors can list them, and connecting to a known bridge can flag you. Where that is dangerous, use <b>private bridges</b> from someone you trust (or bridges.torproject.org by email). WebTunnel bridges look like ordinary HTTPS.</span>
+            </div>
+            <label class="field tight"><span class="muted small">Private bridges (one per line; used instead of the built-in ones) <span id="bridge-count" class="mono"></span></span>
+              <textarea id="bridge-lines" rows="3" class="bio-input mono-input" spellcheck="false" autocomplete="off" placeholder="webtunnel 192.0.2.3:443 FINGERPRINT url=https://…"></textarea></label>
+          </div>
+          <div class="inline-actions"><button type="button" id="conn-save" class="btn outline small-btn">Save connection</button></div>
+          <p id="conn-msg" class="small muted" role="status"></p>
+        </div>
+        <div data-group="safety" class="row-setting column">
+          <div class="stack-4"><span class="setting-title">Account &amp; security</span><span class="muted small">Your account exists only on this device. Keep the passphrase and a backup safe.</span></div>
+          <form id="pass-form" class="stack-8">
+            <input id="pass-old" type="password" autocomplete="off" placeholder="Current passphrase">
+            <div class="pass-row"><input id="pass-new" type="password" autocomplete="off" placeholder="New passphrase" spellcheck="false"><button type="button" id="pass-generate" class="btn outline small-btn">Generate</button></div>
+            <div id="pass-words" class="words-box stack-8" hidden>
+              <span class="label">Write these words down, in order</span>
+              <ol id="pass-word-list" class="word-list"></ol>
+              <label class="check"><input id="pass-wrote" type="checkbox"> I've written these words down somewhere safe</label>
+            </div>
+            <button type="submit" class="btn outline small-btn">Change passphrase</button>
+            <p id="pass-msg" class="small muted" role="status"></p>
+          </form>
+          <div class="stack-8">
+            <div class="stack-4"><span class="setting-title">Key file</span><span class="muted small">Like VeraCrypt's keyfiles: unlocking needs your passphrase <b>and</b> a file you choose (a photo, or a new random file). Without the file, guessing the passphrase gets nobody in. Keep the file away from this device, never edit it, and keep a copy: losing it locks you out, and your backups need it too. Your emergency passphrase still works without it.</span></div>
+            <p id="keyfile-state" class="small"></p>
+            <div class="inline-actions">
+              <button type="button" id="keyfile-choose" class="btn outline small-btn">Choose a file</button>
+              <button type="button" id="keyfile-new" class="btn ghost small-btn">Make a new one</button>
+              <span id="keyfile-chosen" class="muted small"></span>
+            </div>
+            <input id="keyfile-current" type="password" autocomplete="off" placeholder="Current passphrase" spellcheck="false">
+            <div class="inline-actions">
+              <button type="button" id="keyfile-save" class="btn outline small-btn">Use this key file</button>
+              <button type="button" id="keyfile-remove" class="btn ghost small-btn" hidden>Stop using a key file</button>
+            </div>
+            <p id="keyfile-msg" class="small muted" role="status"></p>
+          </div>
+          <div class="stack-8" id="devices-block">
+            <div class="stack-4"><span class="setting-title">Your devices</span><span class="muted small">Use your account on your phone and computer at once. Each device keeps its own passphrase and its own message keys; messages reach all of them. Credits stay on the device that earned them.</span></div>
+            <div id="device-list" class="stack-4"></div>
+            <div class="inline-actions"><button type="button" id="link-start" class="btn outline small-btn">Link a new device</button></div>
+            <div id="link-box" class="words-box stack-8" hidden>
+              <span class="small">On the new device, choose <b>Use my account from another device</b> and enter this code. It works for 30 minutes. Don't send it through anything someone else can read.</span>
+              <textarea id="link-code" rows="2" class="bio-input mono-input" readonly></textarea>
+              <div class="inline-actions"><button type="button" id="link-copy" class="btn ghost small-btn">Copy code</button><button type="button" id="link-cancel" class="btn ghost small-btn">Stop</button></div>
+              <div id="link-requests" class="stack-8"><span class="muted small">Waiting for the new device…</span></div>
+            </div>
+          </div>
+          <div class="stack-8" id="recovery-block">
+            <div class="stack-4"><span class="setting-title">Recovery words</span><span class="muted small">21 words, written on paper, that bring your account back on a new device if this one is lost, and move it to a new key if this one is taken. Anyone who has them can take over your account: keep them hidden, never type them anywhere but Sentinel, and never keep them on this device.</span></div>
+            <p id="recovery-state" class="small"></p>
+            <div class="inline-actions">
+              <button type="button" id="recovery-show" class="btn outline small-btn" hidden>Show my recovery words</button>
+              <button type="button" id="recovery-create" class="btn outline small-btn" hidden>Create recovery words</button>
+            </div>
+            <div id="recovery-words-box" class="words-box stack-8" hidden>
+              <span class="label">Write these words down, in order</span>
+              <ol id="recovery-word-list" class="word-list"></ol>
+              <label class="check"><input id="recovery-wrote" type="checkbox"> I've written them down somewhere safe, away from this device</label>
+              <button type="button" id="recovery-confirm" class="btn primary small-btn" disabled>Remove them from this device</button>
+            </div>
+            <details class="advanced-inline">
+              <summary class="muted small">Move my account to a new key</summary>
+              <div class="stack-8">
+                <span class="hint">If this device (or one where you recovered your account) was taken, or your key may be known to someone, move your account to a new key. Followers switch over automatically; your recovery words stay the same.</span>
+                <textarea id="move-words" rows="3" class="bio-input mono-input" autocomplete="off" spellcheck="false" placeholder="Your 21 recovery words"></textarea>
+                <label class="check"><input id="move-taken" type="radio" name="move-why" checked> A device with my account was taken: followers will need my new follow link to see private posts</label>
+                <label class="check"><input id="move-lost" type="radio" name="move-why"> It was only lost: let followers keep reading</label>
+                <button type="button" id="move-go" class="btn outline small-btn">Move my account</button>
+                <p id="move-msg" class="small muted" role="status"></p>
+              </div>
+            </details>
+          </div>
+          <form id="emergency-form" class="stack-8">
+            <div class="stack-4"><span class="setting-title">Emergency passphrase</span><span class="muted small">If someone forces you to unlock Sentinel, type this instead of your real passphrase. It silently erases your real account from this device and opens an empty account with the name below, so it looks like a normal unlock. Nobody can tell from the app's files whether you've set one. Keep a backup somewhere safe if you want to be able to get your account back.</span></div>
+            <input id="em-current" type="password" autocomplete="off" placeholder="Current passphrase">
+            <input id="em-pass" type="password" autocomplete="off" placeholder="Emergency passphrase (leave empty to remove)" spellcheck="false">
+            <input id="em-name" type="text" autocomplete="off" placeholder="Name shown in the empty account" spellcheck="false" maxlength="40">
+            <button type="submit" class="btn outline small-btn">Save emergency passphrase</button>
+            <p id="em-msg" class="small muted" role="status"></p>
+          </form>
+          <div class="inline-actions"><button type="button" id="backup-btn" class="btn outline small-btn">Save encrypted backup</button></div>
+          <p id="backup-msg" class="small muted" role="status"></p>
+          <div class="warning stack-8">
+            <span class="warning-title"><span class="icon sm" data-icon="alert"></span>Panic wipe</span>
+            <span class="small soft">Erases this account, its keys, messages and Tor state from this device and quits. It can't be undone without a backup.</span>
+            <div class="inline-form"><input id="wipe-confirm" type="text" autocomplete="off" placeholder="Type DELETE" spellcheck="false"><button type="button" id="wipe-btn" class="btn outline">Erase</button></div>
+            <p id="wipe-msg" class="small error" role="alert"></p>
+          </div>
+        </div>
+        <div data-group="safety" class="row-setting column">
+          <div class="stack-4">
+            <span class="setting-title">Disguise as a calculator</span>
+            <span class="muted small">While Sentinel is locked, it looks and works like a calculator, named "Calculator" with a calculator icon (in the Start menu and on the desktop too). To unlock, type your code and press =.</span>
+            <span class="muted small">Honest limits: Task Manager and Windows' list of installed apps still say The Sentinel Protocol, and anyone who knows about this disguise knows to try it. It hides Sentinel from a glance, not from a search. If you pinned Sentinel to the taskbar, unpin it.</span>
+          </div>
+          <div class="pass-row"><input id="disguise-code" type="password" inputmode="numeric" autocomplete="off" maxlength="12" placeholder="Code: 4–12 digits"><button type="button" id="disguise-save" class="btn outline small-btn">Turn on</button></div>
+          <button type="button" id="disguise-off" class="btn ghost small-btn" hidden>Turn disguise off</button>
+          <p id="disguise-msg" class="small muted" role="status"></p>
+        </div>
+        <div data-group="connection" class="row-setting column">
+          <div class="stack-4">
+            <span class="setting-title">Updates</span>
+            <span class="muted small">Sentinel isn't in any app store. Updates come from Pillars over Tor, or as a file someone hands you. Either way, the app only installs an update signed by a majority of Sentinel's release keys (with signatures a quantum computer can't forge) and newer than what you have. A changed byte anywhere and it's refused. Updates from Pillars must be carried by at least two of them, identically (so everyone gets the same one), and wait three days before they can be installed, so a bad release can be caught and revoked first.</span>
+          </div>
+          <p id="update-state" class="small"></p>
+          <p class="muted small phone-only">On phones, a new version comes as an app file (APK) from whoever gave you Sentinel. Android checks it's signed with the same key as the version you have before it installs.</p>
+          <div class="inline-actions desktop-only">
+            <button type="button" id="update-check" class="btn outline small-btn">Check now</button>
+            <button type="button" id="update-file" class="btn ghost small-btn">Install from a file…</button>
+            <button type="button" id="update-install" class="btn primary small-btn" hidden>Install and restart</button>
+          </div>
+          <p id="update-msg" class="small muted" role="status"></p>
+        </div>
+        <details data-group="connection" id="settings-log-box" class="row-setting column">
+          <summary class="setting-title">Connection log</summary>
+          <p class="muted small">What Tor and Sentinel did lately (sending, receiving, connecting), for whoever is helping you if something gets stuck. It stays in memory on this device until you copy it. It doesn't contain your account, messages or IP address.</p>
+          <pre id="settings-log" class="connect-log"></pre>
+          <button type="button" id="settings-log-copy" class="btn outline small-btn">Copy the log</button>
+        </details>
+        <details data-group="connection" class="advanced">
+          <summary>Advanced</summary>
+
+          <form id="pillar-form" class="row-setting column">
+            <div class="stack-4"><span class="setting-title">Home Pillar</span><span class="muted small">Chosen automatically. Only change this if someone you trust gave you a Pillar address.</span></div>
+            <div class="inline-form">
+              <label class="sr-only" for="pillar-input">Pillar onion address</label>
+              <input id="pillar-input" type="text" autocomplete="off" class="mono-input" placeholder="xxxxxxxx….onion" spellcheck="false">
+              <button type="submit" class="btn outline">Save</button>
+            </div>
+            <p id="pillar-msg" class="small muted" role="status"></p>
+          </form>
+        </details>
+      </div>
+    </main>
+
+    <aside class="rail" aria-label="Connection">
+      <section class="card stack-12">
+        <div class="status-head"><span id="status-dot" class="dot"></span><span id="status-title" class="strong">Connecting</span></div>
+        <p id="status-line" class="muted small">Starting Tor on this device…</p>
+      </section>
+      <form id="follow-form" class="card stack-12">
+        <span class="strong">Follow someone</span>
+        <label class="field tight">
+          <span class="muted small">Paste their follow link</span>
+          <input id="follow-input" type="text" autocomplete="off" class="mono-input" placeholder="sentinel://follow/…" spellcheck="false">
+        </label>
+        <button type="submit" class="btn outline block">Follow</button>
+        <p id="follow-msg" class="small muted" role="status"></p>
+        <span class="muted small">There's no people search, by design: you only find someone if they share their link.</span>
+      </form>
+    </aside>
+  </div>
+</section>
+
+<div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-label="Image viewer" hidden>
+  <button type="button" id="lightbox-close" class="icon-btn lightbox-close" aria-label="Close"><span class="icon lg" data-icon="x"></span></button>
+  <img id="lightbox-img" alt="">
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

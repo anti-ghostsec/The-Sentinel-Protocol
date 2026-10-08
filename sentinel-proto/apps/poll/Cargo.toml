@@ -1,0 +1,23 @@
+[package]
+name = "sentinel-poll"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "The Poll app built into Sentinel (a Sentinel App, compiled to WebAssembly)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sentinel-app-sdk = { path = "../../crates/app-sdk" }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Built on its own (for wasm32), not with the rest of Sentinel.
+[workspace]

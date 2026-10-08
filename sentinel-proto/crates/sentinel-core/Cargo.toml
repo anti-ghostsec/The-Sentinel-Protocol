@@ -1,0 +1,31 @@
+[package]
+name = "sentinel-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ed25519-dalek.workspace = true
+blake3.workspace = true
+serde.workspace = true
+ciborium.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
+zeroize.workspace = true
+getrandom.workspace = true
+data-encoding.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+vodozemac.workspace = true
+x25519-dalek.workspace = true
+image.workspace = true
+curve25519-dalek = "4"
+voprf = { version = "0.5", default-features = false, features = ["ristretto255-ciphersuite", "serde", "alloc"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+reed-solomon-erasure = { version = "6", default-features = false, features = ["std"] }
+ml-kem = "0.3"
+ml-dsa = "0.1"
+wasmi = { version = "2", default-features = false, features = ["std", "validate", "deterministic", "auto-dispatch"] }
+sentinel-app-sdk = { path = "../app-sdk" }
+plonky2 = { package = "qp-plonky2", version = "~1.4.1" }

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "The Sentinel Protocol",
+  "version": "0.1.0",
+  "identifier": "protocol.sentinel.app",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "The Sentinel Protocol",
+        "width": 1280,
+        "height": 860,
+        "minWidth": 420,
+        "minHeight": 600,
+        "backgroundColor": "#0A0A0C",
+        "theme": "Dark",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,AutofillServerCommunication,OptimizationHints,Translate,MediaRouter,SpareRendererForSitePerProcess --disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --disable-breakpad --disable-client-side-phishing-detection --no-pings --dns-prefetch-disable --disable-crash-reporter"
+      }
+    ],
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "script-src": "'self'",
+        "style-src": "'self'",
+        "font-src": "'self'",
+        "img-src": "'self' data: blob:",
+        "media-src": "blob: http://smedia.localhost smedia:",
+        "connect-src": "ipc: http://ipc.localhost",
+        "object-src": "'none'",
+        "frame-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'"
+      },
+      "freezePrototype": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
+    "publisher": "The Sentinel Protocol",
+    "shortDescription": "Private, decentralized social network with Tor built in",
+    "longDescription": "The Sentinel Protocol: posts, rooms and messages over Tor onion services only. No accounts on servers, no tracking, no telemetry.",
+    "copyright": "",
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerHooks": "installer-hooks.nsh",
+        "displayLanguageSelector": false
+      }
+    },
+    "resources": {
+      "../../vendor/ffmpeg/win64/*": "ffmpeg/"
+    }
+  }
+}

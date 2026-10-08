@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Main window: app commands plus event listening only. No filesystem, shell, HTTP, opener, window or path APIs.","local":true,"windows":["main"],"permissions":["core:event:default"]}}

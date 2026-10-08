@@ -1,0 +1,75 @@
+[workspace]
+resolver = "2"
+members = ["crates/sentinel-core", "crates/app-sdk", "crates/sentinel-net", "crates/pillar", "crates/client", "crates/app"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+sentinel-core = { path = "crates/sentinel-core" }
+sentinel-net = { path = "crates/sentinel-net" }
+
+# Tor (embedded arti). Vanguards always compiled in; onion services only — no exits used.
+arti-client = { version = "0.47", default-features = false, features = [
+    "tokio",
+    # rustls: memory-safe, consistent across platforms (native-tls/SChannel
+    # stalled on Tor handshakes on Windows).
+    "rustls",
+    "compression",
+    "onion-service-client",
+    "onion-service-service",
+    "vanguards",
+    # Onion-service proof-of-work (client solver + service defence).
+    "hs-pow-full",
+    # Bridges and pluggable transports (obfs4, WebTunnel, Snowflake, meek).
+    "bridge-client",
+    "pt-client",
+] }
+tor-hsservice = "0.47"
+tor-cell = "0.47"
+tor-guardmgr = { version = "0.47", features = ["vanguards"] }
+tor-config = "0.47"
+tor-proto = { version = "0.47", features = ["hs-service"] }
+safelog = "0.10"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "fs", "signal"] }
+futures = "0.3"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tokio-socks = "0.5"
+rpassword = "7"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tracing-subscriber ={ version = "0.3", features = ["env-filter", "fmt"] }
+
+ed25519-dalek = "2"
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
+getrandom = "0.3"
+data-encoding = "2"
+thiserror = "2"
+vodozemac = "0.11"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[patch.crates-io]
+# Upstream saturating-time 0.5.0 loops forever on Windows (100ns SystemTime
+# resolution makes its limit search stop making progress), which hangs arti's
+# consensus parsing. Vendored with a two-line fix; see patches/saturating-time.
+saturating-time = { path = "patches/saturating-time" }
+# Upstream wry has no way to turn on WebView2's custom crash reporting, so
+# the browser engine's crash dumps could be uploaded to Microsoft. Vendored
+# with that one option switched on; see patches/wry (src/webview2/mod.rs).
+wry = { path = "patches/wry" }
+
+[profile.release]
+# Unwind (not abort): a panic in one request handler or background task ends
+# only that task — with abort, any input that triggers a panic would be a
+# remote kill switch for a Pillar and a silent crash for the app. Unwinding
+# also runs Drop, so secret keys are zeroized. Crash reporting stays off.
+panic = "unwind"

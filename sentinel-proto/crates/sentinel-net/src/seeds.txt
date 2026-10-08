@@ -1,0 +1,6 @@
+# Seed Pillars (onion-only), one per line: "<onion> [credit key hex] [pq=<hex>]".
+# The app learns every other Pillar from these via directory gossip. Seed
+# Pillars are also the network's credit mints; their long-term credit key
+# and the fingerprint of its quantum-safe checkpoint key (both printed by
+# `pillar --print-keys`) should be listed so they are pinned.
+wjbtsk5tn74ry5qjtoikswsmj4qqvl2dm5whw6gznaq4x4o572zbznyd.onion d6b25835b245c4c01369c2a0f2e837fc93b69ef646d7c3c784287cb5f02dd833 pq=624231788d77954920bb229111d9726027c73fe9019b1263209c8c8704a89b71
