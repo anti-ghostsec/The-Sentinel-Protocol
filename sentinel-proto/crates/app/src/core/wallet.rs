@@ -97,7 +97,7 @@ impl Core {
 
     /// A mint's checkpoint key: checked against the fingerprint built into
     /// the app when there is one, else the one I saw first (pinned).
-    async fn pq_key(&self, mint: &str) -> Result<sentinel_core::pq::HybridPublic> {
+    pub(super) async fn pq_key(&self, mint: &str) -> Result<sentinel_core::pq::HybridPublic> {
         if let Some(k) = self.unlocked()?.1.pq_mint_keys.get(mint) {
             return Ok(k.clone());
         }

@@ -129,6 +129,9 @@ pub enum Request {
     RewardOfferPq { count: u32, mint: String },
     /// Mint -> Archive: they're in the list from position `first`.
     RewardAppended { mint: String, epoch: u32, first: u64 },
+    /// An issuer's signed list of Pillars it has seen answer for weeks
+    /// (`Object`: CBOR `directory::SignedVouch`; `NotFound` if not an issuer).
+    Vouched,
 }
 
 /// Bytes per `UpdateChunk` answer.

@@ -17,6 +17,7 @@
 //! - Only BEGIN requests to the Sentinel port are accepted; anything else
 //!   tears down the circuit (uniform behaviour keeps the service bland).
 
+mod directory;
 mod economy;
 mod pqmint;
 mod earning;
@@ -121,6 +122,8 @@ struct Ctx {
     mix: sentinel_core::mix::MixSecret,
     /// Mixed packets seen (replays are dropped) and how many are waiting.
     mix_seen: std::sync::Mutex<std::collections::VecDeque<[u8; 32]>>,
+    /// Which listed Pillars answered lately (memory only; see `directory`).
+    dir: Arc<directory::Directory>,
 }
 
 /// Most mixed packets held at once.
@@ -207,6 +210,7 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         updates: cfg.updates.clone(),
         mix: load_mix_secret(&cfg.store),
         mix_seen: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        dir: Arc::default(),
     });
     let (max_seq, count) = mailbox_scan(&cfg.store);
     // The counter survives restarts even after every deposit expired (a
@@ -278,6 +282,9 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
 
     // Pass signed releases and revocations on, Pillar to Pillar.
     tasks.push(tokio::spawn(spread_updates(Arc::clone(&ctx), cfg.seeds.clone(), cfg.spread_after)));
+
+    // Test the Pillars and Archives we list, so gone ones aren't handed out.
+    tasks.push(tokio::spawn(directory::check_loop(Arc::clone(&ctx))));
 
     // Announce ourselves to seeds and learn the directory, every 6 h.
     {
@@ -841,13 +848,9 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             Err(_) => Response::NotFound,
         },
         Request::Pillars => {
-            let mut known: Vec<String> = read_known(&known_path(store)).await;
-            // Random sample so no Pillar is always first.
-            for i in (1..known.len()).rev() {
-                let j = (u32::from_le_bytes(sentinel_core::random_bytes::<4>()) as usize) % (i + 1);
-                known.swap(i, j);
-            }
-            known.truncate(PILLARS_PER_REPLY - 1);
+            // A random sample of the ones that answered lately, the more
+            // reliable first (never ones that are failing).
+            let mut known = ctx.dir.sample(read_known(&known_path(store)).await, PILLARS_PER_REPLY - 1);
             known.push(ctx.self_onion.clone());
             Response::Pillars(known)
         }
@@ -1027,6 +1030,7 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
         | Request::RewardOfferPq { .. }
         | Request::RewardAppended { .. }
         | Request::PqMintKey
+        | Request::Vouched
         | Request::PqSwap { .. }
         | Request::PqUpgrade { .. }
         | Request::PqLeaves { .. }
@@ -1050,11 +1054,7 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             Response::Have(bits)
         }
         Request::Archives => {
-            let mut known: Vec<String> = read_known(&archives_path(store)).await;
-            for i in (1..known.len()).rev() {
-                known.swap(i, random_below(i as u64 + 1) as usize);
-            }
-            known.truncate(PILLARS_PER_REPLY - 1);
+            let mut known = ctx.dir.sample(read_known(&archives_path(store)).await, PILLARS_PER_REPLY - 1);
             if ctx.archive_gb.load(Ordering::Relaxed) > 0 {
                 known.push(ctx.self_onion.clone());
             }
@@ -1070,10 +1070,12 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             let tor = Arc::clone(&ctx.tor);
             let store = store.clone();
             let self_onion = ctx.self_onion.clone();
+            let dir = Arc::clone(&ctx.dir);
             tokio::spawn(async move {
                 let iso = tor.isolated_client();
                 let Ok(mut s) = iso.connect((onion.as_str(), SENTINEL_PORT)).await else { return };
                 if let Ok(Response::Pong) = exchange(&mut s, &Request::Ping).await {
+                    dir.ok(&onion);
                     let _ = add_known(&known_path(&store), &onion, &self_onion).await;
                     if archive_gb > 0 {
                         let _ = add_known(&archives_path(&store), &onion, &self_onion).await;

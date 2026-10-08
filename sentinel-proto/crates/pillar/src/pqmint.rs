@@ -65,6 +65,11 @@ impl PqLedger {
         l
     }
 
+    /// Sign a list of vouched Pillars (see `sentinel_core::directory`).
+    pub fn sign_vouch(&self, body: sentinel_core::directory::Vouch) -> sentinel_core::directory::SignedVouch {
+        sentinel_core::directory::sign_vouch(&self.signer, body)
+    }
+
     pub fn public(&self) -> HybridPublic {
         self.signer.public()
     }

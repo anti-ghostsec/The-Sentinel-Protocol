@@ -15,6 +15,7 @@ pub mod apps;
 pub mod audit;
 pub mod circle;
 pub mod deletion;
+pub mod directory;
 pub mod dms;
 pub mod ffmpeg;
 pub mod local;
@@ -391,6 +392,14 @@ pub struct Store {
     /// Pillars learned from the directory (cache for automatic selection).
     #[serde(default)]
     pub known_pillars: Vec<String>,
+    /// Which known Pillars answered lately (days only; see `directory`).
+    #[serde(default)]
+    pub pillar_health: std::collections::HashMap<String, directory::PillarHealth>,
+    /// Pillars the credit issuers vouch for, and the day they were fetched.
+    #[serde(default)]
+    pub vouched_pillars: Vec<String>,
+    #[serde(default)]
+    pub vouched_day: u64,
     /// Whether this device runs a Pillar for the network.
     #[serde(default)]
     pub host: bool,
@@ -1116,8 +1125,16 @@ impl Core {
                     sentinel_net::note(format!("Sentinel: try {} failed: {e:#}", attempt + 1));
                 }
                 match found {
-                    Ok(()) => {
+                    Ok(rest) => {
                         last = None;
+                        // Connected: a backup Pillar is looked for quietly
+                        // in the background, never holding up the start.
+                        let core = Arc::clone(self);
+                        let net2 = net.clone();
+                        tauri::async_runtime::spawn(async move {
+                            core.find_backup(&net2, rest).await;
+                            core.refresh_vouched(&net2).await;
+                        });
                         break;
                     }
                     Err(e) => {
@@ -1675,29 +1692,28 @@ impl Core {
         }
     }
 
-    /// Choose a primary and a backup Pillar automatically: try built-in
-    /// seeds and cached directory entries in random order, keep the first
-    /// two that answer, and learn more of the directory along the way.
+    /// Choose a Pillar automatically: try built-in seeds and cached
+    /// directory entries in random order, a few at a time, and start with
+    /// the first that answers, learning more of the directory along the way.
+    /// Returns the candidates not tried yet (for [`Self::find_backup`]).
     /// Never picks this device's own hosted Pillar (that would let observers
     /// link the account to the Pillar's uptime).
-    async fn auto_select_pillars(&self, net: &Net) -> Result<()> {
+    async fn auto_select_pillars(&self, net: &Net) -> Result<Vec<String>> {
         let (_, store) = self.unlocked()?;
         let own = self.with(|i| i.hosted.as_ref().map(|h| h.onion.clone()));
-        let mut candidates: Vec<String> = sentinel_net::seed_pillars();
-        for k in &store.known_pillars {
-            if !candidates.contains(k) {
-                candidates.push(k.clone());
-            }
-        }
-        candidates.retain(|c| Some(c) != own.as_ref());
-        shuffle(&mut candidates);
-        // Addresses someone typed in go first.
-        for h in self.with(|i| i.pillar_hints.clone()).into_iter().rev() {
-            if Some(&h) != own.as_ref() {
-                candidates.retain(|c| *c != h);
-                candidates.insert(0, h);
-            }
-        }
+        let today = directory::today();
+        // Typed-in addresses, then a mix of Pillars that worked lately,
+        // vouched ones and seeds, then the rest (see `directory::order`).
+        let mut candidates = directory::order(
+            &self.with(|i| i.pillar_hints.clone()),
+            &sentinel_net::seed_pillars(),
+            &store.known_pillars,
+            &store.vouched_pillars,
+            &store.pillar_health,
+            own.as_ref(),
+            today,
+        );
+        let mut outcomes: Vec<(String, bool)> = Vec::new();
 
         // Probe a few candidates at once (each on its own circuit), so dead
         // entries in the directory don't make the first connection crawl.
@@ -1706,17 +1722,10 @@ impl Core {
         // Why probes failed (shown on the connecting screen so a tester can say).
         let mut problems: Vec<String> = Vec::new();
         let mut i = 0;
-        let mut backup_rounds = 0;
-        while i < candidates.len() && chosen.len() < 2 {
-            // One Pillar that answers is enough to start. Look for a backup
-            // for one more round only: the directory can list many Pillars
-            // that have since gone (a backup is found later, in use).
-            if !chosen.is_empty() {
-                if backup_rounds >= 1 {
-                    break;
-                }
-                backup_rounds += 1;
-            }
+        // One Pillar that answers is enough to start: the directory can list
+        // Pillars that have since gone, and waiting for them only delays the
+        // start (a backup is found in the background afterwards).
+        while i < candidates.len() && chosen.is_empty() {
             let batch: Vec<String> = candidates[i..candidates.len().min(i + 6)].to_vec();
             i += batch.len();
             let probes = batch.iter().map(|c| async move {
@@ -1743,6 +1752,7 @@ impl Core {
                 (c.clone(), r)
             });
             for (c, r) in futures::future::join_all(probes).await {
+                outcomes.push((c.clone(), matches!(r, Ok(Ok(_)))));
                 let list = match r {
                     Ok(Ok(list)) => list,
                     Ok(Err(e)) => {
@@ -1766,6 +1776,7 @@ impl Core {
             }
         }
         if chosen.is_empty() {
+            let _ = self.update(|s| directory::record(s, &outcomes, today));
             match problems.first() {
                 Some(p) => bail!("no Pillars answered ({} tried; {p})", problems.len()),
                 None => bail!("no Pillars answered"),
@@ -1781,7 +1792,39 @@ impl Core {
             }
             s.known_pillars.truncate(200);
             s.profile_published = false;
-        })
+            directory::record(s, &outcomes, today);
+        })?;
+        Ok(candidates.into_iter().skip(i).filter(|c| !chosen.contains(c)).collect())
+    }
+
+    /// After connecting: find one backup Pillar among `candidates` (a few at
+    /// a time, each on its own circuit), for copies of posts and as a
+    /// fallback. Pillars that don't answer are just skipped.
+    async fn find_backup(&self, net: &Net, candidates: Vec<String>) {
+        if self.unlocked().map(|(_, s)| !s.replicas.is_empty()).unwrap_or(true) {
+            return;
+        }
+        for batch in candidates.chunks(6) {
+            let probes = batch.iter().map(|c| async move {
+                let ok = tokio::time::timeout(Duration::from_secs(60), async {
+                    let mut s = net.connect_hedged(c).await?;
+                    anyhow::Ok(matches!(request(&mut s, &Request::Ping).await?, Response::Pong))
+                })
+                .await;
+                (c.clone(), matches!(ok, Ok(Ok(true))))
+            });
+            let results = futures::future::join_all(probes).await;
+            let _ = self.update(|s| directory::record(s, &results, directory::today()));
+            if let Some((c, _)) = results.into_iter().find(|(_, ok)| *ok) {
+                sentinel_net::note(format!("Sentinel: backup Pillar {}… found", &c[..6.min(c.len())]));
+                let _ = self.update(|s| {
+                    if s.replicas.is_empty() && s.pillar.as_ref() != Some(&c) {
+                        s.replicas.push(c.clone());
+                    }
+                });
+                return;
+            }
+        }
     }
 
     /// Start (or restart) this device's Pillar on its own Tor client, with

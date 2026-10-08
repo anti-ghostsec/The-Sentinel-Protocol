@@ -65,6 +65,8 @@ pub struct MintState {
     /// Pillars' reward scores (see `earning`), and the last day shares
     /// were handed out.
     pillars: Mutex<HashMap<String, crate::earning::Score>>,
+    /// The signed vouched list, remade at most once an hour: (hour, CBOR).
+    vouch_cache: Mutex<Option<(u64, Vec<u8>)>>,
     share_day: Mutex<u64>,
 }
 
@@ -214,7 +216,7 @@ impl Econ {
             let share_day = std::fs::read_to_string(store.join("mint-share-day.txt")).ok().and_then(|t| t.trim().parse().ok()).unwrap_or(0);
             // Issuers check spend proofs all day: keep the proof circuit.
             std::thread::spawn(pqcash::warm_up);
-            let m = MintState { mint: credits::Mint::from_seed(&seed), seed, spent: Mutex::new(spent), stats: Mutex::new(stats), archives: Mutex::new(archives), pq: PqLedger::load(store, &seed), pillars: Mutex::new(pillars), share_day: Mutex::new(share_day) };
+            let m = MintState { mint: credits::Mint::from_seed(&seed), seed, spent: Mutex::new(spent), stats: Mutex::new(stats), archives: Mutex::new(archives), pq: PqLedger::load(store, &seed), pillars: Mutex::new(pillars), share_day: Mutex::new(share_day), vouch_cache: Mutex::new(None) };
             m.prune(store);
             Some(m)
         } else {
@@ -304,6 +306,33 @@ impl MintState {
 
     /// Once a day: work out each Pillar's share and add it to what it's owed
     /// (delivered on the next visit; at most a week's worth waits).
+    /// The Pillars this issuer has seen answer its random checks for weeks
+    /// (reward weight built up, checked in the last two days), most
+    /// reliable first, signed. Apps try these first when they connect.
+    fn vouched(&self, self_onion: &str) -> Vec<u8> {
+        let hour = now() / 3600;
+        let mut cache = self.vouch_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((h, b)) = cache.as_ref() {
+            if *h == hour {
+                return b.clone();
+            }
+        }
+        let today = day();
+        let mut good: Vec<(String, f64)> = self
+            .pillars
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, s)| s.earning_weight() >= crate::earning::VOUCH_WEIGHT && s.day + 2 >= today)
+            .map(|(o, s)| (o.clone(), s.earning_weight()))
+            .collect();
+        good.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let body = sentinel_core::directory::Vouch { mint: self_onion.to_owned(), day: today, pillars: good.into_iter().map(|(o, _)| o).collect() };
+        let b = cbor(&self.pq.sign_vouch(body));
+        *cache = Some((hour, b.clone()));
+        b
+    }
+
     fn share_out(&self, store: &Path) {
         let today = day();
         let mut sd = self.share_day.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -363,6 +392,10 @@ pub fn handle_pq(req: &Request, ctx: &Ctx) -> Option<Response> {
     let store = &ctx.store;
     let econ = &ctx.econ;
     Some(match req {
+        Request::Vouched => match &econ.mint {
+            Some(m) => Response::Object(m.vouched(&ctx.self_onion)),
+            None => Response::NotFound,
+        },
         Request::PqMintKey => match &econ.mint {
             Some(m) => Response::Object(cbor(&m.pq.public())),
             None => Response::NotFound,

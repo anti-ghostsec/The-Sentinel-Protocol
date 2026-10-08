@@ -4,6 +4,7 @@
 pub mod apps;
 pub mod cell;
 pub mod credits;
+pub mod directory;
 pub mod dm;
 pub mod erasure;
 pub mod identity;

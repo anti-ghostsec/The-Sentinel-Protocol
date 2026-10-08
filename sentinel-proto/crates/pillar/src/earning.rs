@@ -66,6 +66,9 @@ pub const MIN_WEIGHT: f64 = 0.05;
 /// Test items are asked for again at a random age up to this (days).
 /// Pillars need to keep content at least this long to earn (default 60).
 pub const PROBE_MAX_AGE: u64 = 30;
+/// Pillars at or above this earning weight (weeks of passed checks) are
+/// vouched for to apps (see `sentinel_core::directory`).
+pub const VOUCH_WEIGHT: f64 = 0.25;
 /// Most test items a mint keeps on one Pillar at a time (one a day, each
 /// asked for within PROBE_MAX_AGE days, plus some waiting for a Pillar
 /// that was away).
