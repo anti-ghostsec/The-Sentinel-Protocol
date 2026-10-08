@@ -1103,7 +1103,34 @@ impl Core {
             }
         };
         self.with(|i| i.net = Some(net.clone()));
-        // Pick Pillars automatically the first time (no addresses to paste).
+        // My Pillar may have gone away since last time: if it doesn't
+        // answer, pick again (Pillars that worked lately, like the backup,
+        // are tried first). Two tries, so a slow start isn't taken for gone.
+        if let Some(p) = self.unlocked().ok().and_then(|(_, s)| s.pillar) {
+            self.set_status(&app, "connecting", 0.95, "Checking your Pillar".into());
+            let mut answered = false;
+            for _ in 0..2 {
+                let probe = async {
+                    let mut s = net.connect_hedged(&p).await?;
+                    anyhow::Ok(matches!(request(&mut s, &Request::Ping).await?, Response::Pong))
+                };
+                if matches!(tokio::time::timeout(Duration::from_secs(60), probe).await, Ok(Ok(true))) {
+                    answered = true;
+                    break;
+                }
+            }
+            let today = directory::today();
+            let _ = self.update(|s| {
+                directory::record(s, &[(p.clone(), answered)], today);
+                if !answered && s.pillar.as_ref() == Some(&p) {
+                    sentinel_net::note(format!("Sentinel: my Pillar {}… didn't answer; picking another", &p[..6.min(p.len())]));
+                    s.pillar = None;
+                    s.replicas.retain(|r| *r != p);
+                }
+            });
+        }
+        // Pick Pillars automatically the first time (no addresses to paste),
+        // or when mine is gone.
         if self.unlocked().map(|(_, s)| s.pillar.is_none()).unwrap_or(false) {
             // A Pillar can be briefly unreachable (just started, or its
             // onion address still being published): keep trying for a while.
