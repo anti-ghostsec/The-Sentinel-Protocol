@@ -130,20 +130,36 @@ impl Core {
             return;
         }
         let mut all: Vec<String> = Vec::new();
+        let mut checked = 0;
         for mint in super::wallet::mints_of(&store) {
-            let Ok(pk) = self.pq_key(&mint).await else { continue };
-            let Ok(Ok(mut s)) = tokio::time::timeout(std::time::Duration::from_secs(90), net.connect_hedged(&mint)).await else { continue };
-            let Ok(Response::Object(b)) = request(&mut s, &Request::Vouched).await else { continue };
-            let Ok(v) = ciborium::from_reader::<sentinel_core::directory::SignedVouch, _>(b.as_slice()) else { continue };
-            if let Some(list) = sentinel_core::directory::check_vouch(&pk, &mint, day, &v) {
-                for p in list {
-                    if sentinel_net::transport::check_onion(&p).is_ok() && !all.contains(&p) {
-                        all.push(p);
+            let short: String = mint.chars().take(6).collect();
+            let why = async {
+                let pk = self.pq_key(&mint).await.map_err(|e| format!("no key ({e:#})"))?;
+                let mut s = match tokio::time::timeout(std::time::Duration::from_secs(90), net.connect_hedged(&mint)).await {
+                    Ok(Ok(s)) => s,
+                    _ => return Err("no answer".to_string()),
+                };
+                let b = match request(&mut s, &Request::Vouched).await {
+                    Ok(Response::Object(b)) => b,
+                    Ok(other) => return Err(format!("no list ({other:?})").chars().take(80).collect()),
+                    Err(e) => return Err(format!("no list ({e:#})")),
+                };
+                let v: sentinel_core::directory::SignedVouch = ciborium::from_reader(b.as_slice()).map_err(|_| "unreadable list".to_string())?;
+                sentinel_core::directory::check_vouch(&pk, &mint, day, &v).ok_or_else(|| "list failed its signature or date check".to_string())
+            };
+            match why.await {
+                Ok(list) => {
+                    checked += 1;
+                    for p in list {
+                        if sentinel_net::transport::check_onion(&p).is_ok() && !all.contains(&p) {
+                            all.push(p);
+                        }
                     }
                 }
+                Err(e) => sentinel_net::note(format!("Sentinel: issuer {short}… vouched list: {e}")),
             }
         }
-        sentinel_net::note(format!("Sentinel: issuers vouch for {} Pillar(s)", all.len()));
+        sentinel_net::note(format!("Sentinel: {checked} issuer list(s) checked; they vouch for {} Pillar(s)", all.len()));
         let _ = self.update(|s| {
             s.vouched_pillars = all;
             s.vouched_day = day;

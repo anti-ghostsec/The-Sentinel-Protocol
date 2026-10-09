@@ -114,6 +114,38 @@ pub enum RoomBlob {
         #[serde(with = "crate::apps::serde_bytes_compat")]
         signed: Vec<u8>,
     },
+    /// A member's report about a message, sealed separately to the room's
+    /// admin and each moderator: only they can read it (other members see a
+    /// blob they can't open, and so does the Pillar).
+    Report { sealed: Vec<Vec<u8>> },
+}
+
+/// A report about one room message (see `RoomBlob::Report`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RoomReport {
+    pub session_id: String,
+    pub index: u32,
+    /// What's wrong (one of `crate::social::REPORT_CATEGORIES`).
+    pub category: String,
+    /// The reporter's note (optional, short).
+    pub note: String,
+    /// The message as the reporter saw it.
+    pub text: String,
+    pub minute: u64,
+}
+
+const REPORT_CONTEXT: &str = "sentinel/v1/room-report";
+
+/// Seal a report to one admin or moderator (their room-only keys).
+pub fn seal_report(to: &[u8; 32], to_kem: &[u8], room_id: &[u8; 32], r: &RoomReport) -> Option<Vec<u8>> {
+    crate::pq::seal(REPORT_CONTEXT, room_id, to, Some(to_kem), &cbor(r))
+}
+
+/// Open a report sealed to me, if it is.
+pub fn open_report(member_secret: &[u8; 32], room_id: &[u8; 32], sealed: &[u8]) -> Option<RoomReport> {
+    let plain = crate::pq::open(REPORT_CONTEXT, room_id, member_secret, Some(&member_kem_seed(member_secret)), sealed)?;
+    let r: RoomReport = ciborium::from_reader(plain.as_slice()).ok()?;
+    (r.text.chars().count() <= 5000 && r.note.chars().count() <= 500 && r.category.len() <= 40).then_some(r)
 }
 
 /// A request to join (approval rooms).
@@ -515,6 +547,18 @@ pub fn new_room() -> ([u8; 32], [u8; 32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_reports_open_only_for_the_admin_and_moderators() {
+        let room_id = [3u8; 32];
+        let admin = crate::random_bytes::<32>();
+        let other = crate::random_bytes::<32>();
+        let r = RoomReport { session_id: "s".into(), index: 4, category: "violence".into(), note: "".into(), text: "bad".into(), minute: 1 };
+        let sealed = seal_report(&member_pub(&admin), &member_kem_public(&admin), &room_id, &r).unwrap();
+        assert_eq!(open_report(&admin, &room_id, &sealed), Some(r));
+        assert!(open_report(&other, &room_id, &sealed).is_none(), "another member can't read it");
+        assert!(open_report(&admin, &[4u8; 32], &sealed).is_none(), "another room");
+    }
 
     #[test]
     fn two_members_talk_deniably_and_outsiders_cant() {

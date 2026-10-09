@@ -33,6 +33,8 @@ Thanks for trying Sentinel! This is one of its first releases, and your feedback
 - **Polls:** in a room you made, press **Apps** → *Add Polls to this room*. Ask a question; everyone in the room can vote and change their vote until you close it.
 - **Safety features** (Settings → Safety): emergency passphrase, key file, disguise mode (the app turns into a calculator when locked).
 - **Deleting messages:** in a conversation or room, *Select* lets you delete some messages or all of them (in a conversation you can also ask the other person's app to delete them). Settings → Privacy → *Delete all messages* clears everything.
+- **Report anything harmful:** public posts and Discover rooms have a *Report* button, and so do messages in rooms. It goes to whoever can see the content (the Pillars holding a public post, or a room's moderators), never to anyone who can't. Media from people you don't follow is blurred in Discover until you tap it.
+- **Forgot your passphrase?** The unlock screen has a link that lets you start over and get your account back with your recovery words, a backup or another device.
 - **Credits that don't arrive come back:** if credits you sent are never collected, your app takes them back by itself (after a day if the message never got through, after 8 days if it did but wasn't opened).
 
 ## Your phone and computer together

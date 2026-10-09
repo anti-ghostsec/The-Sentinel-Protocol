@@ -124,6 +124,14 @@ pub fn wrap(route: &[(String, MixKey)], deliver: Step) -> Option<Vec<u8>> {
     (packet.len() <= MAX_PACKET).then_some(packet)
 }
 
+/// A hand-off: one layer, for one Pillar to deliver right away (and keep
+/// retrying for days if the destination doesn't answer), so a message
+/// leaves the sender's device even when its destination is down.
+pub fn handoff(via: &MixKey, deliver: Step) -> Option<Vec<u8>> {
+    let packet = seal_layer(via, deliver, 0)?;
+    (packet.len() <= MAX_PACKET).then_some(packet)
+}
+
 /// A Pillar opens its layer: (what to do, after how long).
 pub fn unwrap(secret: &MixSecret, packet: &[u8]) -> Option<(Step, u32)> {
     if packet.len() > MAX_PACKET {

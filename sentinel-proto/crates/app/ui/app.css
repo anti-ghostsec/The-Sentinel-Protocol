@@ -456,3 +456,15 @@ body { padding-top: env(safe-area-inset-top); }
 .bubble-row.selectable { cursor: pointer; border-radius: 12px; padding: 2px; }
 .bubble-row.selectable .bubble { outline: 1px dashed var(--line-strong); }
 .bubble-row.selected .bubble { outline: 2px solid var(--accent); }
+
+/* reports */
+.report-dialog { max-width: 440px; width: calc(100% - 32px); border: 1px solid var(--line); border-radius: 16px; background: var(--surface); color: inherit; padding: 20px; }
+.report-dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+.report-option { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+.report-box { border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
+.report-quote { border-left: 3px solid var(--line); padding-left: 10px; white-space: pre-wrap; word-break: break-word; }
+/* Media from people you don't follow (Discover): blurred until tapped. */
+.post.stranger .media-tile, .post.stranger video, .post.stranger .stream-block { filter: blur(28px); }
+.post.stranger .media-grid, .post.stranger .stream-block { cursor: pointer; position: relative; }
+.post.stranger .media-note { display: block; }
+.media-note { display: none; }

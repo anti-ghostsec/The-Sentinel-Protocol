@@ -59,6 +59,17 @@ struct Args {
     /// the app: Settings -> Credits), and exit without starting Tor.
     #[arg(long)]
     take_credits: Option<std::path::PathBuf>,
+    /// List reports about public content this Pillar holds (posts, room
+    /// listings, their media), and exit.
+    #[arg(long)]
+    reports: bool,
+    /// Remove reported content (by its address from --reports): deleted
+    /// here and refused if uploaded again. Exits.
+    #[arg(long)]
+    remove: Option<String>,
+    /// Keep reported content: dismiss its reports. Exits.
+    #[arg(long)]
+    keep: Option<String>,
     /// Test builds: check that the parts in this file (from
     /// --take-credits) are in the list of the mint whose data folder is
     /// --data, and exit.
@@ -75,6 +86,26 @@ async fn main() -> Result<()> {
         let parts: Vec<(String, sentinel_core::credits::Token)> = serde_json::from_slice(&std::fs::read(file)?)?;
         let (found, all) = pillar::check_rewards(&sentinel_net::data_root(&args.data)?.join("objects"), &parts)?;
         println!("{found} of {all} credit parts are in the mint's list");
+        return Ok(());
+    }
+    if args.reports || args.remove.is_some() || args.keep.is_some() {
+        let store = sentinel_net::data_root(&args.data)?.join("objects");
+        if let Some(a) = &args.remove {
+            pillar::remove_reported(&store, a)?;
+            println!("Removed {a}: deleted here, and refused if it's uploaded again.");
+        } else if let Some(a) = &args.keep {
+            pillar::keep_reported(&store, a)?;
+            println!("Kept {a}: its reports are dismissed.");
+        } else {
+            let list = pillar::list_reports(&store);
+            if list.is_empty() {
+                println!("No reports.");
+            }
+            for r in list {
+                println!("{}  {}{}  ({} media pieces)", r.address, r.summary(), if r.hidden { "  [hidden from Discover]" } else { "" }, r.chunks.len());
+            }
+            println!("\nRemove: pillar --remove <address>    Keep: pillar --keep <address>");
+        }
         return Ok(());
     }
     if let Some(out) = &args.take_credits {

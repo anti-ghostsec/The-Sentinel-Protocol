@@ -146,6 +146,14 @@
     </div>
     <p id="unlock-error" class="error" role="alert" hidden></p>
     <button type="submit" class="btn primary block">Unlock</button>
+    <button type="button" id="unlock-forgot" class="link-btn small">Forgot your passphrase?</button>
+    <div id="forgot-box" class="card stack-12" hidden>
+      <p class="small">Nobody can reset a passphrase, not even the people who make Sentinel: that's what keeps your account safe if this device is taken.</p>
+      <p class="small">You can still get your account back, with your <b>recovery words</b>, a <b>backup file</b>, or <b>another device</b> where you're signed in. To do that here, first remove the locked copy on this device. It can't be opened without the passphrase anyway.</p>
+      <p class="small muted">If you might still remember the passphrase, don't do this yet.</p>
+      <button type="button" id="forgot-start-over" class="btn outline block">Remove it and get my account back</button>
+      <p id="forgot-msg" class="error small" role="alert" hidden></p>
+    </div>
   </form>
 </section>
 
@@ -522,6 +530,11 @@
               <button type="button" id="host-toggle" class="toggle" role="switch" aria-label="Run a Pillar" aria-checked="false"></button>
             </div>
             <p id="host-status" class="mono small muted" role="status"></p>
+            <div id="host-reports" class="stack-8" hidden>
+              <span class="setting-title">Reports about public content on your Pillar</span>
+              <span class="muted small">Public posts and room listings stored on your Pillar that people reported. After a few reports they're hidden from Discover until you decide. You don't have to look at them to remove them. Private messages and rooms can't be read by your Pillar, so they never show up here.</span>
+              <div id="host-report-list" class="stack-8"></div>
+            </div>
             <div class="warning stack-10" role="note">
               <span class="warning-title"><span class="icon sm" data-icon="alert"></span>The risks of running a Pillar</span>
               <ul class="warn-list">
@@ -785,6 +798,20 @@
   <button type="button" id="lightbox-close" class="icon-btn lightbox-close" aria-label="Close"><span class="icon lg" data-icon="x"></span></button>
   <img id="lightbox-img" alt="">
 </div>
+
+<!-- REPORT -->
+<dialog id="report-dialog" class="report-dialog">
+  <form method="dialog" class="stack-16">
+    <h2 class="title-sm">What's wrong with it?</h2>
+    <p id="report-explain" class="muted small"></p>
+    <div id="report-options" class="stack-8"></div>
+    <label id="report-note-field" class="field" hidden><span class="label">Anything they should know (optional)</span><input id="report-note" type="text" maxlength="300" autocomplete="off"></label>
+    <div class="inline-actions">
+      <button type="submit" value="cancel" class="btn ghost small-btn">Cancel</button>
+      <button type="submit" value="send" id="report-send" class="btn primary small-btn" disabled>Send report</button>
+    </div>
+  </form>
+</dialog>
 
 <script src="app.js"></script>
 </body>

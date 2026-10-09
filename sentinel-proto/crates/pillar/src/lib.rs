@@ -19,9 +19,12 @@
 
 mod directory;
 mod economy;
+mod relay;
+mod reports;
 mod pqmint;
 mod earning;
 pub use economy::take_rewards;
+pub use reports::{keep as keep_reported, list as list_reports, remove as remove_reported, Report};
 #[cfg(feature = "test-hooks")]
 pub use economy::check_rewards;
 
@@ -52,8 +55,11 @@ const MAX_REQUESTS_PER_STREAM: usize = 256;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Streams one rendezvous circuit may open before it is torn down.
 const MAX_STREAMS_PER_CIRCUIT: u32 = 8;
-/// Largest inbox/room-box reply (well under the 2 MiB message limit).
-const FETCH_REPLY_BYTES: usize = 1536 * 1024;
+/// Most data in one inbox, room-box or author-bucket reply. These replies
+/// encode each byte as a CBOR number (up to 2 bytes on the wire), so the
+/// data is kept under half the 2 MiB message limit: a bigger reply can't be
+/// sent at all, and the reader would get nothing, ever, from that bucket.
+const FETCH_REPLY_BYTES: usize = 900 * 1024;
 /// Directory size bound.
 const MAX_KNOWN_PILLARS: usize = 500;
 /// How many Pillars to return per directory request.
@@ -282,6 +288,9 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
 
     // Pass signed releases and revocations on, Pillar to Pillar.
     tasks.push(tokio::spawn(spread_updates(Arc::clone(&ctx), cfg.seeds.clone(), cfg.spread_after)));
+
+    // Messages taken on but not passed on yet: retried for days.
+    tasks.push(tokio::spawn(relay::retry_loop(ctx.store.clone(), mix_ctx(&ctx))));
 
     // Test the Pillars and Archives we list, so gone ones aren't handed out.
     tasks.push(tokio::spawn(directory::check_loop(Arc::clone(&ctx))));
@@ -733,6 +742,9 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
                 return Response::Rejected("only encrypted (sealed) objects are accepted".into());
             };
             let addr = Address::of(&bytes);
+            if reports::removed(store).contains(&addr.to_text()) {
+                return Response::Rejected("removed by this Pillar".into());
+            }
             let path = store.join(addr.to_text());
             let _guard = INDEX_LOCK.lock().await;
             if tokio::fs::try_exists(&path).await.unwrap_or(false) {
@@ -807,7 +819,23 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             if shard > social::RECENT_SHARD {
                 return Response::Rejected("no such shard".into());
             }
-            Response::Index(page(read_lines(&shard_path(store, shard)).await, after))
+            // Reported content waiting for the operator is left out; the
+            // positions stay the same, so readers' places don't shift.
+            let hidden = reports::hidden(store);
+            let list = page(read_lines(&shard_path(store, shard)).await, after);
+            Response::Index(if hidden.is_empty() { list } else { list.into_iter().filter(|(_, a)| !hidden.contains(&a.to_text())).collect() })
+        }
+        Request::Report { address, chunks, category, token, nonce } => {
+            if usize::from(category) >= social::REPORT_CATEGORIES.len()
+                || chunks.len() > 5000
+                || !pow::check(social::REPORT_POW_DOMAIN, &social::report_pow_data(&address, &token, category), nonce, social::REPORT_POW_BITS)
+            {
+                stats.rejected.fetch_add(1, Ordering::Relaxed);
+                return Response::Rejected("invalid report".into());
+            }
+            let store = store.clone();
+            let _ = tokio::task::spawn_blocking(move || reports::record(&store, &address, &chunks, category, &token)).await;
+            Response::Pong
         }
         Request::FollowNotice { author, token, follow, nonce } => {
             let data = social::follow_pow_data(&author, &token, follow);
@@ -913,12 +941,12 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             ctx2.waiting.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(u64::from(delay))).await;
-                // A few tries over the next hour (the sender can't be told).
-                for attempt in 0..4u64 {
-                    if mix_step(&ctx2, &step).await.is_ok() {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_secs(60 + attempt * 600 + random_below(300))).await;
+                // Once now; if the next Pillar doesn't answer, it's kept on
+                // disk and retried for days (see `relay`): the sender may
+                // already be offline and can't be told.
+                let done = matches!(tokio::time::timeout(Duration::from_secs(120), mix_step(&ctx2, &step)).await, Ok(Ok(())));
+                if !done {
+                    relay::keep(&ctx2.store, &step).await;
                 }
                 ctx2.waiting.fetch_sub(1, Ordering::Relaxed);
             });
@@ -993,6 +1021,9 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
                 return Response::Rejected("invalid chunk".into());
             }
             let addr = Address::of(&data);
+            if reports::removed(store).contains(&addr.to_text()) {
+                return Response::Rejected("removed by this Pillar".into());
+            }
             let path = store.join("chunks").join(addr.to_text());
             if tokio::fs::try_exists(&path).await.unwrap_or(false) {
                 let p = path.clone();
@@ -1239,6 +1270,7 @@ async fn fetch_bundle<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(c
 /// What a waiting mixed packet needs from the Pillar.
 struct MixCtx {
     tor: Arc<TorClient<PreferredRuntime>>,
+    store: PathBuf,
     self_onion: String,
     waiting: Arc<AtomicU64>,
     deliver_local: tokio::sync::mpsc::UnboundedSender<(u16, Vec<u8>, u64)>,
@@ -1250,6 +1282,7 @@ static MIX_WAITING: std::sync::OnceLock<Arc<AtomicU64>> = std::sync::OnceLock::n
 fn mix_ctx(ctx: &Ctx) -> MixCtx {
     MixCtx {
         tor: Arc::clone(&ctx.tor),
+        store: ctx.store.clone(),
         self_onion: ctx.self_onion.clone(),
         waiting: MIX_WAITING.get_or_init(|| Arc::new(AtomicU64::new(0))).clone(),
         deliver_local: MIX_LOCAL.get().cloned().expect("mix delivery started"),
@@ -1289,6 +1322,29 @@ async fn mix_step(ctx: &MixCtx, step: &sentinel_core::mix::Step) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fullest_reply_still_fits_in_one_message() {
+        // Random (incompressible) data, in the largest objects allowed, up
+        // to the reply limit: the encoded reply must still be sendable.
+        let mut out = Vec::new();
+        let mut total = 0;
+        let mut n = 0u64;
+        while total + sentinel_core::object::MAX_OBJECT_LEN <= FETCH_REPLY_BYTES {
+            let b: Vec<u8> = (0..sentinel_core::object::MAX_OBJECT_LEN).map(|i| (i as u8).wrapping_mul(97).wrapping_add(200)).collect();
+            total += b.len();
+            n += 1;
+            out.push((n, b));
+        }
+        // Fill the rest with mailbox-sized blobs of high bytes (2 bytes each on the wire).
+        while total + dm::MAX_BLOB <= FETCH_REPLY_BYTES {
+            total += dm::MAX_BLOB;
+            n += 1;
+            out.push((n, vec![255u8; dm::MAX_BLOB]));
+        }
+        let encoded = wire::encode(&Response::Blobs(out));
+        assert!(encoded.len() <= sentinel_core::cell::MAX_MESSAGE, "{} > {}", encoded.len(), sentinel_core::cell::MAX_MESSAGE);
+    }
 
     #[test]
     fn gone_pillars_age_out_of_the_lists() {

@@ -467,6 +467,28 @@ pub fn follow_pow_data(author: &[u8; 32], token: &[u8; 32], follow: bool) -> Vec
 pub const ANNOUNCE_POW_DOMAIN: &str = "sentinel/v0/pillar-announce-pow";
 pub const ANNOUNCE_POW_BITS: u32 = 20;
 
+/// What a report can be about. Kept short on purpose: reports are for
+/// content that's illegal or dangerous, not for disagreeing with a post.
+pub const REPORT_CATEGORIES: &[&str] = &["child-abuse", "intimate-images", "violence", "doxxing", "spam", "other-illegal"];
+/// Proof of work for a report to a Pillar (so fake reports cost something).
+pub const REPORT_POW_DOMAIN: &str = "sentinel/v1/report-pow";
+pub const REPORT_POW_BITS: u32 = 18;
+
+pub fn report_pow_data(address: &[u8; 32], token: &[u8; 32], category: u8) -> Vec<u8> {
+    let mut d = address.to_vec();
+    d.extend_from_slice(token);
+    d.push(category);
+    d
+}
+
+/// A reporter's token for one item: the same every time this person reports
+/// it (so repeating a report doesn't count twice), but unlinkable to them or
+/// across items (like follow tokens).
+pub fn report_token(reporter: &SigningKey, address: &[u8; 32]) -> [u8; 32] {
+    let k = blake3::derive_key("sentinel/v1/report-token", &reporter.to_bytes());
+    *blake3::keyed_hash(&k, address).as_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

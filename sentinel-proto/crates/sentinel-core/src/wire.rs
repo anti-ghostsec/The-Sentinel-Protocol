@@ -132,6 +132,13 @@ pub enum Request {
     /// An issuer's signed list of Pillars it has seen answer for weeks
     /// (`Object`: CBOR `directory::SignedVouch`; `NotFound` if not an issuer).
     Vouched,
+    /// Report public content this Pillar holds: an object (a post or a room
+    /// listing) and the media pieces it points to. `category` indexes
+    /// `social::REPORT_CATEGORIES`; `nonce` is proof of work. Answered
+    /// with `Pong` (even when nothing here matches: no oracle).
+    /// `token` (`social::report_token`) lets the Pillar count each
+    /// reporter once without learning who they are.
+    Report { address: [u8; 32], chunks: Vec<[u8; 32]>, category: u8, token: [u8; 32], nonce: u64 },
 }
 
 /// Bytes per `UpdateChunk` answer.

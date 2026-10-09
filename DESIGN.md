@@ -215,6 +215,7 @@ Every contact has a **safety number** (60 digits). Compare it in person or over 
 - **Change passphrase** at any time.
 - **Encrypted backup** to a file of your choice. A backup holds your identity, who you follow, your rooms and your credits, but **no message history and no session keys**, so a seized backup doesn't reveal conversations.
 - **Panic wipe** deletes the account, its data, the app's browser storage and any extracted helper files from the device.
+- **Forgot your passphrase?** Nobody can reset it, not even the people who make Sentinel: that's what keeps an account safe on a taken device. The unlock screen explains this and offers to remove the locked copy on this device (it can't be opened without the passphrase anyway), so you can get the account back with your recovery words, a backup, or another device where you're signed in. *Tested:* the locked copy was removed and the app went back to the welcome screen.
 
 ### Emergency passphrase *(Built)*
 
@@ -306,9 +307,20 @@ Use one account on your phone and your computer at the same time (Settings → S
 
 ### Finding Pillars *(Built)*
 
-The app ships with a few **seed Pillars** and learns about the rest from them. New Pillars announce themselves with a small proof of work, and are only listed after they're checked to actually answer. Live Pillars announce themselves again every 6 hours, and **any Pillar or Archive not seen for 3 days drops off the lists** (each entry keeps only the day it was last seen), so gone Pillars aren't handed to new apps.
+The app ships with a few **seed Pillars** and learns about the rest from them. New Pillars announce themselves with a small proof of work, and are only listed after they're checked to actually answer. Live Pillars announce themselves again every 6 hours, and any Pillar or Archive not seen for 3 days drops off the lists.
 
-Your app picks its Pillars automatically; you never type addresses. It starts as soon as **one** Pillar answers, looks for a backup for one more short round, and finds one later while in use if needed. (Before this, an app waiting for a second Pillar could sit at "Finding Pillars" for a very long time when the list held gone Pillars; it happened in testing.) If the starting Pillars don't answer, the connecting screen says so and lets you paste the address of a Pillar someone you trust runs; there's also a manual setting under Advanced.
+The network is built so that **gone Pillars never slow anyone down**, even with a million users and hundreds of Pillars disappearing:
+
+- **Pillars check before they recommend.** Every Pillar tests the Pillars and Archives it lists at random times, each over its own circuit, and hands out only ones that answered in the last few hours, the more reliable first. One that fails three tests in a row is dropped from its lists. What a Pillar learns about others' uptime stays in memory, never on disk.
+- **A sample, not the whole list.** Each answer is a random handful, so it stays small however big the network gets, and nobody learns the whole directory from one request.
+- **Your app remembers what worked.** It keeps the day each Pillar last answered and how many tries failed (days only, nothing finer). Pillars that worked lately are tried first, ones failing today wait, and ones silent for a week are forgotten.
+- **Issuers vouch for proven Pillars.** The credit issuers already test every Pillar at random times for months (to pay them, section 13). Each signs a short list of Pillars that built up real weight that way; apps check the signature against the issuer keys built into Sentinel and try those Pillars early. A flood of fake or dead Pillars can't push them aside, because earning a place takes weeks of really serving.
+- **A race, not a queue.** The app tries a mix at once (Pillars that worked lately, vouched ones and seeds, each on its own circuit) and starts with whichever answers first. A backup Pillar is found quietly in the background afterwards, never holding up the start.
+- **If your Pillar disappears,** the app notices when it connects and picks another, trying your backup and other Pillars that worked lately first.
+
+*Tested over Tor:* a new account connected as soon as the seed answered (7 to 15 seconds), then fetched the issuer's signed list and checked its signature. Restarted with a working Pillar, the app went straight to it. With its Pillar set to one that was gone, the app noticed within 45 seconds, picked the seed, and was connected 9 seconds later. (Before this, a phone could wait several minutes on gone Pillars left over from an earlier test; it happened to a tester.)
+
+If the starting Pillars don't answer, the connecting screen says so and lets you paste the address of a Pillar someone you trust runs; there's also a manual setting under Advanced.
 
 **Connection log (Built).** Settings → Connection, and the connecting screen, show what Tor and Sentinel did lately (finding Pillars, sending, receiving), with a button to copy it for whoever is helping you. It's kept in memory only, never written to disk, with addresses blanked out by Tor's own safe logging, and holds no account, messages or IP address.
 
@@ -382,6 +394,7 @@ For things you only want certain people to see. Someone who follows you can **as
 - To protect readers, topics are grouped into **64 buckets**. When you browse a topic, your app downloads its whole bucket plus extra random buckets as cover, each over its own circuit. A Pillar learns "someone fetched buckets 7, 19 and 40", never which topic you care about. Ranking happens on your device.
 - Discoverable posts are encrypted under keys any Sentinel app can work out. That protects hosts from casual scanning, but **a public post can't be secret from the public**, and the app is honest about that.
 - Discover is off for your posts in High-risk mode: a niche topic plus a posting time can point to a person.
+- **Across Pillars:** posts live on their authors' Pillars, so each Discover pass also reads two other Pillars (ones that answered lately first): people on different Pillars find each other.
 
 ### Follower counts without revealing followers *(Built)*
 
@@ -390,6 +403,26 @@ Following someone sends their Pillar an **anonymous follow notice**: a token tha
 ### Muting and blocking *(Built)*
 
 **Mute** hides someone's posts. **Block** hides them everywhere and drops their messages unread. Both lists stay on your device, and nobody is ever told, so blocking someone can't reveal anything to them.
+
+### Reporting harmful content *(Built)*
+
+A network nobody owns still has to deal with child sexual abuse material and other illegal content, and the people most at risk from it are the volunteers whose computers would hold it. Sentinel's rule: **a report goes to whoever can actually see the content, and nobody gets new powers to read anything private.**
+
+| Where it is | Report goes to | Can they see it? |
+|---|---|---|
+| A public post, or a public room's Discover listing | The Pillars and Archives that hold it | Yes: public content can be opened by anyone |
+| A room message | The room's creator and moderators, sealed to them | Yes: they're members. Other members and the Pillar can't read the report, and it doesn't say who sent it |
+| A private message | Nobody else (block the person) | Only the two people can read it |
+
+- **What reports are for:** sexual content involving a child, intimate images shared without consent, threats or violence, someone's private details (doxxing), spam and scams, and other illegal or dangerous content. Not for disagreeing with a post.
+- **Hidden first, then a person decides.** After reports from three different people, a Pillar hides a public post from Discover until its operator decides. Nobody has to be online for that first step, and one person can't make anything disappear: each reporter counts once (an anonymous token, the same each time they report that post, that doesn't say who they are), and a small proof of work makes floods of fake reports expensive.
+- **Operators decide:** in the app (Settings → Help run Sentinel, with the text shown and media not shown) or on a server (`pillar --reports`, `pillar --remove <address>`, `pillar --keep <address>`). Removing doesn't require looking at it. Removed content is deleted along with its media pieces, and refused if someone uploads it there again.
+- **No list.** Each Pillar only remembers, privately, what it removed itself (as fingerprints, so the same files aren't accepted again). Nothing is published or shared between Pillars.
+- **For the person reporting:** the post disappears from their device at once and never comes back.
+- **Media from strangers is blurred in Discover** until tapped, so nobody sees something harmful by accident.
+- **Honest limits:** content in private conversations can't be detected by the network: that's true of every end-to-end encrypted app, and scanning everyone's device would break the privacy that keeps people safe. Someone who re-posts removed material on a different Pillar has to be reported there too. Operators should know the law where they live: in many countries they must remove such content once they know of it, and in some they must report it.
+
+*Tested over Tor:* a public post found in Discover was reported by two people (it vanished from their devices at once; the operator's list showed "spam ×2"); a room message was reported and only the room's creator could open the report; the operator removed the post.
 
 ### Planned
 
@@ -408,6 +441,8 @@ Custom feeds anyone can publish, anonymous "boosts" into Discover, competing tre
 - **Deniable:** messages are authenticated in a way that convinces the person you're talking to, but **proves nothing to anyone else.** Even your first message, which introduces you, uses a code only the recipient could also have made.
 - **Disappearing messages** are on by default: messages are deleted from both sides after 7 days. (Honest limit: a modified app could ignore that.)
 - **Deleting messages yourself** *(Built)*: in a conversation, *Select* lets you pick messages (or *Delete all*), and "Also ask their app to delete them" sends a request that the other person's app carries out. In a room, *Select* deletes messages on your devices (only the room's admin and moderators can hide them for everyone). Settings → Privacy → *Delete all messages* clears every conversation and room at once. Your other devices delete the same messages. Deleting asks twice. (Honest limit: asking the other app is a request; a modified app or a screenshot can't be undone.) *Tested over Tor:* deleting one message only on one side, one on both sides (gone from the other person's app within a minute), one room message, and everything; nothing came back after a refresh.
+- **Delivered even if you go offline.** A message goes straight to the other person's Pillar. If that Pillar doesn't answer, your app hands the sealed message to another Pillar, which keeps trying for 7 days (on disk, so even its own restarts don't lose it): the message has left your device, and you can go offline. That Pillar can't read it or tell who sent it. *Tested over Tor:* the recipient's Pillar was switched off, the sender sent a message and went offline, and when the Pillar came back the message arrived 3 minutes later.
+- **Nothing missed while you're away.** Messages wait on your Pillar for 7 days, in the mailbox for the day they were sent; after time offline, your app reads every day it missed, not just today's.
 - Replays and duplicates are recognised and dropped.
 
 ### Protection against future quantum computers *(Built)*
@@ -705,6 +740,7 @@ Volunteers are a target too: raided, sued or pressured over what passes through 
 - **Measured over real Tor:** a request on a warm connection takes about 0.6 to 0.7 seconds; a fresh private request group through the pool, about 0.7 seconds.
 - **Parallel downloads (Built):** files come from several Archives at once over separate circuits.
 - **One connection per room delivery (Built):** without mixing, the items a room has waiting (introductions, room details, messages) go to the room's Pillar over one connection instead of one each. A new onion connection takes 5 to 20 seconds, so a new room's first message went from over a minute to about 16 seconds. The trade-off: the Pillar can tell those sealed items came from one device (as their timing mostly shows anyway), never what they say, who sent them or which room they're for. With mixing on, each still travels through the mix on its own.
+- **Sync steps at the same time (Built):** checking mail, delivering, reading posts and Discover run side by side (each on its own circuits), and mailboxes are fetched in parallel, each starting at its own random moment (so they don't arrive as one recognisable burst).
 - *Planned:* downloading whole "what's new" buckets instead of asking per account, and cover traffic that pre-fetches popular content.
 
 ---
@@ -740,7 +776,7 @@ Plainly:
 Each line: the attack, then what stops it. "Fixed" means a real weakness was found in the prototype and repaired.
 
 <details>
-<summary><b>All 133 attacks, one line each</b> (click to open)</summary>
+<summary><b>All 140 attacks, one line each</b> (click to open)</summary>
 
 | # | Attack | What stops it |
 |---|--------|---------------|
@@ -877,6 +913,13 @@ Each line: the attack, then what stops it. "Fixed" means a real weakness was fou
 | 131 | Credits lost in a message that never arrives, or is never opened | The sender's app takes them back (a day if undelivered, 8 days if never collected) (Fixed) |
 | 132 | A Windows policy setting giving Sentinel's browser engine a remote-control port or another engine | Checked before the window opens; Sentinel refuses to start and says where the setting is (Fixed) |
 | 133 | A phone closing Sentinel in the background because it holds a lot of memory | The credit proof machinery is freed after each payment on phones (Fixed) |
+| 134 | Gone or fake Pillars filling the directory so apps wait or never connect | Pillars test what they list and hand out samples of live ones; apps remember what worked, race a mix, and try issuer-vouched Pillars early (Fixed) |
+| 135 | An app stuck forever on a Pillar that disappeared | Checked at every connection; a new one is picked when it's gone (Fixed) |
+| 136 | A message stuck on the sender's device (or lost) because the recipient's Pillar was down | Handed to another Pillar that keeps trying for 7 days, on disk (Fixed) |
+| 137 | Messages missed after more than two days offline | Every missed day's mailbox is read, back to 7 days (Fixed) |
+| 138 | Replies too big to send, so a busy Pillar's posts or mail could never be read | Replies capped so they always fit (Fixed: found in testing, it stopped people seeing each other's posts) |
+| 139 | Child sexual abuse material or other illegal content posted publicly | Reports to whoever holds it; hidden after three people report; operators remove; strangers' media blurred in Discover (Mitigated; private conversations can't be scanned) |
+| 140 | Fake reports used to silence a post | Each reporter counts once (anonymous token), proof of work per report, hidden not deleted, a person decides (Mitigated) |
 
 </details>
 
@@ -1001,7 +1044,7 @@ Accounts, profiles, safety numbers, backups, panic wipe, an emergency passphrase
 19. We carry our own fix for a Tor library bug that hangs startup on Windows, permanently, inside the project. Nothing depends on the Tor project fixing it.
 20. Phones: the first connection takes from 30 seconds to a few minutes. Video rebuilding and in-app updates still need a test on a real phone.
 21. The Linux desktop app has a build script but hasn't been built or tested yet (it needs a Linux machine).
-22. The Pillar keeps its list of other Pillars by announcement only; it doesn't yet test listed Pillars itself between announcements.
+22. Vouched Pillars only help once several Pillars have built up weight with the issuers (weeks of uptime); until then apps rely on the seeds and on what they remember.
 
 ---
 
@@ -1067,7 +1110,7 @@ Release builds must use `scripts/build-release.ps1`. It strips local file paths 
 <details>
 <summary><b>What changed in each version</b> (click to open)</summary>
 
-- **0.16**: Deleting messages (selected or all, in conversations and rooms, optionally on the other side; everything from Settings). Credits in a message that's never delivered or collected come back to the sender. Pillar earning rebuilt from a year-long simulation of cheaters: judged by the day, pay follows availability, test items at random ages, fractions carried over, a cap for new Pillars; tested live with a sped-up clock. Smaller (compressed) credit proofs, prepared in the background. Phones: Tor in its own process, picking and saving files through Android's file screens (it silently didn't work before), videos rebuilt with the phone's encoders, in-app updates through Android's installer, far less memory. Windows: the last crash-report setting off, and a check for policies that hijack the browser engine. Quicker obfs4 starts.
+- **0.16**: Reporting harmful content (to whoever can see it; hidden after three people; operators remove; no list) and strangers' media blurred in Discover. Messages handed to another Pillar when the recipient's is down, kept for 7 days; every missed day's mail read after time away; Discover across Pillars; faster syncs; "Forgot your passphrase?"; a bug that made busy Pillars' replies too big to send. Finding Pillars that scales: Pillars test what they list and hand out samples of live ones, apps remember which Pillars worked, issuers sign lists of proven Pillars, the app races a mix and starts on the first answer, and switches when its Pillar disappears. Deleting messages (selected or all, in conversations and rooms, optionally on the other side; everything from Settings). Credits in a message that's never delivered or collected come back to the sender. Pillar earning rebuilt from a year-long simulation of cheaters: judged by the day, pay follows availability, test items at random ages, fractions carried over, a cap for new Pillars; tested live with a sped-up clock. Smaller (compressed) credit proofs, prepared in the background. Phones: Tor in its own process, picking and saving files through Android's file screens (it silently didn't work before), videos rebuilt with the phone's encoders, in-app updates through Android's installer, far less memory. Windows: the last crash-report setting off, and a check for policies that hijack the browser engine. Quicker obfs4 starts.
 - **0.15**: No free credits (only work or other people); sending credits in a private message; Pillars earn credits (weight over months, random checks, shared shrinking pool), server Pillars hand earnings over with `pillar --take-credits`. A security audit (Android backups off, browser-engine variables ignored, test profiles only in test builds, issuer flood and oversized-list protection, dependency scan). Quantum-safe credits: notes in public per-issuer lists, spent with hash-based zero-knowledge proofs (Plonky2), signed checkpoints that catch an issuer showing different lists; old blind tokens traded in automatically. A design for earning by running Pillars. No iPhone or Mac app, by decision. Finding Pillars starts with the first one that answers; Pillars drop entries not seen for 3 days; phones can't run Pillars (and why); a connection log; one connection per room delivery; phone layout clear of system bars and the keyboard. Sentinel Apps: a deterministic WebAssembly sandbox with no outside functions, signed app packages, a plain-language permission screen, screens drawn by Sentinel from fixed parts, admin-signed snapshots so late joiners agree, per-room nicknames, and a first app (Polls). The connecting screen says when Pillars aren't answering and lets you paste a trusted Pillar's address. FFmpeg is fetched and checked by a script (too big for GitHub); without it videos are cleaned in place and the app says so.
 - **0.14**: Several devices per account (link code with check code; every device gets messages; activity syncs). Post-quantum signatures (ML-DSA-65) inside every post, profile and card, pinned by followers. Mixed sending through two Pillars with random delays; fixed-size mailbox checks. Release key holders can make keys and sign or revoke updates inside the app. Linux Pillar. Unfollow. A "Getting started" checklist.
 - **0.13**: Updates spread Pillar to Pillar; apps need two Pillars to carry the same release, wait three days, and honour signed revocations. Recovery words (lost device: same identity on a new one; taken: move to a new key that followers check against a pinned, quantum-safe recovery key). Signed updates (hybrid post-quantum release signatures, majority of release keys, carried Pillar to Pillar or handed over as a file). Post-quantum hybrid (ML-KEM-768) sealing for private messages and room keys. Sentinel Apps described as contracts without a blockchain.

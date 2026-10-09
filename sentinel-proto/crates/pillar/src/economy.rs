@@ -378,7 +378,7 @@ pub async fn handle(req: &Request, ctx: &Ctx) -> Option<Response> {
             let _permit = CHECKS.get_or_init(|| tokio::sync::Semaphore::new(2)).acquire().await.ok()?;
             return tokio::task::block_in_place(|| handle_pq(req, ctx));
         }
-        Request::PqMintKey | Request::PqUpgrade { .. } | Request::PqLeaves { .. } | Request::PqCheckpoint { .. } => return handle_pq(req, ctx),
+        Request::Vouched | Request::PqMintKey | Request::PqUpgrade { .. } | Request::PqLeaves { .. } | Request::PqCheckpoint { .. } => return handle_pq(req, ctx),
         Request::Pin { addrs, months, bundles } => match pin(ctx, addrs, *months, bundles).await {
             Ok(n) => Response::Count(n),
             Err(e) => Response::Rejected(e.to_string()),

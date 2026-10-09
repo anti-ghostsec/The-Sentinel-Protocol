@@ -235,6 +235,8 @@ function paintHosting() {
   else if (h.enabled && h.state === "error") text = "Couldn't start: " + (h.error || "unknown error");
   else if (h.enabled) text = "Starts when Sentinel is connected.";
   $("host-status").textContent = text;
+  if (h.enabled) loadHostReports();
+  else $("host-reports").hidden = true;
   const arch = h.enabled && !highRisk && (h.archiveGb || 0) > 0;
   $("archive-toggle").setAttribute("aria-checked", String(arch));
   $("archive-toggle").disabled = highRisk;
@@ -579,10 +581,132 @@ function postNode(p) {
     like.setAttribute("aria-pressed", String(p.liked));
   });
   actions.append(like);
+  if (!p.mine && p.public) {
+    const rb = el("button", "link-btn small", "Report");
+    rb.type = "button";
+    rb.addEventListener("click", async () => {
+      const r = await chooseReport("post");
+      if (!r) return;
+      try {
+        const n = await invoke("report_post", { id: p.id, category: r.category });
+        art.replaceChildren(el("p", "muted small", n > 0 ? "Reported. It's hidden on this device, and the Pillars holding it were told." : "Reported and hidden on this device. The Pillars holding it couldn't be reached right now."));
+      } catch (e) {
+        rb.textContent = String(e).slice(0, 80);
+      }
+    });
+    actions.append(rb);
+  }
   body.append(actions);
   art.append(av, body);
   paintIcons(art);
   return art;
+}
+
+/* ---------- reporting ---------- */
+
+let REPORT_CATS = null;
+const REPORT_EXPLAIN = {
+  post: "Sent to the Pillars that hold this public post. After a few reports it's hidden from Discover until the person running that Pillar decides. Nobody is told it was you.",
+  listing: "Sent to the Pillar that lists this public room. After a few reports it's hidden from Discover until the person running that Pillar decides. Nobody is told it was you.",
+  room: "Sent only to this room's admin and moderators, sealed so other members and the Pillar can't read it. They see the message and your note, not who sent the report.",
+};
+
+/** Ask what's wrong; resolves to { category, note } or null. */
+async function chooseReport(kind) {
+  if (!REPORT_CATS) REPORT_CATS = await invoke("report_categories").catch(() => []);
+  const d = $("report-dialog");
+  $("report-explain").textContent = REPORT_EXPLAIN[kind] || "";
+  $("report-note-field").hidden = kind !== "room";
+  $("report-note").value = "";
+  $("report-send").disabled = true;
+  $("report-options").replaceChildren(
+    ...REPORT_CATS.map((c) => {
+      const lab = el("label", "report-option");
+      const r = document.createElement("input");
+      r.type = "radio";
+      r.name = "report-cat";
+      r.value = c.id;
+      r.addEventListener("change", () => ($("report-send").disabled = false));
+      lab.append(r, el("span", "", c.label));
+      return lab;
+    }),
+  );
+  return new Promise((resolve) => {
+    d.addEventListener(
+      "close",
+      () => {
+        const picked = d.querySelector("input[name=report-cat]:checked");
+        resolve(d.returnValue === "send" && picked ? { category: picked.value, note: $("report-note").value.trim() } : null);
+      },
+      { once: true },
+    );
+    d.showModal();
+  });
+}
+
+/* Media from people you don't follow (Discover) is blurred until tapped. */
+function blurStranger(art) {
+  if (!art.querySelector(".media-grid, video, .stream-block")) return art;
+  art.classList.add("stranger");
+  const note = el("p", "muted small media-note", "Media from someone you don't follow is blurred. Tap it to show it.");
+  const body = art.querySelector(".post-body");
+  if (body) body.insertBefore(note, body.querySelector(".media-grid, .stream-block") || null);
+  art.addEventListener(
+    "click",
+    (e) => {
+      if (art.classList.contains("stranger") && e.target.closest(".media-grid, video, .stream-block")) {
+        e.preventDefault();
+        e.stopPropagation();
+        art.classList.remove("stranger");
+      }
+    },
+    true,
+  );
+  return art;
+}
+
+/* ---------- reports on my Pillar ---------- */
+
+async function loadHostReports() {
+  let list = [];
+  try {
+    list = await invoke("host_reports");
+  } catch {
+    list = [];
+  }
+  $("host-reports").hidden = list.length === 0;
+  $("host-report-list").replaceChildren(
+    ...list.map((r) => {
+      const box = el("div", "report-box stack-8");
+      box.append(el("span", "strong", r.summary), el("span", "muted small", r.hidden ? "Hidden from Discover until you decide." : "Still shown in Discover (fewer than three reports)."));
+      if (r.preview) box.append(el("div", "report-quote small", r.preview));
+      if (r.hasMedia) box.append(el("span", "muted small", "It has media, which isn't shown here."));
+      const row = el("div", "inline-actions");
+      const rm = el("button", "btn outline small-btn", "Remove it");
+      rm.type = "button";
+      armed(rm, "Remove it from your Pillar? Click again", async () => {
+        try {
+          await invoke("host_remove", { address: r.address });
+        } catch (e) {
+          rm.textContent = String(e).slice(0, 60);
+        }
+        loadHostReports();
+      });
+      const keep = el("button", "btn ghost small-btn", "Keep it");
+      keep.type = "button";
+      keep.addEventListener("click", async () => {
+        try {
+          await invoke("host_keep", { address: r.address });
+        } catch (e) {
+          keep.textContent = String(e).slice(0, 60);
+        }
+        loadHostReports();
+      });
+      row.append(rm, keep);
+      box.append(row);
+      return box;
+    }),
+  );
 }
 
 /* ---------- inline media (spec §5.7) ----------
@@ -1193,7 +1317,7 @@ async function loadDiscover() {
   } catch {
     return;
   }
-  $("discover-feed").replaceChildren(...items.map(postNode));
+  $("discover-feed").replaceChildren(...items.map((p) => blurStranger(postNode(p))));
   paintDiscoverRooms(rooms);
   $("discover-empty").hidden = items.length > 0 || rooms.length > 0;
 }
@@ -1233,7 +1357,19 @@ function paintDiscoverRooms(rooms) {
         }
       });
       const row = el("div", "inline-actions");
-      row.append(btn, msg);
+      const rep = el("button", "link-btn small", "Report");
+      rep.type = "button";
+      rep.addEventListener("click", async () => {
+        const c = await chooseReport("listing");
+        if (!c) return;
+        try {
+          await invoke("report_room_listing", { id: r.id, category: c.category });
+          card.replaceChildren(el("p", "muted small", "Reported. It's hidden on this device, and the Pillar listing it was told."));
+        } catch (e) {
+          msg.textContent = String(e);
+        }
+      });
+      row.append(btn, rep, msg);
       card.append(note, row);
       return card;
     }),
@@ -1543,12 +1679,71 @@ async function loadRoomThread() {
         });
         meta.append(hide);
       }
+      if (!m.mine && m.id && !m.id.startsWith(":") && !(S.room.admin || S.room.moderator)) {
+        const rp = el("button", "link-btn small", " · Report");
+        rp.type = "button";
+        rp.title = "Report this message to the room's admin and moderators";
+        rp.addEventListener("click", async () => {
+          const c = await chooseReport("room");
+          if (!c) return;
+          try {
+            const n = await invoke("report_room_message", { id: S.room.id, msg: m.id, category: c.category, note: c.note });
+            rp.textContent = " · Reported to " + n + (n === 1 ? " person" : " people");
+            rp.disabled = true;
+          } catch (e) {
+            setError("room-error", String(e));
+          }
+        });
+        meta.append(rp);
+      }
       wrap.append(el("div", "bubble", m.text), meta);
       row.append(wrap);
       selectable(row, "room", m.id);
       return row;
     }),
   );
+  if ((S.room.admin || S.room.moderator) && S.room.reports > 0) {
+    const reports = await invoke("room_reports", { id: S.room.id }).catch(() => []);
+    if (reports.length) {
+      const box = el("div", "report-box stack-8");
+      box.append(el("span", "strong", reports.length === 1 ? "1 report from members" : reports.length + " reports from members"), el("span", "muted small", "Sealed to you and the other moderators: nobody else in the room saw them, and they don't say who sent them."));
+      for (const r of reports) {
+        const cat = (REPORT_CATS || (REPORT_CATS = await invoke("report_categories").catch(() => []))).find((c) => c.id === r.category);
+        const one = el("div", "stack-4");
+        one.append(el("span", "small strong", cat ? cat.label : r.category), el("div", "report-quote small", r.text || "(no text)"));
+        if (r.note) one.append(el("span", "muted small", "Note: " + r.note));
+        const row = el("div", "inline-actions");
+        if (!r.hidden) {
+          const hide = el("button", "btn outline small-btn", "Hide for everyone");
+          hide.type = "button";
+          hide.addEventListener("click", async () => {
+            try {
+              await invoke("hide_room_message", { id: S.room.id, msgId: r.id });
+              await invoke("dismiss_room_report", { id: S.room.id, msg: r.id });
+            } catch (e) {
+              setError("room-error", String(e));
+            }
+            S.room.reports = Math.max(0, S.room.reports - 1);
+            loadRoomThread();
+          });
+          row.append(hide);
+        } else {
+          row.append(el("span", "muted small", "Already hidden."));
+        }
+        const dismiss = el("button", "btn ghost small-btn", "Dismiss");
+        dismiss.type = "button";
+        dismiss.addEventListener("click", async () => {
+          await invoke("dismiss_room_report", { id: S.room.id, msg: r.id }).catch(() => {});
+          S.room.reports = Math.max(0, S.room.reports - 1);
+          loadRoomThread();
+        });
+        row.append(dismiss);
+        one.append(row);
+        box.append(one);
+      }
+      $("room-thread").prepend(box);
+    }
+  }
   const t = $("room-thread");
   t.scrollTop = t.scrollHeight;
 }
@@ -3187,3 +3382,34 @@ armed($("delete-all-msgs"), "Delete every message? Click again", async () => {
     $("delete-all-msg").textContent = String(e);
   }
 });
+
+/* ---------- forgot passphrase ---------- */
+
+$("unlock-forgot").addEventListener("click", () => {
+  $("forgot-box").hidden = !$("forgot-box").hidden;
+});
+
+{
+  let armedAt = 0;
+  $("forgot-start-over").addEventListener("click", async () => {
+    const b = $("forgot-start-over");
+    if (Date.now() - armedAt > 5000) {
+      armedAt = Date.now();
+      b.textContent = "Remove the locked copy? Click again";
+      setTimeout(() => (b.textContent = "Remove it and get my account back"), 5000);
+      return;
+    }
+    armedAt = 0;
+    b.disabled = true;
+    try {
+      await invoke("start_over");
+      $("forgot-box").hidden = true;
+      b.textContent = "Remove it and get my account back";
+      show("welcome");
+    } catch (e) {
+      setError("forgot-msg", String(e));
+    } finally {
+      b.disabled = false;
+    }
+  });
+}

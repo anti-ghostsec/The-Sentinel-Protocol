@@ -227,7 +227,17 @@ pub struct RoomState {
     /// The room's Sentinel Apps.
     #[serde(default)]
     pub apps: super::apps::RoomApps,
+    /// The admin's room-only member key (from checkpoints): reports are
+    /// sealed to it and to the moderators'.
+    #[serde(default)]
+    pub admin_member: Option<[u8; 32]>,
+    /// Reports from members (admin and moderators only): (report, day).
+    #[serde(default)]
+    pub reports: Vec<(room::RoomReport, u64)>,
 }
+
+/// Most reports kept per room.
+const MAX_REPORTS: usize = 100;
 
 /// Most join requests kept waiting.
 const MAX_REQUESTS: usize = 200;
@@ -263,6 +273,21 @@ pub struct RoomView {
     /// Key period and authority-log position (for diagnostics).
     pub epoch: u64,
     pub auth_seq: u64,
+    /// Reports waiting (admin and moderators).
+    pub reports: usize,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomReportView {
+    /// The reported message ("session:index").
+    pub id: String,
+    pub category: String,
+    pub note: String,
+    pub text: String,
+    pub minute: u64,
+    /// Already hidden for everyone.
+    pub hidden: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -353,6 +378,8 @@ fn new_state(room_id: [u8; 32], secret: [u8; 32], pillar: String, name: String, 
         pending_bans: Vec::new(),
         mod_seen: Vec::new(),
         apps: Default::default(),
+        admin_member: None,
+        reports: Vec::new(),
     }
 }
 
@@ -671,6 +698,7 @@ impl Core {
                     requests: r.requests.len(),
                     epoch: r.epoch,
                     auth_seq: r.auth.seq,
+                    reports: r.reports.len(),
                 }
             })
             .collect();
@@ -910,6 +938,75 @@ impl Core {
         self.rekey_room(id)
     }
 
+    /// Report a message in a room to its admin and moderators (sealed to
+    /// each of them: other members and the Pillar can't read it). Returns
+    /// how many people it was sent to.
+    pub fn report_room_message(&self, id: &str, msg_id: &str, category: &str, note: &str) -> Result<usize> {
+        if !super::REPORT_CATEGORY_NAMES.iter().any(|(k, _)| *k == category) {
+            bail!("Choose what's wrong with it.");
+        }
+        let (session, index) = msg_id.rsplit_once(':').context("bad message")?;
+        let index: u32 = index.parse().context("bad message")?;
+        let (_, store) = self.unlocked()?;
+        let r = store.rooms.iter().find(|r| hex(&r.room_id) == id).context("no such room")?;
+        let m = r.messages.iter().find(|m| m.session == session && m.index == index).context("That message is no longer here.")?;
+        let report = room::RoomReport {
+            session_id: session.to_owned(),
+            index,
+            category: category.to_owned(),
+            note: note.chars().take(300).collect(),
+            text: m.text.chars().take(2000).collect(),
+            minute: sentinel_core::social::coarse_minute(),
+        };
+        let mine = r.member_secret.map(|s| room::member_pub(&s));
+        let mut to: Vec<[u8; 32]> = r.admin_member.into_iter().chain(r.mods.iter().map(|m| m.member)).filter(|k| Some(*k) != mine).collect();
+        to.sort();
+        to.dedup();
+        let kem_of = |k: &[u8; 32]| r.members.iter().find(|(key, _)| member_key(key) == Some(*k)).and_then(|(_, v)| v.kem.clone());
+        let sealed: Vec<Vec<u8>> = to.iter().filter_map(|k| room::seal_report(k, &kem_of(k)?, &r.room_id, &report)).collect();
+        if sealed.is_empty() {
+            bail!("This room's admin can't receive reports yet (their app hasn't shared its key). Try again tomorrow, or leave the room.");
+        }
+        let n = sealed.len();
+        let room_id = r.room_id;
+        self.update(|s| {
+            if let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == room_id) {
+                let b = room::seal_blob(&x.secret, &RoomBlob::Report { sealed: sealed.clone() });
+                x.queue.push(Queued { sealed: b, nonce: 0, secret: Some(x.secret) });
+            }
+        })?;
+        Ok(n)
+    }
+
+    /// Admin and moderators: the reports waiting in a room.
+    pub fn room_reports(&self, id: &str) -> Result<Vec<RoomReportView>> {
+        let (_, store) = self.unlocked()?;
+        let r = store.rooms.iter().find(|r| hex(&r.room_id) == id).context("no such room")?;
+        Ok(r.reports
+            .iter()
+            .rev()
+            .map(|(q, _)| RoomReportView {
+                id: format!("{}:{}", q.session_id, q.index),
+                category: q.category.clone(),
+                note: q.note.clone(),
+                text: q.text.clone(),
+                minute: q.minute,
+                hidden: r.redacted.iter().any(|(s, i)| *s == q.session_id && *i == q.index),
+            })
+            .collect())
+    }
+
+    /// Admin and moderators: dismiss the reports about one message.
+    pub fn dismiss_room_report(&self, id: &str, msg_id: &str) -> Result<()> {
+        let (session, index) = msg_id.rsplit_once(':').context("bad message")?;
+        let index: u32 = index.parse().context("bad message")?;
+        self.update(|s| {
+            if let Some(x) = s.rooms.iter_mut().find(|x| hex(&x.room_id) == id) {
+                x.reports.retain(|(q, _)| !(q.session_id == session && q.index == index));
+            }
+        })
+    }
+
     /// Admin: hide a message for everyone in the room.
     pub fn hide_room_message(&self, id: &str, msg_id: &str) -> Result<()> {
         let (session, index) = msg_id.rsplit_once(':').context("bad message")?;
@@ -1100,6 +1197,7 @@ impl Core {
                 mods: x.mods.clone(),
                 approval: x.approval,
                 apps: x.apps.list.clone(),
+                admin_member: x.member_secret.map(|m| room::member_pub(&m)),
             };
             if let Some(b) = admin_entry(x, cp) {
                 x.queue.push(Queued { sealed: b, nonce: 0, secret: Some(x.secret) });
@@ -1333,7 +1431,10 @@ impl Core {
                                     apply_mods(x, mods, approval);
                                 }
                             }
-                            Action::Checkpoint { name, visibility, access, banned, redacted, mods, approval, apps, .. } => {
+                            Action::Checkpoint { name, visibility, access, banned, redacted, mods, approval, apps, admin_member, .. } => {
+                                if admin_member.is_some() {
+                                    x.admin_member = admin_member;
+                                }
                                 if matches!(visibility.as_str(), "public" | "private") && matches!(access.as_str(), "free" | "pass" | "membership") {
                                     x.name = name.chars().take(60).collect();
                                     x.visibility = visibility;
@@ -1490,6 +1591,32 @@ impl Core {
                     }
                 })?;
                 Ok(false)
+            }
+            RoomBlob::Report { sealed } => {
+                // Only the admin and moderators can open one (sealed to them).
+                let (_, store) = self.unlocked()?;
+                let Some(r) = store.rooms.iter().find(|x| x.room_id == *room_id) else { return Ok(false) };
+                if r.admin.is_none() && r.my_mod.is_none() {
+                    return Ok(false);
+                }
+                let Some(my) = r.member_secret else { return Ok(false) };
+                let Some(report) = sealed.iter().take(30).find_map(|b| room::open_report(&my, room_id, b)) else { return Ok(false) };
+                if !super::REPORT_CATEGORY_NAMES.iter().any(|(k, _)| *k == report.category) {
+                    return Ok(false);
+                }
+                let today = sentinel_core::dm::today();
+                self.update(|s| {
+                    if let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == *room_id) {
+                        let dup = x.reports.iter().any(|(q, _)| q.session_id == report.session_id && q.index == report.index && q.category == report.category);
+                        if !dup {
+                            x.reports.push((report.clone(), today));
+                            if x.reports.len() > MAX_REPORTS {
+                                x.reports.remove(0);
+                            }
+                        }
+                    }
+                })?;
+                Ok(true)
             }
             RoomBlob::AppCode { signed } => {
                 self.update(|s| {

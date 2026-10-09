@@ -16,6 +16,18 @@ pub mod audit;
 pub mod circle;
 pub mod deletion;
 pub mod directory;
+pub mod moderation;
+
+/// What a report can be about, with the words shown in the app (the keys
+/// are `sentinel_core::social::REPORT_CATEGORIES`, in the same order).
+pub const REPORT_CATEGORY_NAMES: &[(&str, &str)] = &[
+    ("child-abuse", "Sexual content involving a child"),
+    ("intimate-images", "Intimate images shared without consent"),
+    ("violence", "Threats or violence"),
+    ("doxxing", "Someone's private details (doxxing)"),
+    ("spam", "Spam or scams"),
+    ("other-illegal", "Something else that's illegal or dangerous"),
+];
 pub mod dms;
 pub mod ffmpeg;
 pub mod local;
@@ -287,6 +299,11 @@ pub struct DiscoveredRoom {
     pub price: u32,
     pub link: String,
     pub minute: u64,
+    /// The listing's address and the Pillar it was found on (for reports).
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub pillar: String,
 }
 
 #[derive(Serialize)]
@@ -379,6 +396,9 @@ pub struct Store {
     /// Public rooms found in Discover.
     #[serde(default)]
     pub discovered_rooms: Vec<DiscoveredRoom>,
+    /// Public posts and listings I reported (never shown to me again).
+    #[serde(default)]
+    pub reported: Vec<String>,
     /// Remembered "discoverable" choice for new posts.
     #[serde(default)]
     pub discover_default: bool,
@@ -437,6 +457,10 @@ pub struct Store {
     /// Mailbox fetch positions ("pillar|bits|prefix" -> sequence number).
     #[serde(default)]
     pub mail_cursors: std::collections::HashMap<String, u64>,
+    /// The last day every mailbox was read (after being away, the days
+    /// missed are read too, back to the 7 days Pillars keep messages).
+    #[serde(default)]
+    pub mail_day: u64,
     /// Fingerprints of blobs already handled (-> day seen), so re-scans
     /// and replays never process a message twice. Kept 9 days.
     #[serde(default)]
@@ -769,6 +793,8 @@ pub struct PostView {
     pub topics: Vec<String>,
     /// Follow link for discovered authors not yet followed.
     pub follow_link: Option<String>,
+    /// A public (discoverable) post: it can be reported to Pillars.
+    pub public: bool,
     pub media: Vec<MediaView>,
     /// Upload progress for my posts with large attachments (0-1).
     pub progress: Option<f32>,
@@ -1105,20 +1131,14 @@ impl Core {
         self.with(|i| i.net = Some(net.clone()));
         // My Pillar may have gone away since last time: if it doesn't
         // answer, pick again (Pillars that worked lately, like the backup,
-        // are tried first). Two tries, so a slow start isn't taken for gone.
+        // are tried first; a Pillar that was only slow stays in that race).
         if let Some(p) = self.unlocked().ok().and_then(|(_, s)| s.pillar) {
             self.set_status(&app, "connecting", 0.95, "Checking your Pillar".into());
-            let mut answered = false;
-            for _ in 0..2 {
-                let probe = async {
-                    let mut s = net.connect_hedged(&p).await?;
-                    anyhow::Ok(matches!(request(&mut s, &Request::Ping).await?, Response::Pong))
-                };
-                if matches!(tokio::time::timeout(Duration::from_secs(60), probe).await, Ok(Ok(true))) {
-                    answered = true;
-                    break;
-                }
-            }
+            let probe = async {
+                let mut s = net.connect_hedged(&p).await?;
+                anyhow::Ok(matches!(request(&mut s, &Request::Ping).await?, Response::Pong))
+            };
+            let answered = matches!(tokio::time::timeout(Duration::from_secs(45), probe).await, Ok(Ok(true)));
             let today = directory::today();
             let _ = self.update(|s| {
                 directory::record(s, &[(p.clone(), answered)], today);
@@ -1225,15 +1245,24 @@ impl Core {
     pub(crate) async fn deposit(&self, net: &Net, pillar: &str, shard: u16, blob: Vec<u8>, nonce: u64) -> Result<()> {
         let started = tokio::time::Instant::now();
         let short = pillar.chars().take(6).collect::<String>();
-        let r = self.deposit_inner(net, pillar, shard, blob, nonce).await;
+        // A limit on the whole attempt: one that hangs (a Pillar restarting,
+        // a circuit that stalls) fails and is retried on the next sync,
+        // instead of holding the message for many minutes.
+        let r = match tokio::time::timeout(Duration::from_secs(240), self.deposit_inner(net, pillar, shard, blob, nonce)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!("no answer within 4 minutes")),
+        };
         match &r {
-            Ok(()) => sentinel_net::note(format!("Sentinel: delivered to Pillar {short}… in {}s", started.elapsed().as_secs())),
+            Ok(true) => sentinel_net::note(format!("Sentinel: delivered to Pillar {short}… in {}s", started.elapsed().as_secs())),
+            Ok(false) => sentinel_net::note(format!("Sentinel: message for Pillar {short}… handed on in {}s (it will be delivered when that Pillar answers)", started.elapsed().as_secs())),
             Err(e) => sentinel_net::note(format!("Sentinel: delivery to Pillar {short}… failed after {}s: {e:#}", started.elapsed().as_secs())),
         }
-        r
+        r.map(|_| ())
     }
 
-    async fn deposit_inner(&self, net: &Net, pillar: &str, shard: u16, blob: Vec<u8>, nonce: u64) -> Result<()> {
+    /// Ok(true): delivered straight to its Pillar; Ok(false): handed to
+    /// another Pillar (mixing, or the destination didn't answer).
+    async fn deposit_inner(&self, net: &Net, pillar: &str, shard: u16, blob: Vec<u8>, nonce: u64) -> Result<bool> {
         let (_, store) = self.unlocked()?;
         if store.privacy.mix || store.privacy.high_risk {
             match self.mix_route(net, &store, pillar).await {
@@ -1241,9 +1270,16 @@ impl Core {
                     let packet = sentinel_core::mix::wrap(&route, sentinel_core::mix::Step::Deliver { pillar: pillar.to_owned(), shard, blob, nonce }).context("message too large to mix")?;
                     let data = sentinel_core::mix::pow_data(&packet);
                     let pn = tokio::task::spawn_blocking(move || sentinel_core::pow::stamp(sentinel_core::mix::MIX_POW_DOMAIN, &data, sentinel_core::mix::MIX_POW_BITS)).await?;
-                    let mut s = net.connect_hedged(&route[0].0).await?;
+                    let mut s = match net.connect_hedged(&route[0].0).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            // Gone since its key was saved: pick another next time.
+                            self.with(|i| i.mix_keys.remove(&route[0].0));
+                            return Err(e);
+                        }
+                    };
                     return match request(&mut s, &Request::Mix { packet, nonce: pn }).await? {
-                        Response::Pong => Ok(()),
+                        Response::Pong => Ok(false),
                         other => bail!("not taken: {other:?}"),
                     };
                 }
@@ -1251,39 +1287,84 @@ impl Core {
                 _ => bail!("waiting for mixing Pillars"),
             }
         }
-        let mut s = net.connect_hedged(pillar).await?;
-        match request(&mut s, &Request::Deposit { shard, blob, nonce }).await? {
-            Response::Pong => Ok(()),
-            other => bail!("not delivered: {other:?}"),
+        // Straight to the destination...
+        let direct = tokio::time::timeout(Duration::from_secs(45), async {
+            let mut s = net.connect_hedged(pillar).await?;
+            match request(&mut s, &Request::Deposit { shard, blob: blob.clone(), nonce }).await? {
+                Response::Pong => Ok(()),
+                other => bail!("not delivered: {other:?}"),
+            }
+        })
+        .await;
+        if matches!(direct, Ok(Ok(()))) {
+            return Ok(true);
+        }
+        // ...or, if it doesn't answer, handed to another Pillar that keeps
+        // trying for days: the message leaves this device now, and I can go
+        // offline (sealed: that Pillar can't read it or tell who sent it).
+        let via = self.mix_route(net, &store, pillar).await?;
+        let (onion, key) = &via[0];
+        let packet = sentinel_core::mix::handoff(key, sentinel_core::mix::Step::Deliver { pillar: pillar.to_owned(), shard, blob, nonce }).context("message too large to hand over")?;
+        let data = sentinel_core::mix::pow_data(&packet);
+        let pn = tokio::task::spawn_blocking(move || sentinel_core::pow::stamp(sentinel_core::mix::MIX_POW_DOMAIN, &data, sentinel_core::mix::MIX_POW_BITS)).await?;
+        let mut s = net.connect_hedged(onion).await?;
+        match request(&mut s, &Request::Mix { packet, nonce: pn }).await? {
+            Response::Pong => {
+                sentinel_net::note(format!("Sentinel: Pillar {}… didn't answer; handed the message to Pillar {}… to deliver", &pillar[..6.min(pillar.len())], &onion[..6.min(onion.len())]));
+                Ok(false)
+            }
+            other => bail!("not taken: {other:?}"),
         }
     }
 
     /// Two Pillars (other than the destination) and their mix keys, picked
-    /// at random from the ones I know.
+    /// at random among the ones I know, those that answered lately first.
+    /// Missing keys are fetched a few Pillars at a time, each with a time
+    /// limit, so gone Pillars in the directory never hold a message up.
     async fn mix_route(&self, net: &Net, store: &Store, dest: &str) -> Result<Vec<(String, sentinel_core::mix::MixKey)>> {
-        let mut pool: Vec<String> = store.known_pillars.iter().chain(sentinel_net::seed_pillars().iter()).filter(|p| p.as_str() != dest).cloned().collect();
-        pool.sort();
-        pool.dedup();
-        for i in (1..pool.len()).rev() {
-            let j = (u32::from_le_bytes(sentinel_core::random_bytes::<4>()) as usize) % (i + 1);
-            pool.swap(i, j);
-        }
-        let mut route = Vec::new();
-        for p in pool {
+        let today = directory::today();
+        let pool: Vec<String> = directory::order(&[], &sentinel_net::seed_pillars(), &store.known_pillars, &store.vouched_pillars, &store.pillar_health, None, today)
+            .into_iter()
+            .filter(|p| p.as_str() != dest)
+            .collect();
+        let mut route: Vec<(String, sentinel_core::mix::MixKey)> = Vec::new();
+        for p in &pool {
             if route.len() == 2 {
                 break;
             }
-            if let Some(k) = self.with(|i| i.mix_keys.get(&p).cloned()) {
-                route.push((p, k));
-                continue;
+            if let Some(k) = self.with(|i| i.mix_keys.get(p).cloned()) {
+                route.push((p.clone(), k));
             }
-            let Ok(mut s) = net.connect_hedged(&p).await else { continue };
-            if let Ok(Response::Object(b)) = request(&mut s, &Request::MixKey).await {
-                if let Some(k) = sentinel_core::mix::MixKey::decode(&b) {
+        }
+        let missing: Vec<String> = pool.into_iter().filter(|p| !route.iter().any(|(r, _)| r == p)).collect();
+        let mut outcomes: Vec<(String, bool)> = Vec::new();
+        for batch in missing.chunks(6) {
+            if route.len() >= 2 {
+                break;
+            }
+            let probes = batch.iter().map(|p| async move {
+                let r = tokio::time::timeout(Duration::from_secs(45), async {
+                    let mut s = net.connect_hedged(p).await?;
+                    anyhow::Ok(match request(&mut s, &Request::MixKey).await? {
+                        Response::Object(b) => sentinel_core::mix::MixKey::decode(&b),
+                        _ => None,
+                    })
+                })
+                .await;
+                (p.clone(), r.ok().and_then(Result::ok).flatten())
+            });
+            for (p, k) in futures::future::join_all(probes).await {
+                outcomes.push((p.clone(), k.is_some()));
+                if let Some(k) = k {
                     self.with(|i| i.mix_keys.insert(p.clone(), k.clone()));
-                    route.push((p, k));
+                    if route.len() < 2 {
+                        route.push((p, k));
+                    }
                 }
             }
+        }
+        if !outcomes.is_empty() {
+            let _ = self.update(|s| directory::record(s, &outcomes, today));
         }
         // One hop still separates the timing; none would not.
         if route.is_empty() {
@@ -1318,17 +1399,19 @@ impl Core {
             let _ = app.emit("messages", ());
             let _ = app.emit("rooms", ());
         }
-        // Messages first: they're what people wait on.
-        if self.retry_dms().await.unwrap_or(0) > 0 {
+        // Messages first: they're what people wait on. The steps don't
+        // depend on each other, so they run at the same time (each on its
+        // own circuits), and a slow one doesn't hold up the rest.
+        let (sent, _, paid, mail) = tokio::join!(self.retry_dms(), self.room_maintenance(), self.process_payments(app), self.poll_mail());
+        if sent.unwrap_or(0) > 0 {
             let _ = app.emit("messages", ());
         }
-        let _ = self.room_maintenance().await;
-        if self.process_payments(app).await.unwrap_or(0) > 0 {
+        if paid.unwrap_or(0) > 0 {
             let _ = app.emit("rooms", ());
             let _ = app.emit("status", ());
         }
         // One pass over my mailbox prefixes serves DMs and rooms alike.
-        if let Ok((dms, rooms)) = self.poll_mail().await {
+        if let Ok((dms, rooms)) = mail {
             if dms > 0 {
                 let _ = app.emit("messages", ());
             }
@@ -1336,22 +1419,23 @@ impl Core {
                 let _ = app.emit("rooms", ());
             }
         }
-        let _ = self.publish_profile().await;
-        let _ = self.publish_card().await;
-        if self.flush_outbox().await > 0 {
+        let (_, _, flushed, refreshed, discovered, count, _, rewards) = tokio::join!(
+            self.publish_profile(),
+            self.publish_card(),
+            self.flush_outbox(),
+            self.refresh(),
+            self.discover(),
+            self.fetch_follower_count(),
+            self.refresh_archives(),
+            self.collect_rewards(),
+        );
+        if flushed > 0 || refreshed.unwrap_or(0) > 0 {
             let _ = app.emit("timeline", ());
         }
-        if self.refresh().await.unwrap_or(0) > 0 {
-            let _ = app.emit("timeline", ());
-        }
-        if self.discover().await.unwrap_or(0) > 0 {
+        if discovered.unwrap_or(0) > 0 {
             let _ = app.emit("discover", ());
         }
-        if self.fetch_follower_count().await.is_ok() {
-            let _ = app.emit("status", ());
-        }
-        let _ = self.refresh_archives().await;
-        if self.collect_rewards().await.unwrap_or(0) > 0 {
+        if count.is_ok() || rewards.unwrap_or(0) > 0 {
             let _ = app.emit("status", ());
         }
     }
@@ -1470,6 +1554,7 @@ impl Core {
             .iter()
             .map(|d| d.id.clone())
             .chain(store.posts.iter().map(|p| p.id.clone()))
+            .chain(store.reported.iter().cloned())
             .collect();
         // Keys that can open discoverable posts: one per subscribed topic,
         // plus the explore key for undirected exploration.
@@ -1478,8 +1563,28 @@ impl Core {
         reader_keys.push(sentinel_core::seal::explore_key());
         let mut found: Vec<DiscoveredPost> = Vec::new();
         let mut found_rooms: Vec<DiscoveredRoom> = Vec::new();
-        for (shard, keep) in plan {
-            let Ok((posts, rooms)) = fetch_shard(&net, &pillar, shard, &known, &reader_keys).await else { continue };
+        // Posts live on their authors' Pillars, so Discover also reads two
+        // other Pillars each pass (ones that answered lately first): people
+        // on different Pillars find each other. Cover buckets only on mine.
+        let today = directory::today();
+        let others: Vec<String> = directory::order(&[], &sentinel_net::seed_pillars(), &store.known_pillars, &store.vouched_pillars, &store.pillar_health, Some(&pillar), today)
+            .into_iter()
+            .filter(|p| *p != pillar)
+            .take(2)
+            .collect();
+        let mut sources: Vec<(String, u16, bool)> = plan.iter().map(|(s, k)| (pillar.clone(), *s, *k)).collect();
+        for o in &others {
+            sources.extend(plan.iter().filter(|(_, k)| *k).map(|(s, _)| (o.clone(), *s, true)));
+        }
+        let fetches = sources.into_iter().map(|(src, shard, keep)| {
+            let (net, known, reader_keys) = (net.clone(), &known, &reader_keys);
+            async move {
+                let r = tokio::time::timeout(std::time::Duration::from_secs(120), fetch_shard(&net, &src, shard, known, reader_keys)).await;
+                (shard, keep, r.ok().and_then(Result::ok))
+            }
+        });
+        for (shard, keep, got) in futures::future::join_all(fetches).await {
+            let Some((posts, rooms)) = got else { continue };
             if !keep {
                 continue; // cover traffic: fetched, then discarded
             }
@@ -1497,7 +1602,7 @@ impl Core {
                 if shard != social::RECENT_SHARD && !topical {
                     continue; // another topic that happens to share this shard
                 }
-                found.push(DiscoveredPost { topical, pillar: pillar.clone(), ..p });
+                found.push(DiscoveredPost { topical, ..p }); // keeps the Pillar it was found on
             }
         }
         let n = found.len();
@@ -1571,6 +1676,7 @@ impl Core {
                         liked: store.liked.contains(&d.id),
                         topics: d.topics.clone(),
                         follow_link: Some(FollowLink { author, pillar: d.pillar.clone(), feed_key: None }.to_text()),
+                        public: true,
                         media: media_views(&d.media),
                         progress: None,
                         upload_error: None,
@@ -2115,6 +2221,7 @@ impl Core {
             liked: false,
             topics: post.topics.clone(),
             follow_link: None,
+            public: post.discoverable,
             media: media_views(&post.media),
             progress: None,
             upload_error: None,
@@ -2188,6 +2295,7 @@ impl Core {
             liked: false,
             topics: post.topics,
             follow_link: None,
+            public: post.discoverable,
             media,
             progress,
             upload_error,
@@ -2227,6 +2335,7 @@ impl Core {
                     liked: store.liked.contains(&p.id),
                     topics: p.topics.clone(),
                     follow_link: None,
+                    public: p.discoverable,
                     media,
                     progress,
                     upload_error,
@@ -2502,7 +2611,11 @@ impl Core {
                         }
                     })?;
                 }
-                Err(_) => continue, // try again on the next scheduled pass
+                Err(e) => {
+                    // Tried again on the next scheduled pass.
+                    sentinel_net::note(format!("Sentinel: reading posts from Pillar {}… failed: {e:#}", &pillar[..6.min(pillar.len())]));
+                    continue;
+                }
             }
         }
         Ok(new_posts)
@@ -2853,6 +2966,8 @@ async fn fetch_shard(
                         price: l.price,
                         link: l.link,
                         minute: l.minute,
+                        address: addr.to_text(),
+                        pillar: pillar.to_owned(),
                     });
                 }
                 continue;

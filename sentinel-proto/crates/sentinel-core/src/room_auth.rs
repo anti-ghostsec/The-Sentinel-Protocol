@@ -153,6 +153,10 @@ pub enum Action {
         /// The room's Sentinel Apps.
         #[serde(default)]
         apps: Vec<AppRef>,
+        /// The admin's room-only member key, so members can seal reports
+        /// to them (see `room::RoomReport`).
+        #[serde(default)]
+        admin_member: Option<[u8; 32]>,
     },
     Details { name: String, visibility: String, access: String },
     /// New room secret sealed to each remaining member, plus the cut.
@@ -381,7 +385,7 @@ mod tests {
         // A checkpoint with the next number but another parent is a fork too.
         let mut log2 = Log::default();
         log2.offer(&room, &s1);
-        let cp = Action::Checkpoint { name: "x".into(), visibility: "private".into(), access: "free".into(), epoch: 0, banned: vec![], redacted: vec![], mods: vec![], approval: false, apps: vec![] };
+        let cp = Action::Checkpoint { name: "x".into(), visibility: "private".into(), access: "free".into(), epoch: 0, banned: vec![], redacted: vec![], mods: vec![], approval: false, apps: vec![], admin_member: None };
         let (bad, _) = sign(&admin, &entry(room, 2, [9; 32], cp));
         assert!(log2.offer(&room, &bad).is_empty());
         assert!(log2.fork);
@@ -394,7 +398,7 @@ mod tests {
     fn checkpoints_and_rekeys_resync_across_gaps() {
         let (room, _, admin) = new_room_with_admin();
         let mut log = Log::default();
-        let cp = Action::Checkpoint { name: "n".into(), visibility: "private".into(), access: "free".into(), epoch: 0, banned: vec![], redacted: vec![], mods: vec![], approval: false, apps: vec![] };
+        let cp = Action::Checkpoint { name: "n".into(), visibility: "private".into(), access: "free".into(), epoch: 0, banned: vec![], redacted: vec![], mods: vec![], approval: false, apps: vec![], admin_member: None };
         let (s9, h9) = sign(&admin, &entry(room, 9, [5; 32], cp));
         // A late joiner starts from a checkpoint.
         assert_eq!(log.offer(&room, &s9).len(), 1);

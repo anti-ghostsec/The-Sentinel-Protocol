@@ -23,6 +23,9 @@ use sentinel_core::wire::{Request, Response};
 
 use super::{request, Core};
 
+/// Pillars keep mailbox deposits this many days.
+const MAIL_KEEP_DAYS: u64 = 7;
+
 /// Never split finer than this (256 prefixes): each prefix stays shared.
 const MAX_DEPTH: u8 = 8;
 /// Lengthen the prefix only above this many blobs per poll window, shorten
@@ -63,17 +66,22 @@ impl Core {
         let (key, store) = self.unlocked()?;
         let net = self.with(|i| i.net.clone()).context("not connected")?;
         let today = dm::today();
-        let days = [today.saturating_sub(1), today];
+        // Every day since I last read all my mail (messages go to the
+        // sender's day's mailbox, and Pillars keep them 7 days), so nothing
+        // sent while I was away is missed.
+        let from = if store.mail_day == 0 { today.saturating_sub(1) } else { store.mail_day.max(today.saturating_sub(MAIL_KEEP_DAYS)) };
+        let days: Vec<u64> = (from.min(today.saturating_sub(1))..=today).collect();
+        let mut all_read = true;
 
         // Which IDs I read, per Pillar.
         let mut ids: HashMap<String, Vec<[u8; 32]>> = HashMap::new();
         if let (Some(p), Some(st)) = (store.pillar.clone(), store.dm.clone()) {
-            for d in days {
+            for &d in &days {
                 ids.entry(p.clone()).or_default().push(dm::inbox_id(&st.fetch_secret, d));
             }
         }
         for r in &store.rooms {
-            for d in days {
+            for &d in &days {
                 ids.entry(r.pillar.clone()).or_default().push(room::room_box(&r.secret, d).0);
                 // Approval rooms: the admin and moderators also read the ask box.
                 if let Some(ask) = &r.ask {
@@ -84,7 +92,7 @@ impl Core {
 
         // Linking a device: its mailbox on the link code's Pillar.
         for (pillar, secret) in Core::link_boxes(&store) {
-            for d in days {
+            for &d in &days {
                 ids.entry(pillar.clone()).or_default().push(room::room_box(&secret, d).0);
             }
         }
@@ -103,22 +111,43 @@ impl Core {
             }
             let many = prefixes.len() > 1;
             let mut seen_here = 0usize;
-            'prefixes: for prefix in prefixes {
-                // Several prefixes on one Pillar: random gaps between them, so
-                // they aren't fetched in one identifiable burst.
-                if many {
-                    let gap = u64::from_le_bytes(sentinel_core::random_bytes::<8>()) % 25;
-                    tokio::time::sleep(std::time::Duration::from_secs(1 + gap)).await;
-                }
+            // Fetch every prefix at the same time, each on its own circuit
+            // and starting at its own random moment (so they don't arrive as
+            // one identifiable burst); then open what came, in order.
+            let cursors = self.unlocked()?.1.mail_cursors;
+            let fetches = prefixes.into_iter().map(|prefix| {
                 let ck = format!("{pillar}|{bits}|{prefix}");
-                // Own isolated circuit per prefix.
-                let Ok(mut s) = net.connect_hedged(&pillar).await else { continue };
-                for _page in 0..50 {
-                    let after = self.unlocked()?.1.mail_cursors.get(&ck).copied().unwrap_or(0);
-                    let blobs = match request(&mut s, &Request::Fetch { bits, prefix, after }).await {
-                        Ok(Response::Blobs(b)) if !b.is_empty() => b,
-                        _ => break,
-                    };
+                let start = cursors.get(&ck).copied().unwrap_or(0);
+                let (net, pillar) = (net.clone(), pillar.clone());
+                async move {
+                    if many {
+                        let gap = u64::from_le_bytes(sentinel_core::random_bytes::<8>()) % 20;
+                        tokio::time::sleep(std::time::Duration::from_secs(gap)).await;
+                    }
+                    let mut pages: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
+                    let Ok(Ok(mut s)) = tokio::time::timeout(std::time::Duration::from_secs(90), net.connect_hedged(&pillar)).await else { return (ck, None) };
+                    let mut after = start;
+                    for _page in 0..50 {
+                        match request(&mut s, &Request::Fetch { bits, prefix, after }).await {
+                            Ok(Response::Blobs(b)) if !b.is_empty() => {
+                                after = b.iter().map(|(q, _)| *q).max().unwrap_or(after).max(after);
+                                pages.push(b);
+                            }
+                            Ok(_) => break,
+                            Err(_) => return (ck, Some((pages, false))),
+                        }
+                    }
+                    (ck, Some((pages, true)))
+                }
+            });
+            let fetched = futures::future::join_all(fetches).await;
+            'prefixes: for (ck, got) in fetched {
+                let Some((pages, complete)) = got else {
+                    all_read = false;
+                    continue;
+                };
+                all_read &= complete;
+                for blobs in pages {
                     seen_here += blobs.len();
                     for (seq, blob) in blobs {
                         let gen = self.with(|i| i.mail.rescans);
@@ -141,6 +170,9 @@ impl Core {
             }
             self.observe(&pillar, seen_here);
             self.with(|i| i.mail.last.insert(pillar.clone(), Instant::now()));
+        }
+        if all_read {
+            self.update(|s| s.mail_day = today)?;
         }
         Ok((dms, rooms))
     }

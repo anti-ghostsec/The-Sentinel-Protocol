@@ -368,6 +368,65 @@ async fn import_backup(window: WebviewWindow, core: State<'_, Arc<Core>>) -> Res
     Ok(true)
 }
 
+/// What a report can be about (labels for the app).
+#[tauri::command]
+fn report_categories() -> Vec<crate::core::moderation::CategoryView> {
+    crate::core::moderation::categories()
+}
+
+/// Report a public post to the Pillars and Archives holding it.
+#[tauri::command]
+async fn report_post(core: State<'_, Arc<Core>>, id: String, category: String) -> Res<usize> {
+    core.report_post(&id, &category).await.map_err(err)
+}
+
+/// Report a public room's Discover listing.
+#[tauri::command]
+async fn report_room_listing(core: State<'_, Arc<Core>>, id: String, category: String) -> Res<usize> {
+    core.report_room_listing(&id, &category).await.map_err(err)
+}
+
+/// Report a room message to the room's admin and moderators.
+#[tauri::command]
+fn report_room_message(core: State<'_, Arc<Core>>, id: String, msg: String, category: String, note: String) -> Res<usize> {
+    core.report_room_message(&id, &msg, &category, &note).map_err(err)
+}
+
+/// Admin and moderators: reports waiting in a room.
+#[tauri::command]
+fn room_reports(core: State<'_, Arc<Core>>, id: String) -> Res<Vec<crate::core::rooms::RoomReportView>> {
+    core.room_reports(&id).map_err(err)
+}
+
+#[tauri::command]
+fn dismiss_room_report(core: State<'_, Arc<Core>>, id: String, msg: String) -> Res<()> {
+    core.dismiss_room_report(&id, &msg).map_err(err)
+}
+
+/// My Pillar: reports about public content it holds.
+#[tauri::command]
+fn host_reports(core: State<'_, Arc<Core>>) -> Res<Vec<crate::core::moderation::HostReportView>> {
+    core.host_reports().map_err(err)
+}
+
+#[tauri::command]
+fn host_remove(core: State<'_, Arc<Core>>, address: String) -> Res<()> {
+    core.host_remove(&address).map_err(err)
+}
+
+#[tauri::command]
+fn host_keep(core: State<'_, Arc<Core>>, address: String) -> Res<()> {
+    core.host_keep(&address).map_err(err)
+}
+
+/// Forgot the passphrase: remove the locked copy on this device (it can't
+/// be opened without the passphrase) and go back to the welcome screen, to
+/// recover with recovery words, a backup or another device.
+#[tauri::command]
+fn start_over(core: State<'_, Arc<Core>>) -> Res<()> {
+    core.panic_wipe().map_err(err)
+}
+
 /// Erase this account from the device, then quit. Needs the word DELETE.
 #[tauri::command]
 fn panic_wipe(app: AppHandle, core: State<'_, Arc<Core>>, confirm: String) -> Res<()> {
@@ -1170,6 +1229,16 @@ pub fn run() {
             wallet,
             send_credits,
             delete_dm_messages,
+            start_over,
+            report_categories,
+            report_post,
+            report_room_listing,
+            report_room_message,
+            room_reports,
+            dismiss_room_report,
+            host_reports,
+            host_remove,
+            host_keep,
             delete_room_messages,
             delete_all_messages,
             import_credits,

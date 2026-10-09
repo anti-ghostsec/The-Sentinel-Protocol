@@ -62,6 +62,8 @@ Turn it on in the app (Settings → Help run Sentinel), or run the one-file Pill
 - **Post-quantum.** Messages and room keys use a hybrid of X25519 and ML-KEM-768. Signatures, credits and updates are quantum-safe too.
 - **Anonymous credits.** Pay for paid rooms or for keeping files longer with zero-knowledge proofs: nobody can trace who paid whom.
 - **Safety built in.** Emergency passphrase (silently erases the real account), disguise mode (the app becomes a working calculator), key files, auto-lock, panic wipe, screen protection, High-risk mode, and recovery words to take your account to a new device.
+- **Reliable delivery.** If someone's Pillar is down, your message is handed to another Pillar that keeps trying for a week, so it arrives even after you've gone offline.
+- **Kept clean, without spying.** Public posts can be reported to the Pillars that hold them, and room messages to the room's moderators; illegal content is removed by the people who can see it. Private conversations stay private.
 - **Updates nobody can hijack.** Releases are signed with post-quantum release keys (a majority must agree once there are several) and must be carried identically by at least two Pillars, so no one can slip a special version to one person.
 
 The details are in [How Sentinel works](DESIGN.md).
