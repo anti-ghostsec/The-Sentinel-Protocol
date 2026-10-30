@@ -8,3 +8,8 @@
 /vendor/ffmpeg/win64/*.dll
 /vendor/ffmpeg/win64/*.exe
 /apps/*/target
+
+# Local run output: Pillar logs and test passphrase files.
+/seed.out
+/seed.err
+/*-pass.json

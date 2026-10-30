@@ -80,6 +80,8 @@ Download from the **Releases** section of this page. Everything is inside: Tor, 
 
 Check your download against `SHA256SUMS.txt` in the same release. The [tester guide](TESTER_GUIDE.md) walks you through the first ten minutes.
 
+> **Heads up:** Sentinel hasn't been audited by an independent security firm yet, and it is still a pre-release. If being identified could put you in danger, don't rely on it alone until it has been.
+
 ## Where it's going
 
 Sentinel works today, end to end, over the real Tor network: accounts, posts, messages, rooms, media, credits, several devices per account and signed updates, on Windows and Android, with Pillars on Windows and Linux.
