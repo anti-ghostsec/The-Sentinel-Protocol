@@ -24,3 +24,4 @@ data-encoding.workspace = true
 ed25519-dalek.workspace = true
 zeroize.workspace = true
 blake3.workspace = true
+vodozemac.workspace = true

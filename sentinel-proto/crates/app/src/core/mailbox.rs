@@ -13,15 +13,19 @@
 //! prefix when what I download is genuinely too much, and never beyond
 //! `MAX_DEPTH`.
 
-use std::collections::{BTreeSet, HashMap};
-use std::time::Instant;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
+use futures::stream::{FuturesUnordered, StreamExt};
 use sentinel_core::dm;
 use sentinel_core::room;
 use sentinel_core::wire::{Request, Response};
 
-use super::{request, Core};
+use tauri::{AppHandle, Emitter};
+
+use super::{request, request_timeout, Core};
 
 /// Pillars keep mailbox deposits this many days.
 const MAIL_KEEP_DAYS: u64 = 7;
@@ -40,7 +44,17 @@ pub struct MailState {
     last: HashMap<String, Instant>,
     /// Bumped by every re-scan (a key change resets reading positions).
     rescans: u64,
+    /// Pillars that don't hold watches (older versions), and since when.
+    no_watch: HashMap<String, Instant>,
+    /// Per (Pillar, depth): the prefixes watched, padding included, and
+    /// the real ones they were made for.
+    watch_pad: HashMap<(String, u8), (BTreeSet<u16>, BTreeSet<u16>)>,
 }
+
+/// An older Pillar's answer to a request it doesn't know.
+const NO_WATCH: &str = "Pillar doesn't hold watches";
+/// Ask an older Pillar again after this long (it may have been updated).
+const NO_WATCH_RETRY: Duration = Duration::from_secs(6 * 3600);
 
 impl Core {
     /// My own choice of prefix length for a Pillar, from what I observed.
@@ -73,29 +87,7 @@ impl Core {
         let days: Vec<u64> = (from.min(today.saturating_sub(1))..=today).collect();
         let mut all_read = true;
 
-        // Which IDs I read, per Pillar.
-        let mut ids: HashMap<String, Vec<[u8; 32]>> = HashMap::new();
-        if let (Some(p), Some(st)) = (store.pillar.clone(), store.dm.clone()) {
-            for &d in &days {
-                ids.entry(p.clone()).or_default().push(dm::inbox_id(&st.fetch_secret, d));
-            }
-        }
-        for r in &store.rooms {
-            for &d in &days {
-                ids.entry(r.pillar.clone()).or_default().push(room::room_box(&r.secret, d).0);
-                // Approval rooms: the admin and moderators also read the ask box.
-                if let Some(ask) = &r.ask {
-                    ids.entry(r.pillar.clone()).or_default().push(room::room_box(ask, d).0);
-                }
-            }
-        }
-
-        // Linking a device: its mailbox on the link code's Pillar.
-        for (pillar, secret) in Core::link_boxes(&store) {
-            for &d in &days {
-                ids.entry(pillar.clone()).or_default().push(room::room_box(&secret, d).0);
-            }
-        }
+        let ids = Core::mail_ids(&store, &days);
         let (mut dms, mut rooms) = (0, 0);
         for (pillar, list) in ids {
             let bits = self.depth(&pillar);
@@ -125,7 +117,7 @@ impl Core {
                         tokio::time::sleep(std::time::Duration::from_secs(gap)).await;
                     }
                     let mut pages: Vec<Vec<(u64, Vec<u8>)>> = Vec::new();
-                    let Ok(Ok(mut s)) = tokio::time::timeout(std::time::Duration::from_secs(90), net.connect_hedged(&pillar)).await else { return (ck, None) };
+                    let Ok(Ok(mut s)) = tokio::time::timeout(std::time::Duration::from_secs(90), self.stream_to(&net, &pillar)).await else { return (ck, None) };
                     let mut after = start;
                     for _page in 0..50 {
                         match request(&mut s, &Request::Fetch { bits, prefix, after }).await {
@@ -141,31 +133,18 @@ impl Core {
                 }
             });
             let fetched = futures::future::join_all(fetches).await;
-            'prefixes: for (ck, got) in fetched {
+            for (ck, got) in fetched {
                 let Some((pages, complete)) = got else {
                     all_read = false;
                     continue;
                 };
                 all_read &= complete;
-                for blobs in pages {
-                    seen_here += blobs.len();
-                    for (seq, blob) in blobs {
-                        let gen = self.with(|i| i.mail.rescans);
-                        let (d, r) = self.dispatch_blob(&key, &pillar, &blob);
-                        dms += d;
-                        rooms += r;
-                        // That item changed a key and reset the reading
-                        // positions (earlier blobs must be read again with
-                        // the new key): don't move them forward, and stop
-                        // this pass; the next one reads with the new key.
-                        if self.with(|i| i.mail.rescans) != gen {
-                            break 'prefixes;
-                        }
-                        self.update(|st| {
-                            let c = st.mail_cursors.entry(ck.clone()).or_insert(0);
-                            *c = (*c).max(seq);
-                        })?;
-                    }
+                seen_here += pages.iter().map(Vec::len).sum::<usize>();
+                let (d, r, rescanned) = self.take_pages(&key, &pillar, &ck, pages)?;
+                dms += d;
+                rooms += r;
+                if rescanned {
+                    break;
                 }
             }
             self.observe(&pillar, seen_here);
@@ -175,6 +154,184 @@ impl Core {
             self.update(|s| s.mail_day = today)?;
         }
         Ok((dms, rooms))
+    }
+
+    /// The mailbox IDs I read on each Pillar for these days: my inbox,
+    /// my rooms (and their ask boxes), and a device link in progress.
+    fn mail_ids(store: &super::Store, days: &[u64]) -> HashMap<String, Vec<[u8; 32]>> {
+        let mut ids: HashMap<String, Vec<[u8; 32]>> = HashMap::new();
+        if let (Some(p), Some(st)) = (store.pillar.clone(), store.dm.clone()) {
+            for &d in days {
+                ids.entry(p.clone()).or_default().push(dm::inbox_id(&st.fetch_secret, d));
+            }
+        }
+        for r in &store.rooms {
+            for &d in days {
+                ids.entry(r.pillar.clone()).or_default().push(room::room_box(&r.secret, d).0);
+                // Approval rooms: the admin and moderators also read the ask box.
+                if let Some(ask) = &r.ask {
+                    ids.entry(r.pillar.clone()).or_default().push(room::room_box(ask, d).0);
+                }
+            }
+        }
+        // Linking a device: its mailbox on the link code's Pillar.
+        for (pillar, secret) in Core::link_boxes(store) {
+            for &d in days {
+                ids.entry(pillar.clone()).or_default().push(room::room_box(&secret, d).0);
+            }
+        }
+        ids
+    }
+
+    /// Open fetched pages of one prefix (cursor key `ck`) in order and move
+    /// its reading position on. Returns (new DMs, new room messages, true if
+    /// an item reset the reading positions: stop and read again next time).
+    fn take_pages(&self, key: &super::Keys, pillar: &str, ck: &str, pages: Vec<Vec<(u64, Vec<u8>)>>) -> Result<(usize, usize, bool)> {
+        let (mut dms, mut rooms) = (0, 0);
+        for blobs in pages {
+            for (seq, blob) in blobs {
+                let gen = self.with(|i| i.mail.rescans);
+                let (d, r) = self.dispatch_blob(key, pillar, &blob);
+                dms += d;
+                rooms += r;
+                // That item changed a key and reset the reading positions
+                // (earlier blobs must be read again with the new key):
+                // don't move them forward; the next read uses the new key.
+                if self.with(|i| i.mail.rescans) != gen {
+                    return Ok((dms, rooms, true));
+                }
+                self.update(|st| {
+                    let c = st.mail_cursors.entry(ck.to_owned()).or_insert(0);
+                    *c = (*c).max(seq);
+                })?;
+            }
+        }
+        Ok((dms, rooms, false))
+    }
+
+    /// Instant delivery: for every prefix I read today, keep one `Watch`
+    /// held at its Pillar, each on its own isolated circuit, the same way
+    /// as the fetches. The Pillar answers when a deposit lands in the
+    /// prefix (shared with many people), so messages show up seconds after
+    /// they're sent instead of at the next sync. The regular sync still
+    /// reads everything (earlier days, Pillars that don't hold watches).
+    ///
+    /// Off with mixing or High-risk mode: there, fetches keep the fixed
+    /// schedule, so a watcher of the network can't see my app react the
+    /// moment a message is deposited.
+    pub(crate) async fn run_mail_watch(self: Arc<Self>, app: AppHandle) {
+        let mut running: HashSet<(String, u8, u16)> = HashSet::new();
+        let mut started: HashSet<(String, u8, u16)> = HashSet::new();
+        let mut tasks = FuturesUnordered::new();
+        loop {
+            let new: Vec<_> = self.watch_keys().into_iter().filter(|k| !running.contains(k)).collect();
+            for k in new {
+                running.insert(k.clone());
+                // A prefix's first watch starts at a random moment, like the
+                // fetches, so they don't arrive as one recognisable burst;
+                // after an answer it's held again at once.
+                let gap = if started.insert(k.clone()) { u64::from_le_bytes(sentinel_core::random_bytes::<8>()) % 20 } else { 0 };
+                let core = Arc::clone(&self);
+                tasks.push(async move {
+                    tokio::time::sleep(Duration::from_secs(gap)).await;
+                    let r = core.watch_once(&k.0, k.1, k.2).await;
+                    if r.as_ref().is_err_and(|e| !e.to_string().contains(NO_WATCH)) {
+                        // Not connected, or a circuit failed: wait a little.
+                        let pause = 5 + u64::from_le_bytes(sentinel_core::random_bytes::<8>()) % 10;
+                        tokio::time::sleep(Duration::from_secs(pause)).await;
+                    }
+                    (k, r)
+                });
+            }
+            tokio::select! {
+                Some((k, r)) = tasks.next() => {
+                    running.remove(&k);
+                    match r {
+                        Ok((dms, rooms)) => {
+                            if dms > 0 {
+                                let _ = app.emit("messages", ());
+                            }
+                            if rooms > 0 {
+                                let _ = app.emit("rooms", ());
+                            }
+                        }
+                        // An older Pillar: leave it to the regular sync.
+                        Err(e) if e.to_string().contains(NO_WATCH) => {
+                            self.with(|i| i.mail.no_watch.insert(k.0.clone(), Instant::now()));
+                        }
+                        Err(_) => {}
+                    }
+                }
+                // Look for new prefixes (a room joined, a new day, mixing switched).
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+        }
+    }
+
+    /// (Pillar, depth, prefix) to watch now, padded like the fetches;
+    /// none while mixing or High-risk mode is on.
+    fn watch_keys(&self) -> HashSet<(String, u8, u16)> {
+        let Ok((_, store)) = self.unlocked() else { return HashSet::new() };
+        if store.privacy.mix || store.privacy.high_risk || self.with(|i| i.net.is_none()) {
+            return HashSet::new();
+        }
+        let mut keys = HashSet::new();
+        for (pillar, list) in Core::mail_ids(&store, &[dm::today()]) {
+            let skip = self.with(|i| i.mail.no_watch.get(&pillar).is_some_and(|t| t.elapsed() < NO_WATCH_RETRY));
+            if skip {
+                continue;
+            }
+            let bits = self.depth(&pillar);
+            let real: BTreeSet<u16> = list.iter().map(|id| dm::prefix_of(dm::shard_of(id), bits)).collect();
+            // Padding prefixes are kept while the real ones stay the same,
+            // so the set watched doesn't change at every look.
+            let prefixes = self.with(|i| {
+                let e = i.mail.watch_pad.entry((pillar.clone(), bits)).or_default();
+                if e.1 != real {
+                    let mut set = real.clone();
+                    if bits > 0 {
+                        let space = 1u32 << bits;
+                        let target = (set.len().div_ceil(4) * 4).min(space as usize);
+                        while set.len() < target {
+                            set.insert((u32::from_le_bytes(sentinel_core::random_bytes::<4>()) % space) as u16);
+                        }
+                    }
+                    *e = (set, real.clone());
+                }
+                e.0.clone()
+            });
+            keys.extend(prefixes.into_iter().map(|p| (pillar.clone(), bits, p)));
+        }
+        keys
+    }
+
+    /// One held watch on a fresh isolated stream, then anything more in
+    /// that prefix on the same stream. Returns (new DMs, new room messages).
+    async fn watch_once(&self, pillar: &str, bits: u8, prefix: u16) -> Result<(usize, usize)> {
+        let net = self.with(|i| i.net.clone()).context("not connected")?;
+        let ck = format!("{pillar}|{bits}|{prefix}");
+        let mut after = self.unlocked()?.1.mail_cursors.get(&ck).copied().unwrap_or(0);
+        let mut s = tokio::time::timeout(Duration::from_secs(90), self.stream_to(&net, pillar)).await.context("no circuit")??;
+        let hold = Duration::from_secs(sentinel_core::wire::WATCH_HOLD_SECS + 30);
+        let mut pages = match request_timeout(&mut s, &Request::Watch { bits, prefix, after }, hold).await? {
+            Response::Blobs(b) if b.is_empty() => return Ok((0, 0)),
+            Response::Blobs(b) => vec![b],
+            Response::Rejected(e) if e == "malformed request" => bail!("{NO_WATCH}"),
+            other => bail!("watch: {other:?}"),
+        };
+        // A full page: read on, as a fetch would.
+        for _ in 0..50 {
+            after = pages.iter().flatten().map(|(q, _)| *q).max().unwrap_or(after).max(after);
+            match request(&mut s, &Request::Fetch { bits, prefix, after }).await {
+                Ok(Response::Blobs(b)) if !b.is_empty() => pages.push(b),
+                _ => break,
+            }
+        }
+        // The depth may have changed while it was held: those blobs still
+        // open, but the cursor belongs to the old prefix and stays apart.
+        let key = self.unlocked()?.0;
+        let (d, r, _) = self.take_pages(&key, pillar, &ck, pages)?;
+        Ok((d, r))
     }
 
     /// Try my inbox key, then every room on this Pillar. Blobs I handled

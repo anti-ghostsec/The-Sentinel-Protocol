@@ -139,7 +139,15 @@ pub enum Request {
     /// `token` (`social::report_token`) lets the Pillar count each
     /// reporter once without learning who they are.
     Report { address: [u8; 32], chunks: Vec<[u8; 32]>, category: u8, token: [u8; 32], nonce: u64 },
+    /// Like `Fetch`, but when nothing newer than `after` is there yet, the
+    /// Pillar holds the request until a deposit lands in the prefix (or up
+    /// to `WATCH_HOLD_SECS`, answering with empty `Blobs`). Messages arrive
+    /// as they're deposited instead of on the next fetch.
+    Watch { bits: u8, prefix: u16, after: u64 },
 }
+
+/// Longest a Pillar holds a `Watch` before answering with nothing.
+pub const WATCH_HOLD_SECS: u64 = 120;
 
 /// Bytes per `UpdateChunk` answer.
 pub const UPDATE_CHUNK: usize = 1 << 20;

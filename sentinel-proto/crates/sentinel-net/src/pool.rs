@@ -87,6 +87,11 @@ impl Pool {
         Pool { inner, net, onion, task }
     }
 
+    /// The onion this pool connects to.
+    pub fn onion(&self) -> &str {
+        &self.onion
+    }
+
     /// Number of ready streams.
     pub fn ready(&self) -> usize {
         self.inner.ready.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()

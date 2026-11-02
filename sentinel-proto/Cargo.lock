@@ -6007,6 +6007,7 @@ dependencies = [
  "tokio",
  "tokio-socks",
  "tor-rtcompat",
+ "vodozemac",
  "zeroize",
 ]
 

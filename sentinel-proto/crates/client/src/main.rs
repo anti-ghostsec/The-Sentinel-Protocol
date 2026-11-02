@@ -7,6 +7,7 @@
 mod config;
 
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sentinel_core::cell::{read_message, write_message};
@@ -66,6 +67,19 @@ enum Cmd {
         /// Fresh isolated circuits to open.
         #[arg(long, default_value_t = 3)]
         fresh: usize,
+    },
+    /// Measure how fast a private message gets from one person to another
+    /// through a Pillar: two throwaway accounts, never your identity.
+    MsgBench {
+        #[arg(long)]
+        pillar: String,
+        /// Messages to send.
+        #[arg(long, default_value_t = 5)]
+        messages: usize,
+        /// Mailbox prefix length the receiver reads (shared with everyone
+        /// whose inbox falls in the same prefix).
+        #[arg(long, default_value_t = 8)]
+        bits: u8,
     },
     /// Manage bridges (secret Tor entry points for censored networks). No network is used.
     Bridges {
@@ -175,6 +189,7 @@ async fn main() -> Result<()> {
         Cmd::Post { pillar, text } => post(&pillar, text).await,
         Cmd::Get { pillar, address, key } => get(&pillar, &address, key.as_deref()).await,
         Cmd::Bench { pillar, rounds, fresh } => bench(&pillar, rounds, fresh).await,
+        Cmd::MsgBench { pillar, messages, bits } => msg_bench(&pillar, messages, bits).await,
         Cmd::Bridges { action } => bridges(action),
         Cmd::ReleaseKeygen { secret_file } => release_keygen(&secret_file),
         Cmd::AppPack { key, wasm, name, version, description, out } => app_pack(&key, &wasm, name, version, description, &out),
@@ -651,6 +666,187 @@ async fn bench(pillar: &str, rounds: usize, fresh: usize) -> Result<()> {
     if failures > 0 {
         println!("Fresh circuit failures: {failures}/{fresh}");
     }
+    Ok(())
+}
+
+/// The app's mailbox check runs every this many seconds (`REFRESH_EVERY`).
+const APP_SYNC_SECS: f64 = 90.0;
+
+/// One throwaway party: identity, Olm account, inbox secret, contact card.
+fn bench_party(pillar: &str) -> (SigningKey, vodozemac::olm::Account, [u8; 32], sentinel_core::social::ContactCard) {
+    use sentinel_core::dm;
+    let key = identity::generate();
+    let mut acc = vodozemac::olm::Account::new();
+    let inbox_secret = sentinel_core::random_bytes::<32>();
+    let card = dm::make_card(&mut acc, dm::inbox_public(&inbox_secret), Some(dm::inbox_kem_public(&inbox_secret)), sentinel_core::random_bytes::<32>(), pillar.to_owned());
+    (key, acc, inbox_secret, card)
+}
+
+/// Sender to receiver through one Pillar, as the app does it: the sender
+/// seals the message (Olm, then sealed sender with X25519 + ML-KEM-768),
+/// stamps it and deposits it; the receiver picks it up and opens it. The
+/// receiver either holds a `Watch` (answered when the deposit lands) or,
+/// for comparison, fetches on a fresh circuit as the app's sync does.
+async fn msg_bench(pillar: &str, messages: usize, bits: u8) -> Result<()> {
+    use sentinel_core::dm;
+    let settings = Settings::load()?;
+    check_onion(pillar)?;
+    if bits > 16 {
+        bail!("--bits is at most 16");
+    }
+    println!("mode={}  (two throwaway accounts, not your identity)\n", settings.mode.as_str());
+    let t = Instant::now();
+    let net = start_net(&settings).await?;
+    println!("Tor bootstrap: {:.0}ms", ms(t.elapsed()));
+
+    let (a_key, a_acc, _, a_card) = bench_party(pillar);
+    let (_, mut b_acc, b_inbox, b_card) = bench_party(pillar);
+    let inbox = dm::deliver_to(&b_card.inbox_ids).context("no inbox for today")?;
+    let shard = dm::shard_of(&inbox);
+    let prefix = dm::prefix_of(shard, bits);
+    let mut a_sess = dm::outbound_session(&a_acc, &b_card).context("no session")?;
+    let mut b_sess: Option<vodozemac::olm::Session> = None;
+    let reply = dm::ReplyInfo {
+        pillar: pillar.to_owned(),
+        inbox_pub: a_card.inbox_pub,
+        inbox_ids: dm::upcoming_inbox_ids(&sentinel_core::random_bytes::<32>()),
+        inbox_kem: a_card.inbox_kem.clone(),
+    };
+
+    // Both sides use pre-built circuits, as the app does for its own Pillar.
+    let pool = Arc::new(sentinel_net::pool::Pool::spawn(net.clone(), pillar.to_owned(), 3));
+
+    // Start reading after whatever is already in the prefix.
+    let mut after = 0u64;
+    {
+        let mut s = pool.take().await?;
+        loop {
+            match request(&mut s, &Request::Fetch { bits, prefix, after }).await? {
+                Response::Blobs(b) if !b.is_empty() => after = b.iter().map(|(q, _)| *q).max().unwrap_or(after).max(after),
+                _ => break,
+            }
+        }
+    }
+
+    let (mut seal_t, mut pow_t, mut deposit_t, mut open_t, mut e2e, mut fetch_t) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+    let mut watch_ok = true;
+    for i in 0..messages {
+        // Let the pool refill, as between real messages.
+        let wait = Instant::now();
+        while pool.ready() < 3 && wait.elapsed() < CONNECT_TIMEOUT {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // Receiver: a Watch in flight before the message is sent.
+        let watcher = watch_ok.then(|| {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move {
+                let mut s = pool.take().await?;
+                let r = tokio::time::timeout(Duration::from_secs(wire::WATCH_HOLD_SECS + 30), request(&mut s, &Request::Watch { bits, prefix, after })).await.context("watch timed out")??;
+                anyhow::Ok((r, Instant::now()))
+            })
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let start = Instant::now();
+        let text = format!("speed test message {}", i + 1);
+        let payload = dm::DmPayload {
+            from: a_key.verifying_key().to_bytes(),
+            name: "Alice".into(),
+            text: text.clone(),
+            minute: sentinel_core::social::coarse_minute(),
+            card: (i == 0).then(|| a_card.clone()),
+            card_mac: (i == 0).then(|| dm::card_mac(&a_key, &b_card.inbox_pub, &a_card)),
+            reply: Some(reply.clone()),
+            expire_days: Some(7),
+            credits: Vec::new(),
+            purchase: None,
+            grant: None,
+            circle: None,
+            sync: None,
+            delete: None,
+        };
+        let blob = dm::encrypt(&a_acc, &mut a_sess, &payload, &b_card).context("encrypt")?;
+        seal_t.push(ms(start.elapsed()));
+        let t = Instant::now();
+        let (data, pbits) = (dm::deposit_pow_data(shard, &blob), dm::deposit_bits(blob.len()));
+        let nonce = tokio::task::spawn_blocking(move || sentinel_core::pow::stamp(dm::DEPOSIT_POW_DOMAIN, &data, pbits)).await?;
+        pow_t.push(ms(t.elapsed()));
+        let t = Instant::now();
+        let mut s = pool.take().await?;
+        match request(&mut s, &Request::Deposit { shard, blob: blob.clone(), nonce }).await? {
+            Response::Pong => {}
+            other => bail!("deposit refused: {other:?}"),
+        }
+        deposit_t.push(ms(t.elapsed()));
+        let deposited = Instant::now();
+
+        // Receiver gets it: from the held Watch, or (old Pillar) by fetching.
+        let mut got: Option<(Vec<(u64, Vec<u8>)>, Instant)> = None;
+        if let Some(w) = watcher {
+            match w.await? {
+                Ok((Response::Blobs(b), at)) => got = Some((b, at)),
+                Ok((Response::Rejected(e), _)) => {
+                    println!("  This Pillar doesn't hold Watch requests yet ({e}): measuring the app's fetch instead.");
+                    watch_ok = false;
+                }
+                Ok((other, _)) => bail!("unexpected watch answer: {other:?}"),
+                Err(e) => println!("  watch failed: {e:#}"),
+            }
+        }
+        // The fetch the app's sync would make: a fresh circuit, then Fetch.
+        let t = Instant::now();
+        let mut s = net.connect_hedged(pillar).await?;
+        let fetched = match request(&mut s, &Request::Fetch { bits, prefix, after }).await? {
+            Response::Blobs(b) => b,
+            other => bail!("unexpected fetch answer: {other:?}"),
+        };
+        fetch_t.push(ms(t.elapsed()));
+        let (blobs, at) = got.unwrap_or((fetched, Instant::now()));
+
+        let t = Instant::now();
+        let mut found = false;
+        for (seq, b) in &blobs {
+            after = after.max(*seq);
+            let Some((sender, msg)) = dm::unseal(&b_inbox, b) else { continue };
+            if let Some((sess, p)) = dm::decrypt(&mut b_acc, b_sess.take(), sender, &msg) {
+                b_sess = Some(sess);
+                found |= p.text == text;
+            }
+        }
+        if !found {
+            bail!("message {} didn't arrive", i + 1);
+        }
+        open_t.push(ms(t.elapsed()));
+        let total = ms(at.duration_since(start)) + open_t[open_t.len() - 1];
+        if watch_ok {
+            e2e.push(total);
+            println!("  message {:>2}: {:>6.0}ms end to end ({} bytes; deposit {:>5.0}ms, delivered {:>5.0}ms after)", i + 1, total, blob.len(), deposit_t[deposit_t.len() - 1], ms(at.saturating_duration_since(deposited)));
+        } else {
+            println!("  message {:>2}: deposit {:>5.0}ms, fetch on a fresh circuit {:>5.0}ms ({} bytes)", i + 1, deposit_t[deposit_t.len() - 1], fetch_t[fetch_t.len() - 1], blob.len());
+        }
+    }
+
+    println!();
+    summary("Seal (Olm + X25519/ML-KEM)", seal_t);
+    summary("Deposit proof of work", pow_t.clone());
+    summary("Deposit on a pooled circuit", deposit_t.clone());
+    summary("Open (unseal + Olm)", open_t);
+    summary("Fetch on a fresh circuit", fetch_t.clone());
+    if !e2e.is_empty() {
+        summary("End to end, with Watch", e2e);
+    }
+    // Without Watch the message waits for the receiver's next sync, a
+    // uniformly random moment within the 90 s schedule, then a fetch.
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let base = med(pow_t) + med(deposit_t) + med(fetch_t);
+    println!(
+        "End to end, 90 s sync (model)      typical={:>7.0}ms  worst={:>7.0}ms",
+        base + APP_SYNC_SECS * 500.0,
+        base + APP_SYNC_SECS * 1000.0
+    );
     Ok(())
 }
 

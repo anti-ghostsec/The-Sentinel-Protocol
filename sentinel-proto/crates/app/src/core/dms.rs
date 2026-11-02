@@ -332,22 +332,29 @@ impl Core {
                 if let (Some(b), Some(first)) = (&m.blob, cards.first()) {
                     pending.push(Outgoing { olm: first.olm_identity, blob: b.clone() });
                 }
-                let mut stuck = false;
+                let mut sends = Vec::new();
                 for o in pending {
-                    let Some(card) = cards.iter().chain(store.my_devices.iter()).find(|x| x.olm_identity == o.olm).cloned() else {
+                    match cards.iter().chain(store.my_devices.iter()).find(|x| x.olm_identity == o.olm).cloned() {
+                        Some(card) => sends.push((o, card)),
                         // That device is gone: drop the copy.
-                        self.drop_copy(&c.author, &o)?;
-                        continue;
-                    };
-                    if self.deposit_dm(&net, &card, &o.blob).await.is_err() {
-                        stuck = true;
-                        break; // keep order: try again next sync
+                        None => self.drop_copy(&c.author, &o)?,
                     }
-                    delivered += 1;
-                    self.drop_copy(&c.author, &o)?;
+                }
+                // Each copy goes to a different device, so they go out at
+                // the same time (each on its own circuit); order per device
+                // holds because the next message waits for all of them.
+                let results = futures::future::join_all(sends.iter().map(|(o, card)| self.deposit_dm(&net, card, &o.blob))).await;
+                let mut stuck = false;
+                for ((o, _), r) in sends.iter().zip(results) {
+                    if r.is_ok() {
+                        delivered += 1;
+                        self.drop_copy(&c.author, o)?;
+                    } else {
+                        stuck = true;
+                    }
                 }
                 if stuck {
-                    break;
+                    break; // keep order: try again next sync
                 }
             }
         }

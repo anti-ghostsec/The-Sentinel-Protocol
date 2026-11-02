@@ -130,6 +130,10 @@ struct Ctx {
     mix_seen: std::sync::Mutex<std::collections::VecDeque<[u8; 32]>>,
     /// Which listed Pillars answered lately (memory only; see `directory`).
     dir: Arc<directory::Directory>,
+    /// The shard of every new deposit, for held `Watch` requests.
+    deposits: tokio::sync::broadcast::Sender<u16>,
+    /// `Watch` requests being held.
+    watching: AtomicU64,
 }
 
 /// Most mixed packets held at once.
@@ -217,6 +221,8 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         mix: load_mix_secret(&cfg.store),
         mix_seen: std::sync::Mutex::new(std::collections::VecDeque::new()),
         dir: Arc::default(),
+        deposits: tokio::sync::broadcast::channel(1024).0,
+        watching: AtomicU64::new(0),
     });
     let (max_seq, count) = mailbox_scan(&cfg.store);
     // The counter survives restarts even after every deposit expired (a
@@ -909,6 +915,8 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             }
             stats.used_bytes.fetch_add(blob.len() as u64, Ordering::Relaxed);
             ctx.mail_count.fetch_add(1, Ordering::Relaxed);
+            // Wake the readers watching this shard's prefixes.
+            let _ = ctx.deposits.send(shard);
             // Plain acknowledgement: nothing about who else uses the shard.
             Response::Pong
         }
@@ -978,38 +986,17 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             if bits > 16 {
                 return Response::Rejected("bad prefix".into());
             }
-            let mut found: Vec<(u64, PathBuf)> = Vec::new();
-            if let Ok(rd) = std::fs::read_dir(store.join("inboxes")) {
-                for d in rd.filter_map(|e| e.ok()) {
-                    let Ok(shard) = u16::from_str_radix(&d.file_name().to_string_lossy(), 16) else { continue };
-                    if !dm::prefix_matches(shard, bits, prefix) {
-                        continue;
-                    }
-                    if let Ok(files) = std::fs::read_dir(d.path()) {
-                        found.extend(
-                            files
-                                .filter_map(|e| e.ok())
-                                .filter_map(|e| Some((e.file_name().to_string_lossy().parse::<u64>().ok()?, e.path())))
-                                .filter(|(n, _)| *n > after),
-                        );
-                    }
-                }
+            Response::Blobs(mailbox_page(store, bits, prefix, after).await)
+        }
+        Request::Watch { bits, prefix, after } => {
+            if bits > 16 {
+                return Response::Rejected("bad prefix".into());
             }
-            found.sort();
-            // Bounded by bytes as well as count (a reply over the message
-            // limit would fail every time); the reader pages with `after`.
-            let mut out = Vec::new();
-            let mut total = 0usize;
-            for (n, p) in found.into_iter().take(200) {
-                if let Ok(b) = tokio::fs::read(&p).await {
-                    total += b.len() + 16;
-                    if total > FETCH_REPLY_BYTES && !out.is_empty() {
-                        break;
-                    }
-                    out.push((n, b));
-                }
-            }
-            Response::Blobs(out)
+            let Some(_slot) = WatchSlot::take(&ctx.watching) else {
+                return Response::Rejected("busy".into());
+            };
+            let hold = Duration::from_secs(wire::WATCH_HOLD_SECS);
+            Response::Blobs(watch_mailbox(store, ctx.deposits.subscribe(), bits, prefix, after, hold).await)
         }
         Request::PutChunk { data, nonce } => {
             // Media chunks are ciphertext with keys this node is never given.
@@ -1119,6 +1106,86 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
 }
 
 /// Where a product's update bundle lives (only the known names).
+/// Deposits in `prefix` newer than `after`, oldest first, one reply's worth.
+async fn mailbox_page(store: &Path, bits: u8, prefix: u16, after: u64) -> Vec<(u64, Vec<u8>)> {
+    let mut found: Vec<(u64, PathBuf)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(store.join("inboxes")) {
+        for d in rd.filter_map(|e| e.ok()) {
+            let Ok(shard) = u16::from_str_radix(&d.file_name().to_string_lossy(), 16) else { continue };
+            if !dm::prefix_matches(shard, bits, prefix) {
+                continue;
+            }
+            if let Ok(files) = std::fs::read_dir(d.path()) {
+                found.extend(
+                    files
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| Some((e.file_name().to_string_lossy().parse::<u64>().ok()?, e.path())))
+                        .filter(|(n, _)| *n > after),
+                );
+            }
+        }
+    }
+    found.sort();
+    // Bounded by bytes as well as count (a reply over the message
+    // limit would fail every time); the reader pages with `after`.
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for (n, p) in found.into_iter().take(200) {
+        if let Ok(b) = tokio::fs::read(&p).await {
+            total += b.len() + 16;
+            if total > FETCH_REPLY_BYTES && !out.is_empty() {
+                break;
+            }
+            out.push((n, b));
+        }
+    }
+    out
+}
+
+/// A mailbox page, waiting up to `hold` for one if there's nothing yet.
+/// `deposits` must be subscribed before the first look, so a deposit
+/// landing in between isn't missed.
+async fn watch_mailbox(store: &Path, mut deposits: tokio::sync::broadcast::Receiver<u16>, bits: u8, prefix: u16, after: u64, hold: Duration) -> Vec<(u64, Vec<u8>)> {
+    use tokio::sync::broadcast::error::RecvError;
+    let deadline = tokio::time::Instant::now() + hold;
+    loop {
+        let page = mailbox_page(store, bits, prefix, after).await;
+        if !page.is_empty() {
+            return page;
+        }
+        // Until a deposit in this prefix (or too many to follow: look again).
+        loop {
+            match tokio::time::timeout_at(deadline, deposits.recv()).await {
+                Err(_) | Ok(Err(RecvError::Closed)) => return Vec::new(),
+                Ok(Ok(shard)) if !dm::prefix_matches(shard, bits, prefix) => continue,
+                Ok(Ok(_)) | Ok(Err(RecvError::Lagged(_))) => break,
+            }
+        }
+    }
+}
+
+/// Most `Watch` requests held at once.
+const MAX_WATCHING: u64 = 50_000;
+
+/// One held `Watch`, counted while it waits.
+struct WatchSlot<'a>(&'a AtomicU64);
+
+impl<'a> WatchSlot<'a> {
+    fn take(count: &'a AtomicU64) -> Option<Self> {
+        if count.fetch_add(1, Ordering::Relaxed) >= MAX_WATCHING {
+            count.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(WatchSlot(count))
+    }
+}
+
+impl Drop for WatchSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 fn update_path(ctx: &Ctx, product: &str) -> Option<PathBuf> {
     let dir = ctx.updates.as_ref()?;
     matches!(product, "app" | "app-android" | "pillar").then(|| dir.join(format!("{product}.bin")))
@@ -1357,5 +1424,42 @@ mod tests {
         let text = format!("{a} {today}\n{b} {}\n{c} {}\nnot-an-onion\n", today - 3, today - 4);
         assert_eq!(read_known_text(&text), vec![a.clone(), b]);
         assert_eq!(read_known_text(&format!("{a}\n")), vec![a]);
+    }
+
+    fn put_deposit(store: &Path, shard: u16, seq: u64, tx: &tokio::sync::broadcast::Sender<u16>) {
+        std::fs::create_dir_all(shard_dir(store, shard)).unwrap();
+        std::fs::write(shard_dir(store, shard).join(format!("{seq:016}")), [seq as u8; 100]).unwrap();
+        let _ = tx.send(shard);
+    }
+
+    #[tokio::test]
+    async fn a_watch_answers_when_mail_lands_in_its_prefix() {
+        let store = std::env::temp_dir().join(format!("sentinel-watch-{}", data_encoding::HEXLOWER.encode(&sentinel_core::random_bytes::<8>())));
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let hold = Duration::from_secs(30);
+        // Mail already there: answered at once.
+        put_deposit(&store, 0xAB00, 1, &tx);
+        let got = watch_mailbox(&store, tx.subscribe(), 8, 0xAB, 0, hold).await;
+        assert_eq!(got.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![1]);
+
+        // Nothing newer: held until a deposit in the prefix, not one elsewhere.
+        let watch = tokio::spawn({
+            let (store, rx) = (store.clone(), tx.subscribe());
+            async move { watch_mailbox(&store, rx, 8, 0xAB, 1, hold).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        put_deposit(&store, 0xCD00, 2, &tx);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!watch.is_finished());
+        let t = std::time::Instant::now();
+        put_deposit(&store, 0xAB42, 3, &tx);
+        let got = watch.await.unwrap();
+        assert_eq!(got.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![3]);
+        assert!(t.elapsed() < Duration::from_secs(1));
+
+        // Nothing at all: an empty answer when the hold runs out.
+        let got = watch_mailbox(&store, tx.subscribe(), 8, 0xEE, 0, Duration::from_millis(200)).await;
+        assert!(got.is_empty());
+        let _ = std::fs::remove_dir_all(&store);
     }
 }

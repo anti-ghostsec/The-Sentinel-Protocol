@@ -696,6 +696,8 @@ struct Inner {
     uploader: Option<tauri::async_runtime::JoinHandle<()>>,
     cover: Option<tauri::async_runtime::JoinHandle<()>>,
     auditor: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// Held mailbox watches (instant delivery; see `mailbox`).
+    watcher: Option<tauri::async_runtime::JoinHandle<()>>,
     mail: mailbox::MailState,
     /// This account's key-file fingerprint, while unlocked (memory only).
     keyfile: Option<zeroize::Zeroizing<[u8; 32]>>,
@@ -1057,6 +1059,9 @@ impl Core {
             if let Some(h) = i.auditor.take() {
                 h.abort();
             }
+            if let Some(h) = i.watcher.take() {
+                h.abort();
+            }
             if let Some(h) = i.updater.take() {
                 h.abort();
             }
@@ -1209,6 +1214,7 @@ impl Core {
         let uploader = tauri::async_runtime::spawn(Arc::clone(self).run_uploader(app.clone()));
         let cover = tauri::async_runtime::spawn(Arc::clone(self).run_cover_traffic());
         let auditor = tauri::async_runtime::spawn(Arc::clone(self).run_auditor());
+        let watcher = tauri::async_runtime::spawn(Arc::clone(self).run_mail_watch(app.clone()));
         let updater = tauri::async_runtime::spawn(Arc::clone(self).run_update_checks(app.clone()));
         {
             let core = Arc::clone(self);
@@ -1231,6 +1237,9 @@ impl Core {
             i.uploader = Some(uploader);
             i.cover = Some(cover);
             i.auditor = Some(auditor);
+            if let Some(old) = i.watcher.replace(watcher) {
+                old.abort();
+            }
             if let Some(old) = i.updater.replace(updater) {
                 old.abort();
             }
@@ -1289,7 +1298,7 @@ impl Core {
         }
         // Straight to the destination...
         let direct = tokio::time::timeout(Duration::from_secs(45), async {
-            let mut s = net.connect_hedged(pillar).await?;
+            let mut s = self.stream_to(net, pillar).await?;
             match request(&mut s, &Request::Deposit { shard, blob: blob.clone(), nonce }).await? {
                 Response::Pong => Ok(()),
                 other => bail!("not delivered: {other:?}"),
@@ -1373,10 +1382,21 @@ impl Core {
         Ok(route)
     }
 
+    /// A fresh isolated stream to `pillar`: a ready one from the pool when
+    /// it's my own Pillar (built earlier, in the background), else a new
+    /// connection. Either way it's used for this one request group only.
+    pub(crate) async fn stream_to(&self, net: &Net, pillar: &str) -> Result<Box<dyn Io>> {
+        match self.with(|i| i.pool.clone()).filter(|p| p.onion() == pillar) {
+            Some(pool) => pool.take().await,
+            None => net.connect_hedged(pillar).await,
+        }
+    }
+
     pub(crate) fn start_pool(&self) {
         self.with(|i| {
             if let (Some(net), Some(p)) = (&i.net, i.store.as_ref().and_then(|s| s.pillar.clone())) {
-                i.pool = Some(Arc::new(Pool::spawn(net.clone(), p, 2)));
+                // Three: held mailbox watches take one each as well.
+                i.pool = Some(Arc::new(Pool::spawn(net.clone(), p, 3)));
             }
         });
     }

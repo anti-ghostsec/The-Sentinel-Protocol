@@ -45,6 +45,11 @@ struct Args {
     /// a random 5–35 minutes).
     #[arg(long)]
     spread_after: Option<u64>,
+    /// Pillars to announce to and learn the directory from
+    /// (comma-separated onions, or `none` for a private test Pillar);
+    /// default: the built-in seeds.
+    #[arg(long)]
+    seeds: Option<String>,
     /// Separate data folder name (lets several test nodes share a machine).
     #[arg(long, default_value = "pillar")]
     data: String,
@@ -139,7 +144,11 @@ async fn main() -> Result<()> {
             nickname: args.nickname,
             quota_bytes: args.quota_gb * 1_000_000_000,
             retention_days: args.retention_days,
-            seeds: sentinel_net::seed_pillars(),
+            seeds: match args.seeds.as_deref() {
+                Some("none") => Vec::new(),
+                Some(list) => list.split(',').filter_map(|o| sentinel_net::transport::check_onion(o).ok()).collect(),
+                None => sentinel_net::seed_pillars(),
+            },
             chunk_quota_bytes: if args.archive_gb > 0 { args.archive_gb * 1_000_000_000 } else { 1_000_000_000 },
             chunk_retention_days: args.chunk_retention_days,
             archive: args.archive_gb > 0,
