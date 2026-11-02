@@ -1,0 +1,144 @@
+name: Build
+
+# Builds the apps people install, the same way the scripts in
+# sentinel-proto/scripts do, and keeps them as downloadable artifacts.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    # The oldest supported Ubuntu, so the AppImage runs on older systems too.
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: sentinel-proto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sentinel-proto
+      # Installs the system libraries and FFmpeg, builds the app (.deb and
+      # AppImage) and the static Pillar, and checks for local paths.
+      - name: Build
+        run: bash scripts/build-linux.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-linux
+          path: sentinel-proto/dist/*
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: sentinel-proto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sentinel-proto
+      - name: Tauri CLI
+        run: cargo tauri --version 2>$null; if ($LASTEXITCODE -ne 0) { cargo install tauri-cli --version '^2' --locked }
+      # FFmpeg, then the Pillar, CLI and app installer, with local paths
+      # stripped and checked.
+      - name: Build
+        run: powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-windows
+          path: |
+            sentinel-proto/target/release/bundle/nsis/*.exe
+            sentinel-proto/target/release/pillar.exe
+            sentinel-proto/target/release/sentinel-cli.exe
+          if-no-files-found: error
+
+  android:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: sentinel-proto
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sentinel-proto
+      - name: Tools
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi
+          cargo tauri --version >/dev/null 2>&1 || cargo install tauri-cli --version '^2' --locked
+      # The release key comes from the ANDROID_KEYSTORE_B64 and
+      # ANDROID_KEYSTORE_PASSWORD secrets. Without them a throwaway key is
+      # made: that APK installs, but can't update one signed with the real key.
+      - name: Signing key
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          ks="$RUNNER_TEMP/release.jks"
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$ks"
+            pw="$KEYSTORE_PASSWORD"
+          else
+            echo "::warning::No release key in secrets: signing with a throwaway key."
+            pw="$(openssl rand -hex 16)"
+            keytool -genkeypair -keystore "$ks" -storepass "$pw" -keypass "$pw" -alias sentinel \
+              -keyalg RSA -keysize 4096 -validity 3650 -dname "CN=Sentinel test build" -noprompt
+          fi
+          printf 'storeFile=%s\npassword=%s\nkeyAlias=sentinel\n' "$ks" "$pw" > crates/app/gen/android/keystore.properties
+      - name: Build
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          bin="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          root="$PWD"
+          export CARGO_ENCODED_RUSTFLAGS="$(printf -- '--remap-path-prefix=%s=home\x1f--remap-path-prefix=%s=sentinel' "$HOME" "$root")"
+          jni="crates/app/gen/android/app/src/main/jniLibs"
+          rm -rf "$jni"
+          # The separate Tor program (see torproc.rs), shipped as a "library"
+          # so the system unpacks it where the app may run it.
+          for t in "aarch64-linux-android arm64-v8a aarch64-linux-android" \
+                   "armv7-linux-androideabi armeabi-v7a armv7a-linux-androideabi"; do
+            set -- $t
+            u="$(echo "$1" | tr 'a-z-' 'A-Z_')"
+            export "CARGO_TARGET_${u}_LINKER=$bin/${3}24-clang"
+            export "CC_${1//-/_}=$bin/${3}24-clang"
+            export "AR_${1//-/_}=$bin/llvm-ar"
+            cargo rustc --release --locked -p sentinel-net --bin sentinel-tor --target "$1" -- -C strip=symbols
+            mkdir -p "$jni/$2"
+            cp "target/$1/release/sentinel-tor" "$jni/$2/libsentinel_tor.so"
+          done
+          ( cd crates/app && cargo tauri android build --apk --target aarch64 --target armv7 )
+          mkdir -p dist
+          cp crates/app/gen/android/app/build/outputs/apk/universal/release/*.apk dist/sentinel-android.apk
+          # Both architectures' app and Tor libraries must be inside.
+          for lib in arm64-v8a/libsentinel_app_lib.so arm64-v8a/libsentinel_tor.so \
+                     armeabi-v7a/libsentinel_app_lib.so armeabi-v7a/libsentinel_tor.so; do
+            unzip -l dist/sentinel-android.apk | grep -q "lib/$lib" || { echo "missing lib/$lib in the APK" >&2; exit 1; }
+          done
+          for t in aarch64-linux-android armv7-linux-androideabi; do
+            for f in libsentinel_app_lib.so sentinel-tor; do
+              if grep -a -q -e "/home/$(id -un)/" "target/$t/release/$f"; then
+                echo "local path left in $f ($t)" >&2; exit 1
+              fi
+            done
+          done
+          rm -f crates/app/gen/android/keystore.properties
+          echo "clean: dist/sentinel-android.apk ($(du -h dist/sentinel-android.apk | cut -f1))"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sentinel-android
+          path: sentinel-proto/dist/sentinel-android.apk
+          if-no-files-found: error
