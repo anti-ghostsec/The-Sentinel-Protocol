@@ -1850,15 +1850,17 @@ impl Core {
     /// the first that answers, learning more of the directory along the way.
     /// Returns the candidates not tried yet (for [`Self::find_backup`]).
     /// Never picks this device's own hosted Pillar (that would let observers
-    /// link the account to the Pillar's uptime).
+    /// link the account to the Pillar's uptime), unless its address was
+    /// typed in on purpose (`add_pillar_hint` warns about that).
     async fn auto_select_pillars(&self, net: &Net) -> Result<Vec<String>> {
         let (_, store) = self.unlocked()?;
-        let own = self.with(|i| i.hosted.as_ref().map(|h| h.onion.clone()));
+        let hints = self.with(|i| i.pillar_hints.clone());
+        let own = self.with(|i| i.hosted.as_ref().map(|h| h.onion.clone())).filter(|o| !hints.contains(o));
         let today = directory::today();
         // Typed-in addresses, then a mix of Pillars that worked lately,
         // vouched ones and seeds, then the rest (see `directory::order`).
         let mut candidates = directory::order(
-            &self.with(|i| i.pillar_hints.clone()),
+            &hints,
             &sentinel_net::seed_pillars(),
             &store.known_pillars,
             &store.vouched_pillars,
@@ -2417,15 +2419,21 @@ impl Core {
     }
 
     /// A Pillar address to try first while looking for Pillars (someone
-    /// trusted runs it; the network's seeds may be down).
-    pub fn add_pillar_hint(&self, onion: &str) -> Result<()> {
+    /// trusted runs it; the network's seeds may be down). Returns what to
+    /// tell the user.
+    pub fn add_pillar_hint(&self, onion: &str) -> Result<String> {
         let onion = check_onion(onion)?;
-        self.with(|i| {
+        let own = self.with(|i| {
             if !i.pillar_hints.contains(&onion) {
-                i.pillar_hints.push(onion);
+                i.pillar_hints.push(onion.clone());
             }
+            i.hosted.as_ref().is_some_and(|h| h.onion == onion)
         });
-        Ok(())
+        Ok(if own {
+            "Added. This is the Pillar this device runs: using it as your own lets anyone watching it tell when your account is online, so switch to someone else's Pillar when you can.".into()
+        } else {
+            "Added. Sentinel will try it next.".into()
+        })
     }
 
     pub fn set_pillar(&self, onion: &str) -> Result<()> {

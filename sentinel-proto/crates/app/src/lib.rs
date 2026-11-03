@@ -979,7 +979,7 @@ fn copy_connection_log() -> bool {
 }
 
 #[tauri::command]
-fn add_pillar_hint(core: State<'_, Arc<Core>>, onion: String) -> Res<()> {
+fn add_pillar_hint(core: State<'_, Arc<Core>>, onion: String) -> Res<String> {
     core.add_pillar_hint(&onion).map_err(err)
 }
 

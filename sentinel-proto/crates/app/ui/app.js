@@ -413,9 +413,9 @@ $("connect-log-copy").addEventListener("click", async () => {
 $("connect-pillar-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   try {
-    await invoke("add_pillar_hint", { onion: $("connect-pillar").value });
+    const msg = await invoke("add_pillar_hint", { onion: $("connect-pillar").value });
     $("connect-pillar").value = "";
-    $("connect-pillar-msg").textContent = "Added. Sentinel will try it next.";
+    $("connect-pillar-msg").textContent = msg;
     if (!$("connect-retry").hidden) startConnecting();
   } catch (err) {
     $("connect-pillar-msg").textContent = String(err);
