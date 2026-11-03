@@ -142,3 +142,42 @@ jobs:
           name: sentinel-android
           path: sentinel-proto/dist/sentinel-android.apk
           if-no-files-found: error
+
+  # A version tag (v0.2.0, or v0.2.0-beta for a pre-release) publishes the
+  # files under Releases, with the names the README lists.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # An APK signed with a throwaway key can't update people's installs.
+      - name: Release key present
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ]; then
+            echo "::error::Set the ANDROID_KEYSTORE_B64 and ANDROID_KEYSTORE_PASSWORD secrets before releasing."
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          path: art
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir out
+          cp art/sentinel-windows/bundle/nsis/*-setup.exe out/sentinel-windows-setup.exe
+          cp art/sentinel-windows/pillar.exe out/sentinel-pillar-windows.exe
+          cp art/sentinel-windows/sentinel-cli.exe out/sentinel-cli-windows.exe
+          cp art/sentinel-linux/*.AppImage out/sentinel-linux.AppImage
+          cp art/sentinel-linux/*.deb out/sentinel-linux.deb
+          cp art/sentinel-linux/sentinel-pillar-linux-x86_64 out/
+          cp art/sentinel-android/sentinel-android.apk out/
+          ( cd out && sha256sum * > SHA256SUMS.txt )
+          pre=""
+          case "$TAG" in *-*) pre="--prerelease" ;; esac
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --title "The Sentinel Protocol $TAG" --generate-notes $pre

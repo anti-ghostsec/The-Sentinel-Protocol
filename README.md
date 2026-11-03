@@ -76,6 +76,7 @@ Download from the **Releases** section of this page. Everything is inside: Tor, 
 |---|---|
 | **Windows 10 or 11** | `sentinel-windows-setup.exe`: installs for your user only, no admin rights needed |
 | **Android 7 or newer** | `sentinel-android.apk` |
+| **Linux** (Ubuntu 22.04+, Debian 12+) | `sentinel-linux.AppImage` (runs as is: `chmod +x`, then open it) or `sentinel-linux.deb` |
 | **A computer that stays on** | `sentinel-pillar-windows.exe`, `sentinel-pillar-linux-x86_64`, or `sentinel-pillar-linux-arm64` (Raspberry Pi) |
 
 Check your download against `SHA256SUMS.txt` in the same release. The [tester guide](TESTER_GUIDE.md) walks you through the first ten minutes.
