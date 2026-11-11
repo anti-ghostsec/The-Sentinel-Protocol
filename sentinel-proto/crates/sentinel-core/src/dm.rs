@@ -37,8 +37,18 @@ pub const MAX_BLOB: usize = 64 * 1024;
 /// Proof-of-work for inbox deposits (anti-spam without identity).
 pub const DEPOSIT_POW_DOMAIN: &str = "sentinel/v0/deposit-pow";
 pub const DEPOSIT_POW_BITS: u32 = 14;
-/// Pad sealed payloads to multiples of this.
-const PAD: usize = 512;
+/// Sealed payloads are padded to one of these sizes, so the Pillar can't
+/// tell kinds of messages apart by size: a first message (it carries the
+/// sender's contact card, about 13 KB more) and an ordinary one (with its
+/// reply details) both come out at 24 KiB; short ones without reply
+/// details at 2 KiB. Bigger ones are padded to a multiple of `PAD`.
+const PAD_BUCKETS: &[usize] = &[2 * 1024, 24 * 1024, 40 * 1024, 60 * 1024];
+const PAD: usize = 4096;
+
+/// The padded size for a payload of `len` bytes.
+fn padded_len(len: usize) -> usize {
+    PAD_BUCKETS.iter().copied().find(|b| *b >= len).unwrap_or(len.div_ceil(PAD) * PAD)
+}
 
 pub fn session_config() -> SessionConfig {
     SessionConfig::version_1()
@@ -334,11 +344,34 @@ pub fn encrypt(account: &Account, session: &mut Session, payload: &DmPayload, ca
     let msg = session.encrypt(cbor(payload)).ok()?;
     let (t, bytes) = msg.to_parts();
     let mut wire = Wire { sender_identity: account.curve25519_key().to_bytes(), olm_type: t as u8, olm: bytes, pad: Vec::new() };
-    let len = cbor(&wire).len();
-    wire.pad = vec![0; (len.div_ceil(PAD) * PAD).saturating_sub(len + 3)];
+    pad_wire(&mut wire);
     match card.inbox_kem.as_deref().filter(|k| k.len() == crate::pq::KEM_PUBLIC) {
         Some(k) => crate::pq::seal(PQ_SEAL, &card.inbox_pub, &card.inbox_pub, Some(k), &cbor(&wire)),
         None => Some(seal_to(&card.inbox_pub, &cbor(&wire))),
+    }
+}
+
+/// Pad to exactly the bucket size. The pad is a CBOR list of numbers: a 0
+/// takes one byte and a 24 two, so after the longest run of zeros that
+/// fits, a few 24s make up the last bytes (the list's own length field
+/// grows with it, which zeros alone can't always match).
+fn pad_wire(wire: &mut Wire) {
+    wire.pad = Vec::new();
+    let target = padded_len(cbor(&*wire).len() + 3);
+    let len_with = |w: &mut Wire, n: usize| {
+        w.pad = vec![0; n];
+        cbor(&*w).len()
+    };
+    let mut n = target.saturating_sub(cbor(&*wire).len() + 3);
+    while n > 0 && len_with(wire, n) > target {
+        n -= 1;
+    }
+    while len_with(wire, n + 1) <= target {
+        n += 1;
+    }
+    let short = target.saturating_sub(len_with(wire, n));
+    for b in wire.pad.iter_mut().take(short) {
+        *b = 24;
     }
 }
 
@@ -539,6 +572,34 @@ mod tests {
 #[cfg(test)]
 mod inbox_capability_tests {
     use super::*;
+
+    #[test]
+    fn mailbox_padding_is_stable_for_the_day_and_hides_the_count() {
+        use std::collections::BTreeSet;
+        let secret = [9u8; 32];
+        let real: BTreeSet<u16> = [3u16, 7].into_iter().collect();
+        let a = padded_prefixes(&secret, "p.onion", 100, 4, &real);
+        assert_eq!(a.len(), 4);
+        assert!(real.is_subset(&a));
+        // Every poll of the day asks for the same prefixes.
+        assert_eq!(padded_prefixes(&secret, "p.onion", 100, 4, &real), a);
+        // Another day, Pillar or reader: other padding (not always, at 16
+        // prefixes, but over a few tries).
+        let differs = |f: &dyn Fn(u64) -> BTreeSet<u16>| (0..8).any(|i| f(i) != a);
+        assert!(differs(&|i| padded_prefixes(&secret, "p.onion", 101 + i, 4, &real)));
+        assert!(differs(&|i| padded_prefixes(&[i as u8; 32], "p.onion", 100, 4, &real)));
+        // One more real prefix: still a multiple of 4.
+        let mut more = real.clone();
+        more.insert(11);
+        let b = padded_prefixes(&secret, "p.onion", 100, 4, &more);
+        assert_eq!(b.len(), 4);
+        assert!(more.is_subset(&b));
+        // Depth 0 is everything; a small space is filled completely.
+        assert_eq!(padded_prefixes(&secret, "p.onion", 100, 0, &[0].into_iter().collect()).len(), 1);
+        let all: BTreeSet<u16> = [0, 1].into_iter().collect();
+        assert_eq!(padded_prefixes(&secret, "p.onion", 100, 1, &all), all);
+        assert_eq!(padded_prefixes(&secret, "p.onion", 100, 2, &[1].into_iter().collect()).len(), 4);
+    }
 
     #[test]
     fn only_the_owner_can_derive_the_fetch_token() {
