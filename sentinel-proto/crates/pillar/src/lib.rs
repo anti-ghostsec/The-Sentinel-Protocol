@@ -20,6 +20,7 @@
 mod directory;
 mod economy;
 mod relay;
+mod seen;
 mod reports;
 mod pqmint;
 mod earning;
@@ -132,8 +133,10 @@ struct Ctx {
     updates: Option<PathBuf>,
     /// Mix key (secret kept in the data folder).
     mix: sentinel_core::mix::MixSecret,
-    /// Mixed packets seen (replays are dropped) and how many are waiting.
-    mix_seen: std::sync::Mutex<std::collections::VecDeque<[u8; 32]>>,
+    /// Mixed packets seen (replays are dropped), kept across restarts.
+    mix_seen: seen::SeenSet,
+    /// Deposits stored lately (the same blob twice is stored once).
+    deposit_seen: seen::SeenSet,
     /// Which listed Pillars answered lately (memory only; see `directory`).
     dir: Arc<directory::Directory>,
     /// The shard of every new deposit, for held `Watch` requests.
@@ -144,6 +147,15 @@ struct Ctx {
 
 /// Most mixed packets held at once.
 const MAX_MIX_WAITING: u64 = 20_000;
+/// Days a mixed packet is remembered (replays within them are dropped).
+/// The mix key doesn't change, so this is the replay window: a longer
+/// one costs disk (32 bytes per packet) and memory.
+const MIX_SEEN_DAYS: u64 = 30;
+/// Most mixed packets remembered; when full, new packets are refused
+/// (never forgotten early, which would let replays through).
+const MAX_MIX_SEEN: usize = 500_000;
+/// Deposits live 7 days; their ids are kept a day longer.
+const DEPOSIT_SEEN_DAYS: u64 = 8;
 
 /// The mix secret, made once and kept beside the Pillar's data.
 fn load_mix_secret(store: &Path) -> sentinel_core::mix::MixSecret {
@@ -226,7 +238,8 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         mint_interval: cfg.mint_interval,
         updates: cfg.updates.clone(),
         mix: load_mix_secret(&cfg.store),
-        mix_seen: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        mix_seen: seen::SeenSet::load(&cfg.store.join("mix-seen"), MIX_SEEN_DAYS, MAX_MIX_SEEN, today_day()),
+        deposit_seen: seen::SeenSet::load(&cfg.store.join("deposit-seen"), DEPOSIT_SEEN_DAYS, 2 * MAX_MAILBOX_TOTAL as usize, today_day()),
         dir: Arc::default(),
         deposits: tokio::sync::broadcast::channel(1024).0,
         watching: AtomicU64::new(0),
@@ -943,6 +956,11 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             }
             let dir = shard_dir(store, shard);
             let _guard = INDEX_LOCK.lock().await;
+            // The same blob again (a sender's retry, a replay): stored once.
+            let blob_id = blake3::derive_key("sentinel/v1/deposit-seen", &blob);
+            if ctx.deposit_seen.contains(&blob_id) {
+                return Response::Pong;
+            }
             if tokio::fs::create_dir_all(&dir).await.is_err() {
                 return Response::Rejected("storage error".into());
             }
@@ -956,6 +974,7 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             if write_coarse(&dir.join(format!("{seq:016}")), &blob).await.is_err() {
                 return Response::Rejected("storage error".into());
             }
+            let _ = ctx.deposit_seen.add(blob_id, today_day());
             stats.used_bytes.fetch_add(blob.len() as u64, Ordering::Relaxed);
             stats.mail_bytes.fetch_add(blob.len() as u64, Ordering::Relaxed);
             ctx.mail_count.fetch_add(1, Ordering::Relaxed);
@@ -973,15 +992,8 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
                 return Response::Rejected("invalid".into());
             }
             let id = blake3::derive_key("sentinel/v0/mix-seen", &packet);
-            {
-                let mut seen = ctx.mix_seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if seen.contains(&id) {
-                    return Response::Pong; // a replay: already handled
-                }
-                seen.push_back(id);
-                if seen.len() > 50_000 {
-                    seen.pop_front();
-                }
+            if ctx.mix_seen.contains(&id) {
+                return Response::Pong; // a replay: already handled
             }
             let Some((step, delay)) = mix::unwrap(&ctx.mix, &packet) else {
                 return Response::Rejected("invalid".into());
@@ -995,6 +1007,11 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             let ctx2 = mix_ctx(ctx);
             if ctx2.waiting.load(Ordering::Relaxed) >= MAX_MIX_WAITING {
                 return Response::Rejected("busy".into());
+            }
+            match ctx.mix_seen.add(id, today_day()) {
+                seen::Seen::New => {}
+                seen::Seen::Again => return Response::Pong,
+                seen::Seen::Full => return Response::Rejected("busy".into()),
             }
             ctx2.waiting.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
