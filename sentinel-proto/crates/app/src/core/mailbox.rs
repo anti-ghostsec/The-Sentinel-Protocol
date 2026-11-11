@@ -97,8 +97,8 @@ impl Core {
         let (mut dms, mut rooms) = (0, 0);
         for (pillar, list) in ids {
             let bits = self.depth(&pillar);
-            // Always fetch a multiple of 4 prefixes (extra ones, the same
-            // all day), so the Pillar can't count my inboxes and rooms.
+            // Padding prefixes too (the same all day, a secret number of
+            // them), so the Pillar can't count my inboxes and rooms.
             let prefixes = Core::prefixes(&key, &pillar, bits, &list);
             let many = prefixes.len() > 1;
             let mut seen_here = 0usize;

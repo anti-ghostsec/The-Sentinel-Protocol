@@ -135,41 +135,44 @@ pub fn prefix_matches(shard: u16, bits: u8, prefix: u16) -> bool {
 /// Pillar's mailboxes, whatever a Pillar does.
 pub const MAX_READ_DEPTH: u8 = 4;
 
-/// The prefixes a reader fetches: its real ones plus padding up to a
-/// multiple of 4, so the Pillar can't count its inboxes and rooms. The
-/// padding comes from `pad_secret` (a key only this reader has), the
-/// Pillar, the day and the depth: the same all day, so it can't be told
-/// apart from the real prefixes (which recur) by looking at which change
-/// between polls. A real prefix added during the day keeps the rest.
-pub fn padded_prefixes(pad_secret: &[u8; 32], pillar: &str, day: u64, bits: u8, real: &std::collections::BTreeSet<u16>) -> std::collections::BTreeSet<u16> {
-    let mut set = real.clone();
+/// Padding prefixes a reader adds per Pillar and day: between these two.
+const PAD_MIN: usize = 4;
+const PAD_MAX: usize = 8;
+
+/// The day's padding prefixes for one Pillar and depth: chosen from
+/// `pad_secret` (a key only this reader has), the Pillar, the day and the
+/// depth, and nothing else. How many (4 to 8) is secret too.
+pub fn padding_prefixes(pad_secret: &[u8; 32], pillar: &str, day: u64, bits: u8) -> std::collections::BTreeSet<u16> {
+    let mut pad = std::collections::BTreeSet::new();
     if bits == 0 {
-        return set;
+        return pad;
     }
     let space = 1usize << bits.min(16);
-    let target = (set.len().div_ceil(4) * 4).min(space);
     let mut seed = blake3::Hasher::new_keyed(pad_secret);
-    seed.update(b"sentinel/v1/mailbox-padding");
+    seed.update(b"sentinel/v2/mailbox-padding");
     seed.update(&day.to_le_bytes());
     seed.update(&[bits]);
     seed.update(pillar.as_bytes());
     let mut stream = seed.finalize_xof();
-    let mut tries = 0;
-    while set.len() < target {
-        let mut b = [0u8; 2];
+    let mut b = [0u8; 2];
+    stream.fill(&mut b);
+    let count = (PAD_MIN + u16::from_le_bytes(b) as usize % (PAD_MAX - PAD_MIN + 1)).min(space);
+    while pad.len() < count {
         stream.fill(&mut b);
-        set.insert((u16::from_le_bytes(b) as usize % space) as u16);
-        tries += 1;
-        if tries > 100_000 {
-            // Can't happen in practice; fill in order rather than loop on.
-            for p in 0..space as u16 {
-                if set.len() >= target {
-                    break;
-                }
-                set.insert(p);
-            }
-        }
+        pad.insert((u16::from_le_bytes(b) as usize % space) as u16);
     }
+    pad
+}
+
+/// The prefixes a reader fetches: the day's padding (see
+/// [`padding_prefixes`]) with its real ones added on top. The padding
+/// doesn't depend on the real prefixes, so all day the same set is asked
+/// for: a real prefix added during the day shows as one more entry and
+/// changes nothing else, and as the amount of padding is secret, the size
+/// of the set doesn't tell how many are real.
+pub fn padded_prefixes(pad_secret: &[u8; 32], pillar: &str, day: u64, bits: u8, real: &std::collections::BTreeSet<u16>) -> std::collections::BTreeSet<u16> {
+    let mut set = padding_prefixes(pad_secret, pillar, day, bits);
+    set.extend(real.iter().copied());
     set
 }
 
@@ -639,28 +642,34 @@ mod tests {
     fn mailbox_padding_is_stable_for_the_day_and_hides_the_count() {
         use std::collections::BTreeSet;
         let secret = [9u8; 32];
+        let pad = padding_prefixes(&secret, "p.onion", 100, 4);
+        assert!((PAD_MIN..=PAD_MAX).contains(&pad.len()));
+        // Two polls on the same day, before and after a real prefix is
+        // added: the second is the first plus that one entry, nothing else.
         let real: BTreeSet<u16> = [3u16, 7].into_iter().collect();
-        let a = padded_prefixes(&secret, "p.onion", 100, 4, &real);
-        assert_eq!(a.len(), 4);
-        assert!(real.is_subset(&a));
-        // Every poll of the day asks for the same prefixes.
-        assert_eq!(padded_prefixes(&secret, "p.onion", 100, 4, &real), a);
-        // Another day, Pillar or reader: other padding (not always, at 16
-        // prefixes, but over a few tries).
-        let differs = |f: &dyn Fn(u64) -> BTreeSet<u16>| (0..8).any(|i| f(i) != a);
-        assert!(differs(&|i| padded_prefixes(&secret, "p.onion", 101 + i, 4, &real)));
-        assert!(differs(&|i| padded_prefixes(&[i as u8; 32], "p.onion", 100, 4, &real)));
-        // One more real prefix: still a multiple of 4.
+        let before = padded_prefixes(&secret, "p.onion", 100, 4, &real);
+        let new = (0..16u16).find(|p| !before.contains(p)).unwrap();
         let mut more = real.clone();
-        more.insert(11);
-        let b = padded_prefixes(&secret, "p.onion", 100, 4, &more);
-        assert_eq!(b.len(), 4);
-        assert!(more.is_subset(&b));
-        // Depth 0 is everything; a small space is filled completely.
+        more.insert(new);
+        let after = padded_prefixes(&secret, "p.onion", 100, 4, &more);
+        let mut want = before.clone();
+        want.insert(new);
+        assert_eq!(after, want);
+        // The padding is the same whatever the real prefixes are.
+        assert!(pad.is_subset(&before) && pad.is_subset(&after));
+        assert_eq!(padded_prefixes(&secret, "p.onion", 100, 4, &BTreeSet::new()), pad);
+        // How much padding varies (it's secret), so the count of a set
+        // doesn't give away the number of real prefixes.
+        let counts: BTreeSet<usize> = (0..40).map(|d| padding_prefixes(&secret, "p.onion", d, 4).len()).collect();
+        assert!(counts.len() > 2, "{counts:?}");
+        // Another day, Pillar or reader: other padding.
+        assert!((101..110).any(|d| padding_prefixes(&secret, "p.onion", d, 4) != pad));
+        assert!((0..8u8).any(|i| padding_prefixes(&[i; 32], "p.onion", 100, 4) != pad));
+        assert!(padding_prefixes(&secret, "q.onion", 100, 4) != pad || padding_prefixes(&secret, "r.onion", 100, 4) != pad);
+        // Depth 0 is everything; a small space is simply all of it.
+        assert!(padding_prefixes(&secret, "p.onion", 100, 0).is_empty());
+        assert_eq!(padding_prefixes(&secret, "p.onion", 100, 1).len(), 2);
         assert_eq!(padded_prefixes(&secret, "p.onion", 100, 0, &[0].into_iter().collect()).len(), 1);
-        let all: BTreeSet<u16> = [0, 1].into_iter().collect();
-        assert_eq!(padded_prefixes(&secret, "p.onion", 100, 1, &all), all);
-        assert_eq!(padded_prefixes(&secret, "p.onion", 100, 2, &[1].into_iter().collect()).len(), 4);
     }
 
     #[test]
