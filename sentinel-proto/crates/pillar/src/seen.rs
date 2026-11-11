@@ -48,8 +48,8 @@ impl SeenSet {
                 }
                 let b = std::fs::read(e.path()).unwrap_or_default();
                 let set = inner.days.entry(day).or_default();
-                for id in b.chunks_exact(32) {
-                    if set.insert(id.try_into().expect("32 bytes")) {
+                for id in b.as_chunks::<32>().0 {
+                    if set.insert(*id) {
                         inner.total += 1;
                     }
                 }

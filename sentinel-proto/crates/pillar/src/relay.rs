@@ -70,7 +70,10 @@ pub(crate) async fn keep(store: &Path, step: &Step, max_bytes: u64) -> bool {
 
 fn forget(store: &Path, len: u64) {
     let q = queued(store);
-    let _ = q.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(len)));
+    let mut cur = q.load(Ordering::Relaxed);
+    while let Err(v) = q.compare_exchange_weak(cur, cur.saturating_sub(len), Ordering::Relaxed, Ordering::Relaxed) {
+        cur = v;
+    }
 }
 
 fn age_days(m: &std::fs::Metadata) -> u64 {
