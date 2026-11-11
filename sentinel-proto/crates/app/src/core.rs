@@ -882,6 +882,22 @@ async fn request(stream: &mut Box<dyn Io>, req: &Request) -> Result<Response> {
     request_timeout(stream, req, REQUEST_TIMEOUT).await
 }
 
+/// A stamped put for `bytes` (the proof of work is made once and serves
+/// every Pillar the object goes to).
+pub(crate) async fn stamp_put(bytes: Vec<u8>) -> Result<Arc<Request>> {
+    Ok(Arc::new(tokio::task::spawn_blocking(move || wire::put_stamped(bytes)).await?))
+}
+
+/// Store an object with a stamped put; an older Pillar that doesn't know
+/// stamped puts gets the plain one.
+pub(crate) async fn put_request(stream: &mut Box<dyn Io>, stamped: &Request) -> Result<Response> {
+    let r = request(stream, stamped).await?;
+    if let (true, Request::PutStamped { object, .. }) = (wire::is_unknown_request(&r), stamped) {
+        return request(stream, &Request::Put(object.clone())).await;
+    }
+    Ok(r)
+}
+
 /// `request` with a custom timeout (for requests the node must forward,
 /// e.g. pin payments it redeems at the mint).
 async fn request_timeout(stream: &mut Box<dyn Io>, req: &Request, t: Duration) -> Result<Response> {
@@ -1825,20 +1841,21 @@ impl Core {
 
     async fn put(&self, bytes: Vec<u8>) -> Result<()> {
         let pool = self.with(|i| i.pool.clone()).context("no Pillar configured")?;
+        let stamped = stamp_put(bytes).await?;
         // Copy to backup Pillars too (best effort, each on its own circuit),
         // so a post survives if the primary disappears.
         if let (Ok((_, store)), Some(net)) = (self.unlocked(), self.with(|i| i.net.clone())) {
             for replica in store.replicas {
-                let (net, bytes) = (net.clone(), bytes.clone());
+                let (net, stamped) = (net.clone(), Arc::clone(&stamped));
                 tokio::spawn(async move {
                     if let Ok(mut s) = net.connect_hedged(&replica).await {
-                        let _ = request(&mut s, &Request::Put(bytes)).await;
+                        let _ = put_request(&mut s, &stamped).await;
                     }
                 });
             }
         }
         let mut s = pool.take().await?;
-        match request(&mut s, &Request::Put(bytes)).await? {
+        match put_request(&mut s, &stamped).await? {
             Response::Stored(_) => Ok(()),
             Response::Rejected(r) => bail!("Pillar rejected: {r}"),
             other => bail!("unexpected response: {other:?}"),

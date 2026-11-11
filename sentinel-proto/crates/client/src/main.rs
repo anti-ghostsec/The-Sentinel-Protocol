@@ -493,6 +493,17 @@ async fn request(stream: &mut Box<dyn Io>, req: &Request) -> Result<Response> {
     wire::decode(&bytes).context("malformed response")
 }
 
+/// Store an object with proof of work (plain `Put` for an older Pillar).
+async fn put(stream: &mut Box<dyn Io>, bytes: Vec<u8>) -> Result<Response> {
+    let b = bytes.clone();
+    let stamped = tokio::task::spawn_blocking(move || wire::put_stamped(b)).await?;
+    let r = request(stream, &stamped).await?;
+    if wire::is_unknown_request(&r) {
+        return request(stream, &Request::Put(bytes)).await;
+    }
+    Ok(r)
+}
+
 async fn post(pillar: &str, text: String) -> Result<()> {
     let settings = Settings::load()?;
     check_onion(pillar)?;
@@ -504,7 +515,7 @@ async fn post(pillar: &str, text: String) -> Result<()> {
     eprintln!("read key (share only with readers): {}", data_encoding::BASE32_NOPAD.encode(&read_key).to_lowercase());
     let net = start_net(&settings).await?;
     let mut s = net.connect_hedged(pillar).await?;
-    match request(&mut s, &Request::Put(bytes)).await? {
+    match put(&mut s, bytes).await? {
         Response::Stored(a) => println!("{}", a.to_text()),
         Response::Rejected(r) => bail!("rejected: {r}"),
         other => bail!("unexpected response: {other:?}"),
@@ -600,7 +611,8 @@ async fn bench(pillar: &str, rounds: usize, fresh: usize) -> Result<()> {
 
     let throwaway = identity::generate();
     let env = Envelope::sign(&throwaway, "post", vec![b'x'; 2000]);
-    let (addr, put) = match timed_request(&mut s, &Request::Put(env.encode()?)).await? {
+    let stamped = wire::put_stamped(env.encode()?);
+    let (addr, put) = match timed_request(&mut s, &stamped).await? {
         (Response::Stored(a), d) => (a, d),
         (other, _) => bail!("unexpected: {other:?}"),
     };

@@ -710,7 +710,7 @@ async fn tend_pillar(ctx: &Ctx, m: &MintState, onion: &str) {
         }
         if st.wants_probe(today) {
             let item = probe_item().context("probe")?;
-            match exchange(&mut s, &Request::Put(item)).await? {
+            match crate::put_to(&mut s, item).await? {
                 Response::Stored(a) => st.add_probe(a.0, today, u64::from_le_bytes(sentinel_core::random_bytes::<8>())),
                 _ => ok = false,
             }

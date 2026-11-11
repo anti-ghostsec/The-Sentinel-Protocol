@@ -95,10 +95,11 @@ impl Core {
                 targets.push(s);
             }
         }
+        let stamped = super::stamp_put(bytes.to_vec()).await?;
         let mut stored = 0;
         for t in targets {
             if let Ok(mut s) = net.connect_hedged(&t).await {
-                if let Ok(Response::Stored(_)) = request(&mut s, &Request::Put(bytes.to_vec())).await {
+                if let Ok(Response::Stored(_)) = super::put_request(&mut s, &stamped).await {
                     stored += 1;
                 }
             }

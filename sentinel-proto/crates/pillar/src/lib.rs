@@ -60,6 +60,9 @@ const MAX_STREAMS_PER_CIRCUIT: u32 = 8;
 /// data is kept under half the 2 MiB message limit: a bigger reply can't be
 /// sent at all, and the reader would get nothing, ever, from that bucket.
 const FETCH_REPLY_BYTES: usize = 900 * 1024;
+/// Share of the quota kept for mailboxes: objects (posts, profiles) can
+/// never use it, so filling a Pillar with posts can't stop messages.
+const MAIL_RESERVE_DIVISOR: u64 = 4;
 /// Directory size bound.
 const MAX_KNOWN_PILLARS: usize = 500;
 /// How many Pillars to return per directory request.
@@ -101,7 +104,10 @@ pub struct Stats {
     pub stored: AtomicU64,
     pub served: AtomicU64,
     pub rejected: AtomicU64,
+    /// Everything stored (objects, indexes and mailboxes).
     pub used_bytes: AtomicU64,
+    /// The mailbox part of `used_bytes`.
+    pub mail_bytes: AtomicU64,
     pub chunk_bytes: AtomicU64,
 }
 
@@ -199,8 +205,9 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
     let onion = service.onion_address().context("onion service has no address")?.display_unredacted().to_string();
 
     let stats = Arc::new(Stats::default());
-    let (objects, chunks) = usage(&cfg.store);
-    stats.used_bytes.store(objects, Ordering::Relaxed);
+    let (objects, mail, chunks) = usage(&cfg.store);
+    stats.used_bytes.store(objects + mail, Ordering::Relaxed);
+    stats.mail_bytes.store(mail, Ordering::Relaxed);
     stats.chunk_bytes.store(chunks, Ordering::Relaxed);
     let archive_gb = if cfg.archive { (cfg.chunk_quota_bytes / 1_000_000_000).min(u32::MAX as u64) as u32 } else { 0 };
     let ctx = Arc::new(Ctx {
@@ -265,8 +272,9 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
             loop {
                 let s2 = store.clone();
                 let _ = tokio::task::spawn_blocking(move || prune(&s2, max_age, chunk_age)).await;
-                let (objects, chunks) = usage(&store);
-                stats.used_bytes.store(objects, Ordering::Relaxed);
+                let (objects, mail, chunks) = usage(&store);
+                stats.used_bytes.store(objects + mail, Ordering::Relaxed);
+                stats.mail_bytes.store(mail, Ordering::Relaxed);
                 stats.chunk_bytes.store(chunks, Ordering::Relaxed);
                 prune_ctx.mail_count.store(mailbox_scan(&store).1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_secs(86_400)).await;
@@ -360,6 +368,18 @@ async fn exchange<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(s: &m
     })
     .await
     .context("timed out")?
+}
+
+/// Store an object on another Pillar: with proof of work, or plain for an
+/// older Pillar that doesn't know stamped puts.
+pub(crate) async fn put_to<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(s: &mut S, object: Vec<u8>) -> Result<Response> {
+    let o = object.clone();
+    let req = tokio::task::spawn_blocking(move || wire::put_stamped(o)).await?;
+    let r = exchange(s, &req).await?;
+    if wire::is_unknown_request(&r) {
+        return exchange(s, &Request::Put(object)).await;
+    }
+    Ok(r)
 }
 
 fn known_path(store: &Path) -> PathBuf {
@@ -512,7 +532,7 @@ async fn handle_stream(req: StreamRequest, ctx: Arc<Ctx>) -> Result<()> {
                 Some(resp) => resp,
                 None => handle_request(r, &ctx).await,
             },
-            None => Response::Rejected("malformed request".into()),
+            None => Response::Rejected(wire::UNKNOWN_REQUEST.into()),
         };
         write_message(&mut stream, &wire::encode(&resp)).await?;
     }
@@ -636,19 +656,32 @@ fn files_size(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-/// (objects + inboxes + indexes, media chunks) in bytes, counted from disk
+/// (objects + indexes, inboxes, media chunks) in bytes, counted from disk
 /// so quotas hold across restarts.
-fn usage(store: &Path) -> (u64, u64) {
+fn usage(store: &Path) -> (u64, u64, u64) {
     let mut objects = files_size(store);
-    for sub in ["authors", "shards", "followers"] {
+    for sub in ["authors", "shards", "followers", "abuckets"] {
         objects += files_size(&store.join(sub));
     }
+    let mut mail = 0;
     if let Ok(rd) = std::fs::read_dir(store.join("inboxes")) {
         for b in rd.filter_map(|e| e.ok()) {
-            objects += files_size(&b.path());
+            mail += files_size(&b.path());
         }
     }
-    (objects, files_size(&store.join("chunks")))
+    (objects, mail, files_size(&store.join("chunks")))
+}
+
+/// Whether `len` more bytes of objects fit: objects may use the quota
+/// except the mailbox reserve.
+fn object_fits(used: u64, mail: u64, len: u64, quota: u64) -> bool {
+    let objects = used.saturating_sub(mail);
+    objects + len <= quota - quota / MAIL_RESERVE_DIVISOR && used + len <= quota
+}
+
+/// Whether a deposit of `len` bytes fits (the whole quota, reserve included).
+fn deposit_fits(used: u64, len: u64, quota: u64) -> bool {
+    used + len <= quota
 }
 
 fn older_than(m: &std::fs::Metadata, max_age: Duration, now: SystemTime) -> bool {
@@ -730,8 +763,18 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
     let stats = &ctx.stats;
     match req {
         Request::Ping => Response::Pong,
-        Request::Put(bytes) => {
-            if stats.used_bytes.load(Ordering::Relaxed) + bytes.len() as u64 > ctx.quota_bytes {
+        // Objects must carry proof of work now (an older app's plain
+        // `Put` is refused with a reason it shows).
+        Request::Put(_) => {
+            stats.rejected.fetch_add(1, Ordering::Relaxed);
+            Response::Rejected("this Pillar needs proof of work for posts: update the app".into())
+        }
+        Request::PutStamped { object: bytes, nonce } => {
+            if bytes.len() > sentinel_core::object::MAX_OBJECT_LEN || !social::put_check(&bytes, nonce) {
+                stats.rejected.fetch_add(1, Ordering::Relaxed);
+                return Response::Rejected("insufficient proof of work".into());
+            }
+            if !object_fits(stats.used_bytes.load(Ordering::Relaxed), stats.mail_bytes.load(Ordering::Relaxed), bytes.len() as u64, ctx.quota_bytes) {
                 return Response::Rejected("Pillar is full".into());
             }
             let env = match Envelope::decode_verified(&bytes) {
@@ -895,7 +938,7 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
                 stats.rejected.fetch_add(1, Ordering::Relaxed);
                 return Response::Rejected("invalid deposit".into());
             }
-            if stats.used_bytes.load(Ordering::Relaxed) + blob.len() as u64 > ctx.quota_bytes {
+            if !deposit_fits(stats.used_bytes.load(Ordering::Relaxed), blob.len() as u64, ctx.quota_bytes) {
                 return Response::Rejected("Pillar is full".into());
             }
             let dir = shard_dir(store, shard);
@@ -914,6 +957,7 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
                 return Response::Rejected("storage error".into());
             }
             stats.used_bytes.fetch_add(blob.len() as u64, Ordering::Relaxed);
+            stats.mail_bytes.fetch_add(blob.len() as u64, Ordering::Relaxed);
             ctx.mail_count.fetch_add(1, Ordering::Relaxed);
             // Wake the readers watching this shard's prefixes.
             let _ = ctx.deposits.send(shard);
@@ -1411,6 +1455,22 @@ mod tests {
         }
         let encoded = wire::encode(&Response::Blobs(out));
         assert!(encoded.len() <= sentinel_core::cell::MAX_MESSAGE, "{} > {}", encoded.len(), sentinel_core::cell::MAX_MESSAGE);
+    }
+
+    #[test]
+    fn posts_can_never_take_the_mailbox_reserve() {
+        let quota = 1000;
+        // Objects stop at 750 of 1000, whatever the mailboxes hold.
+        assert!(object_fits(0, 0, 750, quota));
+        assert!(!object_fits(0, 0, 751, quota));
+        assert!(!object_fits(750, 0, 1, quota));
+        // Mailboxes still have their quarter when posts filled their share.
+        assert!(deposit_fits(750, 250, quota));
+        assert!(!deposit_fits(750, 251, quota));
+        // Mail can use free object space, and then posts wait.
+        assert!(deposit_fits(100, 800, quota));
+        assert!(!object_fits(900, 800, 101, quota));
+        assert!(object_fits(900, 800, 100, quota));
     }
 
     #[test]

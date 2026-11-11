@@ -144,6 +144,28 @@ pub enum Request {
     /// to `WATCH_HOLD_SECS`, answering with empty `Blobs`). Messages arrive
     /// as they're deposited instead of on the next fetch.
     Watch { bits: u8, prefix: u16, after: u64 },
+    /// `Put` with a proof-of-work stamp (`social::put_stamp`). Pillars that
+    /// know it no longer take a plain `Put`; older ones answer this with
+    /// "malformed request", and the sender falls back to `Put`.
+    PutStamped {
+        #[serde(with = "bytes")]
+        object: Vec<u8>,
+        nonce: u64,
+    },
+}
+
+/// What a Pillar answers to a request it doesn't know (an older version).
+pub const UNKNOWN_REQUEST: &str = "malformed request";
+
+/// Whether `r` is an older Pillar's answer to a request it doesn't know.
+pub fn is_unknown_request(r: &Response) -> bool {
+    matches!(r, Response::Rejected(e) if e == UNKNOWN_REQUEST)
+}
+
+/// A stamped `Put` for `object` (computes the proof of work: CPU-bound).
+pub fn put_stamped(object: Vec<u8>) -> Request {
+    let nonce = crate::social::put_stamp(&object);
+    Request::PutStamped { object, nonce }
 }
 
 /// Longest a Pillar holds a `Watch` before answering with nothing.

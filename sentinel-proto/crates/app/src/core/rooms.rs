@@ -1103,8 +1103,9 @@ impl Core {
         let env = social::room_listing_envelope(&SigningKey::from_bytes(&admin), &listing).map_err(|e| anyhow::anyhow!(e))?;
         let bytes = env.encode()?;
         let net = self.with(|i| i.net.clone()).context("not connected")?;
+        let stamped = super::stamp_put(bytes).await?;
         let mut s = net.connect_hedged(&r.pillar).await?;
-        match request(&mut s, &Request::Put(bytes)).await? {
+        match super::put_request(&mut s, &stamped).await? {
             Response::Stored(_) => Ok(()),
             other => bail!("listing not stored: {other:?}"),
         }

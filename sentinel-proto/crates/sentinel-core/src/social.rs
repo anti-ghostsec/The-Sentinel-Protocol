@@ -463,6 +463,40 @@ pub fn follow_pow_data(author: &[u8; 32], token: &[u8; 32], follow: bool) -> Vec
     d
 }
 
+/// Proof of work for storing an object (post, profile, listing) on a
+/// Pillar, so filling one up costs real compute. Grows with size: twice the
+/// bytes, twice the work.
+pub const PUT_POW_DOMAIN: &str = "sentinel/v1/put-pow";
+pub const PUT_POW_BITS: u32 = 18;
+
+/// Difficulty for storing an object of `len` bytes: `PUT_POW_BITS` per
+/// started 8 KiB, rounded up to a power of two.
+pub fn put_bits(len: usize) -> u32 {
+    let units = len.div_ceil(8192).max(1);
+    PUT_POW_BITS + units.next_power_of_two().trailing_zeros()
+}
+
+/// Bytes covered by an object's proof of work.
+pub fn put_pow_data(object: &[u8]) -> [u8; 32] {
+    blake3::derive_key("sentinel/v1/put-pow-data", object)
+}
+
+/// Find the proof of work for storing `object` (CPU-bound: run it off the
+/// UI thread).
+pub fn put_stamp(object: &[u8]) -> u64 {
+    let bits = put_bits(object.len());
+    let data = put_pow_data(object);
+    if bits > PUT_POW_BITS + 1 {
+        crate::pow::stamp_parallel(PUT_POW_DOMAIN, &data, bits)
+    } else {
+        crate::pow::stamp(PUT_POW_DOMAIN, &data, bits)
+    }
+}
+
+pub fn put_check(object: &[u8], nonce: u64) -> bool {
+    crate::pow::check(PUT_POW_DOMAIN, &put_pow_data(object), nonce, put_bits(object.len()))
+}
+
 /// Domain and difficulty for Pillar announcement proof-of-work.
 pub const ANNOUNCE_POW_DOMAIN: &str = "sentinel/v0/pillar-announce-pow";
 pub const ANNOUNCE_POW_BITS: u32 = 20;
@@ -492,6 +526,22 @@ pub fn report_token(reporter: &SigningKey, address: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storing_an_object_costs_work_that_grows_with_its_size() {
+        assert_eq!(put_bits(100), PUT_POW_BITS);
+        assert_eq!(put_bits(8192), PUT_POW_BITS);
+        assert_eq!(put_bits(8193), PUT_POW_BITS + 1);
+        assert_eq!(put_bits(3 * 8192), PUT_POW_BITS + 2); // rounded up, never down
+        assert_eq!(put_bits(crate::object::MAX_OBJECT_LEN), PUT_POW_BITS + 5);
+        let obj = vec![7u8; 500];
+        let n = put_stamp(&obj);
+        assert!(put_check(&obj, n));
+        let mut other = obj.clone();
+        other[0] ^= 1;
+        // A stamp is for one object only (a chance match is 1 in 2^18).
+        assert!(!put_check(&other, n));
+    }
 
     #[test]
     fn room_listings_open_with_topic_keys_and_need_topics() {
