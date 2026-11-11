@@ -8,3 +8,7 @@
 /vendor/ffmpeg/win64/*.dll
 /vendor/ffmpeg/win64/*.exe
 /apps/*/target
+# Output of local Pillar and test runs.
+/seed.err
+/seed.out
+/*-pass.json
