@@ -650,7 +650,7 @@ fn page(all: Vec<Address>, after: u64) -> Vec<(u64, Address)> {
 }
 
 /// Bytes in files directly inside `dir`.
-fn files_size(dir: &Path) -> u64 {
+pub(crate) fn files_size(dir: &Path) -> u64 {
     std::fs::read_dir(dir)
         .map(|rd| rd.filter_map(|e| e.ok()).filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).map(|m| m.len()).sum())
         .unwrap_or(0)
@@ -986,6 +986,12 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             let Some((step, delay)) = mix::unwrap(&ctx.mix, &packet) else {
                 return Response::Rejected("invalid".into());
             };
+            // Only ever passed on to onion services (never a host on the
+            // open internet through a Tor exit).
+            if !step_target_ok(&step) {
+                stats.rejected.fetch_add(1, Ordering::Relaxed);
+                return Response::Rejected("invalid".into());
+            }
             let ctx2 = mix_ctx(ctx);
             if ctx2.waiting.load(Ordering::Relaxed) >= MAX_MIX_WAITING {
                 return Response::Rejected("busy".into());
@@ -998,7 +1004,7 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
                 // already be offline and can't be told.
                 let done = matches!(tokio::time::timeout(Duration::from_secs(120), mix_step(&ctx2, &step)).await, Ok(Ok(())));
                 if !done {
-                    relay::keep(&ctx2.store, &step).await;
+                    relay::keep(&ctx2.store, &step, ctx2.relay_max).await;
                 }
                 ctx2.waiting.fetch_sub(1, Ordering::Relaxed);
             });
@@ -1384,6 +1390,8 @@ struct MixCtx {
     store: PathBuf,
     self_onion: String,
     waiting: Arc<AtomicU64>,
+    /// Bytes the retry queue may hold.
+    relay_max: u64,
     deliver_local: tokio::sync::mpsc::UnboundedSender<(u16, Vec<u8>, u64)>,
 }
 
@@ -1396,13 +1404,27 @@ fn mix_ctx(ctx: &Ctx) -> MixCtx {
         store: ctx.store.clone(),
         self_onion: ctx.self_onion.clone(),
         waiting: MIX_WAITING.get_or_init(|| Arc::new(AtomicU64::new(0))).clone(),
+        relay_max: relay::MAX_QUEUE_BYTES.min(ctx.quota_bytes / 8),
         deliver_local: MIX_LOCAL.get().cloned().expect("mix delivery started"),
     }
+}
+
+/// Whether a mix step's next Pillar is a v3 onion address (in the
+/// normal lower-case form). Anything else would have this Pillar open a
+/// connection to a host of the sender's choosing.
+fn step_target_ok(step: &sentinel_core::mix::Step) -> bool {
+    use sentinel_core::mix::Step;
+    let target = match step {
+        Step::Forward { to, .. } => to,
+        Step::Deliver { pillar, .. } => pillar,
+    };
+    social::valid_onion(target).is_some_and(|t| t == *target)
 }
 
 /// Carry out one mix step: pass the packet on, or deposit it.
 async fn mix_step(ctx: &MixCtx, step: &sentinel_core::mix::Step) -> Result<()> {
     use sentinel_core::mix::{self, Step};
+    anyhow::ensure!(step_target_ok(step), "not an onion address");
     match step {
         Step::Forward { to, packet } => {
             let p = packet.clone();
@@ -1455,6 +1477,19 @@ mod tests {
         }
         let encoded = wire::encode(&Response::Blobs(out));
         assert!(encoded.len() <= sentinel_core::cell::MAX_MESSAGE, "{} > {}", encoded.len(), sentinel_core::cell::MAX_MESSAGE);
+    }
+
+    #[test]
+    fn mix_steps_go_only_to_onion_services() {
+        use sentinel_core::mix::Step;
+        let onion = "a".repeat(56) + ".onion";
+        let fwd = |to: &str| Step::Forward { to: to.into(), packet: vec![1] };
+        let dep = |p: &str| Step::Deliver { pillar: p.into(), shard: 1, blob: vec![1], nonce: 0 };
+        assert!(step_target_ok(&fwd(&onion)) && step_target_ok(&dep(&onion)));
+        for bad in ["example.com", "93.184.216.34", "localhost", "a.onion", "", &onion.to_uppercase(), &format!("{onion}:80"), &format!(" {onion}"), &("a".repeat(16) + ".onion")] {
+            assert!(!step_target_ok(&fwd(bad)), "{bad}");
+            assert!(!step_target_ok(&dep(bad)), "{bad}");
+        }
     }
 
     #[test]
