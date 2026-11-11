@@ -704,8 +704,8 @@ struct Inner {
     /// A key file chosen on the unlock or new-account screen (fingerprint
     /// and file name), used by the next unlock or account creation.
     chosen_keyfile: Option<(zeroize::Zeroizing<[u8; 32]>, String)>,
-    /// Mix keys of Pillars fetched this session.
-    mix_keys: std::collections::HashMap<String, sentinel_core::mix::MixKey>,
+    /// Mix keys of Pillars fetched this session, and when.
+    mix_keys: std::collections::HashMap<String, (sentinel_core::mix::MixKey, std::time::Instant)>,
     /// Update checks and downloads.
     update: updates::UpdateView,
     updater: Option<tauri::async_runtime::JoinHandle<()>>,
@@ -881,6 +881,9 @@ fn handle_of(author: &str) -> String {
 async fn request(stream: &mut Box<dyn Io>, req: &Request) -> Result<Response> {
     request_timeout(stream, req, REQUEST_TIMEOUT).await
 }
+
+/// How long a fetched mix key is used before it's fetched again.
+const MIX_KEY_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
 
 /// A stamped put for `bytes` (the proof of work is made once and serves
 /// every Pillar the object goes to).
@@ -1305,7 +1308,11 @@ impl Core {
                     };
                     return match request(&mut s, &Request::Mix { packet, nonce: pn }).await? {
                         Response::Pong => Ok(false),
-                        other => bail!("not taken: {other:?}"),
+                        other => {
+                            // A key may have been changed: fetch the route's keys again.
+                            self.forget_mix_keys(route.iter().map(|(p, _)| p.as_str()));
+                            bail!("not taken: {other:?}")
+                        }
                     };
                 }
                 // Not enough mixing Pillars known yet: wait rather than send unmixed.
@@ -1338,8 +1345,19 @@ impl Core {
                 sentinel_net::note(format!("Sentinel: Pillar {}… didn't answer; handed the message to Pillar {}… to deliver", &pillar[..6.min(pillar.len())], &onion[..6.min(onion.len())]));
                 Ok(false)
             }
-            other => bail!("not taken: {other:?}"),
+            other => {
+                self.forget_mix_keys([onion.as_str()]);
+                bail!("not taken: {other:?}")
+            }
         }
+    }
+
+    fn forget_mix_keys<'a>(&self, pillars: impl IntoIterator<Item = &'a str>) {
+        self.with(|i| {
+            for p in pillars {
+                i.mix_keys.remove(p);
+            }
+        });
     }
 
     /// Two Pillars (other than the destination) and their mix keys, picked
@@ -1357,7 +1375,9 @@ impl Core {
             if route.len() == 2 {
                 break;
             }
-            if let Some(k) = self.with(|i| i.mix_keys.get(p).cloned()) {
+            // Pillars change their mix keys (every two weeks, or sooner
+            // under a flood); a key older than a few hours is fetched again.
+            if let Some(k) = self.with(|i| i.mix_keys.get(p).filter(|(_, t)| t.elapsed() < MIX_KEY_MAX_AGE).map(|(k, _)| k.clone())) {
                 route.push((p.clone(), k));
             }
         }
@@ -1381,7 +1401,7 @@ impl Core {
             for (p, k) in futures::future::join_all(probes).await {
                 outcomes.push((p.clone(), k.is_some()));
                 if let Some(k) = k {
-                    self.with(|i| i.mix_keys.insert(p.clone(), k.clone()));
+                    self.with(|i| i.mix_keys.insert(p.clone(), (k.clone(), std::time::Instant::now())));
                     if route.len() < 2 {
                         route.push((p, k));
                     }

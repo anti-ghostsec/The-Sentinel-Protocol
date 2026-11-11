@@ -4834,6 +4834,7 @@ dependencies = [
  "tor-hsservice",
  "tor-proto",
  "tor-rtcompat",
+ "zeroize",
 ]
 
 [[package]]

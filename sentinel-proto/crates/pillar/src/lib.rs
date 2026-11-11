@@ -19,6 +19,7 @@
 
 mod directory;
 mod economy;
+mod mixkeys;
 mod relay;
 mod seen;
 mod reports;
@@ -131,10 +132,8 @@ struct Ctx {
     econ: economy::Econ,
     mint_interval: u64,
     updates: Option<PathBuf>,
-    /// Mix key (secret kept in the data folder).
-    mix: sentinel_core::mix::MixSecret,
-    /// Mixed packets seen (replays are dropped), kept across restarts.
-    mix_seen: seen::SeenSet,
+    /// Mix keys (rotating) and their replay lists.
+    mix: mixkeys::MixKeys,
     /// Deposits stored lately (the same blob twice is stored once).
     deposit_seen: seen::SeenSet,
     /// Which listed Pillars answered lately (memory only; see `directory`).
@@ -147,29 +146,11 @@ struct Ctx {
 
 /// Most mixed packets held at once.
 const MAX_MIX_WAITING: u64 = 20_000;
-/// Days a mixed packet is remembered (replays within them are dropped).
-/// The mix key doesn't change, so this is the replay window: a longer
-/// one costs disk (32 bytes per packet) and memory.
-const MIX_SEEN_DAYS: u64 = 30;
-/// Most mixed packets remembered; when full, new packets are refused
-/// (never forgotten early, which would let replays through).
+/// Most mixed packets remembered per mix-key generation; a full list
+/// starts a new generation (see `mixkeys`).
 const MAX_MIX_SEEN: usize = 500_000;
 /// Deposits live 7 days; their ids are kept a day longer.
 const DEPOSIT_SEEN_DAYS: u64 = 8;
-
-/// The mix secret, made once and kept beside the Pillar's data.
-fn load_mix_secret(store: &Path) -> sentinel_core::mix::MixSecret {
-    let path = store.join("mix.key");
-    if let Ok(b) = std::fs::read(&path) {
-        if let Ok(a) = <[u8; 32]>::try_from(b.as_slice()) {
-            return sentinel_core::mix::MixSecret::from_bytes(a);
-        }
-    }
-    let s = sentinel_core::mix::MixSecret::generate();
-    let _ = std::fs::create_dir_all(store);
-    let _ = std::fs::write(&path, s.bytes());
-    s
-}
 
 /// A running Pillar. Dropping it stops the service and its tasks.
 pub struct RunningPillar {
@@ -237,8 +218,7 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         econ: economy::Econ::load(&cfg.store, &onion, cfg.mints.clone())?,
         mint_interval: cfg.mint_interval,
         updates: cfg.updates.clone(),
-        mix: load_mix_secret(&cfg.store),
-        mix_seen: seen::SeenSet::load(&cfg.store.join("mix-seen"), MIX_SEEN_DAYS, MAX_MIX_SEEN, today_day()),
+        mix: mixkeys::MixKeys::load(&cfg.store, today_day(), MAX_MIX_SEEN),
         deposit_seen: seen::SeenSet::load(&cfg.store.join("deposit-seen"), DEPOSIT_SEEN_DAYS, 2 * MAX_MAILBOX_TOTAL as usize, today_day()),
         dir: Arc::default(),
         deposits: tokio::sync::broadcast::channel(1024).0,
@@ -984,19 +964,20 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             Response::Pong
         }
         Request::UpdateInfo { product } => update_info(ctx, &product).await.unwrap_or(Response::NotFound),
-        Request::MixKey => Response::Object(ctx.mix.public().encode()),
+        Request::MixKey => Response::Object(ctx.mix.public(today_day()).encode()),
         Request::Mix { packet, nonce } => {
             use sentinel_core::mix;
             if packet.len() > mix::MAX_PACKET || !pow::check(mix::MIX_POW_DOMAIN, &mix::pow_data(&packet), nonce, mix::MIX_POW_BITS) {
                 stats.rejected.fetch_add(1, Ordering::Relaxed);
                 return Response::Rejected("invalid".into());
             }
-            let id = blake3::derive_key("sentinel/v0/mix-seen", &packet);
-            if ctx.mix_seen.contains(&id) {
-                return Response::Pong; // a replay: already handled
-            }
-            let Some((step, delay)) = mix::unwrap(&ctx.mix, &packet) else {
-                return Response::Rejected("invalid".into());
+            let today = today_day();
+            let (step, delay, gen, packet_id) = match ctx.mix.open(&packet, today) {
+                mixkeys::Opened::Step { step, delay, gen, packet_id } => (step, delay, gen, packet_id),
+                mixkeys::Opened::Replay => return Response::Pong, // already handled
+                // Garbage, or sealed to a key that was retired: the app
+                // fetches the current key and tries again.
+                mixkeys::Opened::Invalid => return Response::Rejected(mix::UNKNOWN_KEY.into()),
             };
             // Only ever passed on to onion services (never a host on the
             // open internet through a Tor exit).
@@ -1008,10 +989,10 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             if ctx2.waiting.load(Ordering::Relaxed) >= MAX_MIX_WAITING {
                 return Response::Rejected("busy".into());
             }
-            match ctx.mix_seen.add(id, today_day()) {
-                seen::Seen::New => {}
-                seen::Seen::Again => return Response::Pong,
-                seen::Seen::Full => return Response::Rejected("busy".into()),
+            match ctx.mix.record(gen, &packet_id, today) {
+                mixkeys::Recorded::New => {}
+                mixkeys::Recorded::Again => return Response::Pong,
+                mixkeys::Recorded::Stale => return Response::Rejected(mix::UNKNOWN_KEY.into()),
             }
             ctx2.waiting.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
@@ -1451,6 +1432,9 @@ async fn mix_step(ctx: &MixCtx, step: &sentinel_core::mix::Step) -> Result<()> {
             let mut s = iso.connect((to.as_str(), SENTINEL_PORT)).await?;
             match exchange(&mut s, &Request::Mix { packet: p, nonce }).await? {
                 Response::Pong => Ok(()),
+                // Sealed to a key the next Pillar has retired: it can never
+                // be opened, so it isn't kept for retrying.
+                Response::Rejected(e) if e == mix::UNKNOWN_KEY => Ok(()),
                 other => anyhow::bail!("not taken: {other:?}"),
             }
         }

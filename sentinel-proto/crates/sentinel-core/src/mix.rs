@@ -26,7 +26,13 @@ const PAD: usize = 8 * 1024;
 /// Largest packet a Pillar accepts.
 pub const MAX_PACKET: usize = 96 * 1024;
 pub const MIX_POW_DOMAIN: &str = "sentinel/v0/mix-pow";
-pub const MIX_POW_BITS: u32 = 12;
+/// Proof of work per packet: every packet takes a place in the Pillar's
+/// replay list, so filling one (which makes the Pillar change its key)
+/// must cost real compute.
+pub const MIX_POW_BITS: u32 = 16;
+/// A Pillar's answer to a packet no live key of its opens (garbage, or a
+/// key it has retired): the sender should fetch its current key.
+pub const UNKNOWN_KEY: &str = "unknown mix key";
 
 /// A Pillar's public mix key.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
