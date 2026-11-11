@@ -129,20 +129,31 @@ pub fn release_keys() -> Vec<HybridPublic> {
     parse_keys(RELEASE_KEYS)
 }
 
-fn parse_keys(text: &str) -> Vec<HybridPublic> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| {
-            let (ed, dsa) = l.split_once(' ')?;
-            let ed: [u8; 32] = data_encoding::HEXLOWER.decode(ed.as_bytes()).ok()?.try_into().ok()?;
-            let dsa = data_encoding::HEXLOWER.decode(dsa.trim().as_bytes()).ok()?;
-            (dsa.len() == crate::pq::DSA_PUBLIC).then_some(HybridPublic { ed, dsa })
-        })
-        .collect()
+fn key_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
 }
 
-/// Signatures needed: a majority of the listed keys.
+fn parse_key(l: &str) -> Option<HybridPublic> {
+    let (ed, dsa) = l.split_once(' ')?;
+    let ed: [u8; 32] = data_encoding::HEXLOWER.decode(ed.as_bytes()).ok()?.try_into().ok()?;
+    let dsa = data_encoding::HEXLOWER.decode(dsa.trim().as_bytes()).ok()?;
+    (dsa.len() == crate::pq::DSA_PUBLIC).then_some(HybridPublic { ed, dsa })
+}
+
+/// The keys in a key list, each once (a key listed twice is one key).
+fn parse_keys(text: &str) -> Vec<HybridPublic> {
+    let mut keys: Vec<HybridPublic> = Vec::new();
+    for k in key_lines(text).filter_map(parse_key) {
+        if !keys.iter().any(|x| x.ed == k.ed) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// Signatures needed from `keys` pinned release keys: a majority. One key
+/// while only one is pinned; from three keys on, always at least two, so
+/// one stolen key can neither sign an update nor revoke one.
 pub fn threshold(keys: usize) -> usize {
     keys / 2 + 1
 }
@@ -422,6 +433,48 @@ mod tests {
         assert!(merge_revocations(&mut list, vec![one, two.clone(), two], &keys));
         assert_eq!(list.len(), 1);
         assert_eq!(decode_revocations(&encode_revocations(&list)).len(), 1);
+    }
+
+    #[test]
+    fn one_key_is_never_enough_once_three_are_pinned() {
+        assert_eq!(threshold(1), 1); // today's single key keeps working
+        assert_eq!(threshold(2), 2);
+        for n in 3..=20 {
+            assert!(threshold(n) >= 2 && threshold(n) > n / 2, "{n}");
+        }
+        assert_eq!((threshold(3), threshold(4), threshold(5)), (2, 3, 3));
+        // 2 of 3 test keys sign an update and a revocation; 1 of 3 doesn't.
+        let signers: Vec<HybridSigner> = (11..=13u8).map(|i| HybridSigner::from_secret(&[i; 32])).collect();
+        let keys: Vec<HybridPublic> = signers.iter().map(|s| s.public()).collect();
+        let m = manifest("0.3.0", &[("Sentinel.exe", b"y")]);
+        let r = Revocation { product: "app".into(), version: "0.3.0".into(), manifest: manifest_id(&m) };
+        for (n, want) in [(1usize, false), (2, true), (3, true)] {
+            let h = Header { manifest: m.clone(), sigs: signers[..n].iter().map(|s| sign(s, &m)).collect() };
+            assert_eq!(verify_header(&h, &keys, "app", "windows-x64", "0.1.0").is_ok(), want, "{n} of 3");
+            let d = RevocationDoc { revocation: r.clone(), sigs: signers[..n].iter().map(|s| sign_revocation(s, &r)).collect() };
+            assert_eq!(verify_revocation(&d, &keys), want, "{n} of 3");
+        }
+        // With a single pinned key, that key alone suffices (as today).
+        let h = Header { manifest: m.clone(), sigs: vec![sign(&signers[0], &m)] };
+        assert!(verify_header(&h, &keys[..1], "app", "windows-x64", "0.1.0").is_ok());
+    }
+
+    #[test]
+    fn a_key_listed_twice_counts_once() {
+        let k = HybridSigner::from_secret(&[21; 32]).public();
+        let line = key_line(&k);
+        assert_eq!(parse_keys(&format!("{line}\n{line}\n")).len(), 1);
+    }
+
+    #[test]
+    fn every_pinned_release_key_line_is_valid() {
+        // A typo must not quietly drop a key (and with it the threshold).
+        let lines: Vec<&str> = key_lines(RELEASE_KEYS).collect();
+        assert!(!lines.is_empty());
+        for l in &lines {
+            assert!(parse_key(l).is_some(), "bad line in release_keys.txt: {}", &l[..l.len().min(20)]);
+        }
+        assert_eq!(release_keys().len(), lines.len(), "a release key is listed twice");
     }
 
     #[test]
