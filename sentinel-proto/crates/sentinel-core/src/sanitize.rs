@@ -20,6 +20,11 @@
 //!
 //! Everything else (archives, documents, Ogg, HEIC …) is passed through
 //! unchanged as a *file* and the UI warns that it may carry metadata.
+//!
+//! MP4/MOV and WebM/Matroska files with any track other than video and
+//! audio (GPS and sensor tracks from phones and action cameras, timecode,
+//! captions) are refused: their samples sit among the media data, where
+//! in-place cleaning can't reach them. FFmpeg's remux leaves them out.
 
 use std::io::{Read, Seek, SeekFrom};
 
@@ -102,6 +107,10 @@ pub enum SanitizeError {
     Io(#[from] std::io::Error),
     #[error("the file is malformed: {0}")]
     Malformed(&'static str),
+    /// A track that isn't video or audio (GPS, sensor, timecode, captions
+    /// ...): only FFmpeg can leave it out, so without it the file is refused.
+    #[error("the file has a \"{0}\" track besides its video and audio (it may hold location or sensor data), which can only be removed with FFmpeg")]
+    ExtraTrack(String),
 }
 
 fn bad(what: &'static str) -> SanitizeError {
@@ -209,7 +218,7 @@ fn mp4<R: Read + Seek>(r: &mut R, start: u64, end: u64, _depth: u8, s: &mut Scan
             }
             let mut b = read_at(r, pos, size as usize)?;
             let orig = b.clone();
-            mp4_mem(&mut b, header as usize, size as usize, 0, &mut s.dims)?;
+            mp4_mem(&mut b, header as usize, size as usize, 0, &typ, &mut s.dims)?;
             if b != orig {
                 s.patches.push(Patch { offset: pos, data: PatchData::Bytes(b) });
             }
@@ -220,7 +229,7 @@ fn mp4<R: Read + Seek>(r: &mut R, start: u64, end: u64, _depth: u8, s: &mut Scan
 }
 
 /// Clean boxes inside an in-memory region.
-pub(crate) fn mp4_mem(b: &mut [u8], start: usize, end: usize, depth: u8, dims: &mut (u32, u32)) -> Result<(), SanitizeError> {
+pub(crate) fn mp4_mem(b: &mut [u8], start: usize, end: usize, depth: u8, parent: &[u8; 4], dims: &mut (u32, u32)) -> Result<(), SanitizeError> {
     if depth > 10 {
         return Ok(());
     }
@@ -249,7 +258,13 @@ pub(crate) fn mp4_mem(b: &mut [u8], start: usize, end: usize, depth: u8, dims: &
         } else if MP4_PADDING.contains(&&typ) {
             b[body..box_end].fill(0);
         } else if MP4_CONTAINERS.contains(&&typ) {
-            mp4_mem(b, body, box_end, depth + 1, dims)?;
+            mp4_mem(b, body, box_end, depth + 1, &typ, dims)?;
+        } else if &typ == b"hdlr" && parent == b"mdia" {
+            // A track's handler: version/flags(4), pre-defined(4), type(4).
+            let kind: [u8; 4] = b.get(body + 8..body + 12).filter(|_| body + 12 <= box_end).ok_or(bad("MP4 handler"))?.try_into().unwrap();
+            if &kind != b"vide" && &kind != b"soun" {
+                return Err(SanitizeError::ExtraTrack(String::from_utf8_lossy(&kind).into_owned()));
+            }
         } else if &typ == b"mvhd" || &typ == b"tkhd" || &typ == b"mdhd" {
             // Full box: version(1) flags(3), then creation & modification time.
             if body + 4 <= box_end {
@@ -385,6 +400,20 @@ fn ebml_zero_children<R: Read + Seek>(r: &mut R, start: u64, end: u64, depth: u8
         let elem_end = data.checked_add(size).filter(|e| *e <= end).ok_or(bad("EBML size"))?;
         if MKV_ZERO.contains(&id) {
             s.patches.push(Patch { offset: data, data: PatchData::Zeros(size) });
+        } else if id == 0x83 /* TrackType */ && depth == 1 {
+            // 1 video, 2 audio; anything else (subtitles, metadata ...) stays put.
+            if size == 0 || size > 8 {
+                return Err(bad("EBML track type"));
+            }
+            let t = read_at(r, data, size as usize)?.iter().fold(0u64, |a, x| (a << 8) | *x as u64);
+            if t != 1 && t != 2 {
+                let name = match t {
+                    0x11 => "subtitle".to_owned(),
+                    0x21 => "metadata".to_owned(),
+                    n => format!("type {n}"),
+                };
+                return Err(SanitizeError::ExtraTrack(name));
+            }
         } else if id == 0xAE /* TrackEntry */ {
             ebml_zero_children(r, data, elem_end, depth + 1, s)?;
         } else if id == 0xE0 /* Video */ {
@@ -547,6 +576,60 @@ mod tests {
             assert!(!has(&out, secret));
         }
         assert!(has(&out, b"FRAMES"));
+    }
+
+    fn mp4_with_tracks(handlers: &[&[u8; 4]]) -> Vec<u8> {
+        let traks: Vec<u8> = handlers
+            .iter()
+            .flat_map(|h| {
+                let hdlr = bx(b"hdlr", &[&[0u8; 8][..], &h[..], &[0u8; 12]].concat());
+                bx(b"trak", &bx(b"mdia", &[bx(b"mdhd", &[0u8; 24]), hdlr].concat()))
+            })
+            .collect();
+        [bx(b"ftyp", b"isom\0\0\0\0isom"), bx(b"moov", &traks), bx(b"mdat", b"SAMPLES")].concat()
+    }
+
+    #[test]
+    fn mp4_with_gps_or_other_data_tracks_is_refused() {
+        let ok = mp4_with_tracks(&[b"vide", b"soun"]);
+        assert!(scan(Format::Mp4, &mut Cursor::new(&ok), ok.len() as u64).is_ok());
+        // GoPro GPS ("meta"), Google camera motion ("camm"), Apple's location
+        // and timecode tracks ("mebx", "tmcd"), captions ("text").
+        for extra in [b"meta", b"camm", b"mebx", b"tmcd", b"text"] {
+            let f = mp4_with_tracks(&[b"vide", extra, b"soun"]);
+            match scan(Format::Mp4, &mut Cursor::new(&f), f.len() as u64) {
+                Err(SanitizeError::ExtraTrack(t)) => assert_eq!(t.as_bytes(), extra),
+                other => panic!("{other:?}"),
+            }
+            // The in-memory path (small files) refuses it too.
+            assert!(crate::media::sanitize(&f).is_err());
+        }
+        // A "meta" box's own handler (not a track's) is fine: the box is blanked.
+        let hdlr = bx(b"hdlr", &[&[0u8; 8][..], &b"vide"[..], &[0u8; 12]].concat());
+        let trak = bx(b"trak", &bx(b"mdia", &hdlr));
+        let meta = bx(b"meta", &bx(b"hdlr", &[&[0u8; 8][..], &b"mdir"[..], &[0u8; 12]].concat()));
+        let f = [bx(b"ftyp", b"isom\0\0\0\0isom"), bx(b"moov", &[trak, bx(b"udta", &meta)].concat())].concat();
+        assert!(scan(Format::Mp4, &mut Cursor::new(&f), f.len() as u64).is_ok());
+    }
+
+    #[test]
+    fn webm_with_subtitle_or_metadata_tracks_is_refused() {
+        let file = |types: &[u8]| {
+            let header = ebml_el(&[0x1A, 0x45, 0xDF, 0xA3], &ebml_el(&[0x42, 0x82], b"webm"));
+            let entries: Vec<u8> = types.iter().flat_map(|t| ebml_el(&[0xAE], &ebml_el(&[0x83], &[*t]))).collect();
+            let tracks = ebml_el(&[0x16, 0x54, 0xAE, 0x6B], &entries);
+            let cluster = ebml_el(&[0x1F, 0x43, 0xB6, 0x75], b"FRAMES");
+            let body = [tracks, cluster].concat();
+            let mut seg = vec![0x18, 0x53, 0x80, 0x67, 0x40, body.len() as u8];
+            seg.extend_from_slice(&body);
+            [header, seg].concat()
+        };
+        let ok = file(&[1, 2]);
+        assert!(scan(Format::Webm, &mut Cursor::new(&ok), ok.len() as u64).is_ok());
+        for t in [0x11, 0x21, 0x03] {
+            let f = file(&[1, t, 2]);
+            assert!(matches!(scan(Format::Webm, &mut Cursor::new(&f), f.len() as u64), Err(SanitizeError::ExtraTrack(_))), "{t}");
+        }
     }
 
     #[test]
