@@ -501,7 +501,12 @@ async fn put(stream: &mut Box<dyn Io>, bytes: Vec<u8>) -> Result<Response> {
     if wire::is_unknown_request(&r) {
         return request(stream, &Request::Put(bytes)).await;
     }
-    Ok(r)
+    // A new author on that Pillar: more work, once.
+    let (more, r) = tokio::task::spawn_blocking(move || (wire::restamp(&r, &bytes), r)).await?;
+    match more {
+        Some(req) => request(stream, &req).await,
+        None => Ok(r),
+    }
 }
 
 async fn post(pillar: &str, text: String) -> Result<()> {
@@ -611,7 +616,10 @@ async fn bench(pillar: &str, rounds: usize, fresh: usize) -> Result<()> {
 
     let throwaway = identity::generate();
     let env = Envelope::sign(&throwaway, "post", vec![b'x'; 2000]);
-    let stamped = wire::put_stamped(env.encode()?);
+    // A throwaway author is new to the Pillar: stamp for that up front.
+    let object = env.encode()?;
+    let nonce = sentinel_core::social::put_stamp_bits(&object, sentinel_core::social::put_bits_max(object.len()));
+    let stamped = Request::PutStamped { object, nonce };
     let (addr, put) = match timed_request(&mut s, &stamped).await? {
         (Response::Stored(a), d) => (a, d),
         (other, _) => bail!("unexpected: {other:?}"),

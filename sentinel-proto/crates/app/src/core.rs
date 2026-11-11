@@ -892,13 +892,21 @@ pub(crate) async fn stamp_put(bytes: Vec<u8>) -> Result<Arc<Request>> {
 }
 
 /// Store an object with a stamped put; an older Pillar that doesn't know
-/// stamped puts gets the plain one.
+/// stamped puts gets the plain one, and one that asks for more work (I'm
+/// new there) gets a harder stamp.
 pub(crate) async fn put_request(stream: &mut Box<dyn Io>, stamped: &Request) -> Result<Response> {
     let r = request(stream, stamped).await?;
-    if let (true, Request::PutStamped { object, .. }) = (wire::is_unknown_request(&r), stamped) {
+    let Request::PutStamped { object, .. } = stamped else { return Ok(r) };
+    if wire::is_unknown_request(&r) {
         return request(stream, &Request::Put(object.clone())).await;
     }
-    Ok(r)
+    // The first object of mine this Pillar sees costs more work (once).
+    let o = object.clone();
+    let (more, r) = tokio::task::spawn_blocking(move || (wire::restamp(&r, &o), r)).await?;
+    match more {
+        Some(req) => request(stream, &req).await,
+        None => Ok(r),
+    }
 }
 
 /// `request` with a custom timeout (for requests the node must forward,

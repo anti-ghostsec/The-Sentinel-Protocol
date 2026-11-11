@@ -19,6 +19,7 @@
 
 mod directory;
 mod economy;
+mod limits;
 mod mixkeys;
 mod relay;
 mod seen;
@@ -136,6 +137,8 @@ struct Ctx {
     mix: mixkeys::MixKeys,
     /// Deposits stored lately (the same blob twice is stored once).
     deposit_seen: seen::SeenSet,
+    /// Objects stored today, per author.
+    author_limits: limits::AuthorLimits,
     /// Which listed Pillars answered lately (memory only; see `directory`).
     dir: Arc<directory::Directory>,
     /// The shard of every new deposit, for held `Watch` requests.
@@ -219,6 +222,7 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         mint_interval: cfg.mint_interval,
         updates: cfg.updates.clone(),
         mix: mixkeys::MixKeys::load(&cfg.store, today_day(), MAX_MIX_SEEN),
+        author_limits: limits::AuthorLimits::default(),
         deposit_seen: seen::SeenSet::load(&cfg.store.join("deposit-seen"), DEPOSIT_SEEN_DAYS, 2 * MAX_MAILBOX_TOTAL as usize, today_day()),
         dir: Arc::default(),
         deposits: tokio::sync::broadcast::channel(1024).0,
@@ -372,7 +376,13 @@ pub(crate) async fn put_to<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unp
     if wire::is_unknown_request(&r) {
         return exchange(s, &Request::Put(object)).await;
     }
-    Ok(r)
+    // A new author there: more work, once.
+    let (o, r2) = (object.clone(), r);
+    let (more, r) = tokio::task::spawn_blocking(move || (wire::restamp(&r2, &o), r2)).await?;
+    match more {
+        Some(req) => exchange(s, &req).await,
+        None => Ok(r),
+    }
 }
 
 fn known_path(store: &Path) -> PathBuf {
@@ -787,15 +797,26 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             if reports::removed(store).contains(&addr.to_text()) {
                 return Response::Rejected("removed by this Pillar".into());
             }
+            // An author this Pillar holds nothing from pays more (see `limits`).
+            let index = index_path(store, &env.author);
+            let new_author = !tokio::fs::metadata(&index).await.is_ok_and(|m| m.len() > 0);
+            let needed = social::put_bits(bytes.len()) + if new_author { social::NEW_AUTHOR_EXTRA_BITS } else { 0 };
+            if !social::put_check_bits(&bytes, nonce, needed) {
+                return wire::need_more_work(needed);
+            }
             let path = store.join(addr.to_text());
             let _guard = INDEX_LOCK.lock().await;
             if tokio::fs::try_exists(&path).await.unwrap_or(false) {
                 return Response::Stored(addr); // duplicate: already indexed
             }
+            if let Err(e) = ctx.author_limits.admit(&env.author, bytes.len() as u64, new_author, today_day()) {
+                stats.rejected.fetch_add(1, Ordering::Relaxed);
+                return Response::Rejected(e.into());
+            }
             if write_coarse(&path, &bytes).await.is_err() {
                 return Response::Rejected("storage error".into());
             }
-            if append_line(&index_path(store, &env.author), &addr.to_text()).await.is_err() {
+            if append_line(&index, &addr.to_text()).await.is_err() {
                 let _ = tokio::fs::remove_file(&path).await;
                 return Response::Rejected("storage error".into());
             }

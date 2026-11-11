@@ -481,10 +481,25 @@ pub fn put_pow_data(object: &[u8]) -> [u8; 32] {
     blake3::derive_key("sentinel/v1/put-pow-data", object)
 }
 
+/// Extra difficulty for an author a Pillar holds nothing from (a new
+/// author costs 256 times more, so minting authors to get around the
+/// per-author daily limit is expensive).
+pub const NEW_AUTHOR_EXTRA_BITS: u32 = 8;
+
+/// Most difficulty a Pillar may ask for an object of `len` bytes; an app
+/// won't work harder than this, whatever a Pillar says.
+pub fn put_bits_max(len: usize) -> u32 {
+    put_bits(len) + NEW_AUTHOR_EXTRA_BITS
+}
+
 /// Find the proof of work for storing `object` (CPU-bound: run it off the
 /// UI thread).
 pub fn put_stamp(object: &[u8]) -> u64 {
-    let bits = put_bits(object.len());
+    put_stamp_bits(object, put_bits(object.len()))
+}
+
+/// The same at a given difficulty (a Pillar asked for more).
+pub fn put_stamp_bits(object: &[u8], bits: u32) -> u64 {
     let data = put_pow_data(object);
     if bits > PUT_POW_BITS + 1 {
         crate::pow::stamp_parallel(PUT_POW_DOMAIN, &data, bits)
@@ -494,7 +509,11 @@ pub fn put_stamp(object: &[u8]) -> u64 {
 }
 
 pub fn put_check(object: &[u8], nonce: u64) -> bool {
-    crate::pow::check(PUT_POW_DOMAIN, &put_pow_data(object), nonce, put_bits(object.len()))
+    put_check_bits(object, nonce, put_bits(object.len()))
+}
+
+pub fn put_check_bits(object: &[u8], nonce: u64, bits: u32) -> bool {
+    crate::pow::check(PUT_POW_DOMAIN, &put_pow_data(object), nonce, bits)
 }
 
 /// Domain and difficulty for Pillar announcement proof-of-work.
@@ -541,6 +560,10 @@ mod tests {
         other[0] ^= 1;
         // A stamp is for one object only (a chance match is 1 in 2^18).
         assert!(!put_check(&other, n));
+        // A stamp at a higher difficulty passes both checks.
+        let hard = put_stamp_bits(&obj, PUT_POW_BITS + 2);
+        assert!(put_check(&obj, hard) && put_check_bits(&obj, hard, PUT_POW_BITS + 2));
+        assert_eq!(put_bits_max(100), PUT_POW_BITS + NEW_AUTHOR_EXTRA_BITS);
     }
 
     #[test]

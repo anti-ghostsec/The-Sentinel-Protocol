@@ -168,6 +168,42 @@ pub fn put_stamped(object: Vec<u8>) -> Request {
     Request::PutStamped { object, nonce }
 }
 
+const NEED_WORK: &str = "more proof of work needed: ";
+
+/// A Pillar's answer when an object needs more work than the base stamp
+/// (its author is new to the Pillar).
+pub fn need_more_work(bits: u32) -> Response {
+    Response::Rejected(format!("{NEED_WORK}{bits} bits"))
+}
+
+/// If `r` asks for more work for `object`, the stamped request to send
+/// instead (computes the proof of work: CPU-bound). `None` for any other
+/// answer, or for more work than any Pillar may ask.
+pub fn restamp(r: &Response, object: &[u8]) -> Option<Request> {
+    let Response::Rejected(e) = r else { return None };
+    let bits: u32 = e.strip_prefix(NEED_WORK)?.strip_suffix(" bits")?.parse().ok()?;
+    if bits <= crate::social::put_bits(object.len()) || bits > crate::social::put_bits_max(object.len()) {
+        return None;
+    }
+    Some(Request::PutStamped { object: object.to_vec(), nonce: crate::social::put_stamp_bits(object, bits) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pillar_can_ask_for_more_work_but_only_up_to_the_limit() {
+        let obj = vec![1u8; 100];
+        let base = crate::social::put_bits(100);
+        let Some(Request::PutStamped { nonce, .. }) = restamp(&need_more_work(base + 2), &obj) else { panic!() };
+        assert!(crate::social::put_check_bits(&obj, nonce, base + 2));
+        assert!(restamp(&need_more_work(crate::social::put_bits_max(100) + 1), &obj).is_none());
+        assert!(restamp(&need_more_work(base), &obj).is_none());
+        assert!(restamp(&Response::Rejected("Pillar is full".into()), &obj).is_none());
+    }
+}
+
 /// Longest a Pillar holds a `Watch` before answering with nothing.
 pub const WATCH_HOLD_SECS: u64 = 120;
 
