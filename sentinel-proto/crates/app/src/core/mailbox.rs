@@ -11,7 +11,8 @@
 //! never by the Pillar. (A hostile Pillar answering "16 bits" would put each
 //! person in their own shard and undo the whole point.) I only lengthen the
 //! prefix when what I download is genuinely too much, and never beyond
-//! `MAX_DEPTH`.
+//! `MAX_DEPTH`. (A Pillar can still pad its answers to make me split; the
+//! fixed limit keeps every prefix shared with a sixteenth of its mailboxes.)
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -30,8 +31,8 @@ use super::{request, request_timeout, Core};
 /// Pillars keep mailbox deposits this many days.
 const MAIL_KEEP_DAYS: u64 = 7;
 
-/// Never split finer than this (256 prefixes): each prefix stays shared.
-const MAX_DEPTH: u8 = 8;
+/// Never split finer than this (16 prefixes): each prefix stays shared.
+const MAX_DEPTH: u8 = dm::MAX_READ_DEPTH;
 /// Lengthen the prefix only above this many blobs per poll window, shorten
 /// below a quarter of it.
 const SPLIT_ABOVE: usize = 4000;
@@ -46,9 +47,6 @@ pub struct MailState {
     rescans: u64,
     /// Pillars that don't hold watches (older versions), and since when.
     no_watch: HashMap<String, Instant>,
-    /// Per (Pillar, depth): the prefixes watched, padding included, and
-    /// the real ones they were made for.
-    watch_pad: HashMap<(String, u8), (BTreeSet<u16>, BTreeSet<u16>)>,
 }
 
 /// An older Pillar's answer to a request it doesn't know.
@@ -59,7 +57,15 @@ const NO_WATCH_RETRY: Duration = Duration::from_secs(6 * 3600);
 impl Core {
     /// My own choice of prefix length for a Pillar, from what I observed.
     fn depth(&self, pillar: &str) -> u8 {
-        self.with(|i| i.mail.depths.get(pillar).map(|(d, _)| *d).unwrap_or(0))
+        self.with(|i| i.mail.depths.get(pillar).map(|(d, _)| *d).unwrap_or(0)).min(MAX_DEPTH)
+    }
+
+    /// My real prefixes on a Pillar plus padding: the same set all day (see
+    /// `dm::padded_prefixes`), for fetches and watches alike.
+    fn prefixes(key: &super::Keys, pillar: &str, bits: u8, ids: &[[u8; 32]]) -> BTreeSet<u16> {
+        let real: BTreeSet<u16> = ids.iter().map(|id| dm::prefix_of(dm::shard_of(id), bits)).collect();
+        let pad_secret = zeroize::Zeroizing::new(blake3::derive_key("sentinel/v1/mailbox-pad-secret", &key.root.to_bytes()));
+        dm::padded_prefixes(&pad_secret, pillar, dm::today(), bits, &real)
     }
 
     fn observe(&self, pillar: &str, seen: usize) {
@@ -91,16 +97,9 @@ impl Core {
         let (mut dms, mut rooms) = (0, 0);
         for (pillar, list) in ids {
             let bits = self.depth(&pillar);
-            let mut prefixes: BTreeSet<u16> = list.iter().map(|id| dm::prefix_of(dm::shard_of(id), bits)).collect();
-            // Always fetch a multiple of 4 prefixes (random extra ones), so
-            // the Pillar can't count how many inboxes and rooms I have.
-            if bits > 0 {
-                let space = 1u32 << bits;
-                let target = (prefixes.len().div_ceil(4) * 4).min(space as usize);
-                while prefixes.len() < target {
-                    prefixes.insert((u32::from_le_bytes(sentinel_core::random_bytes::<4>()) % space) as u16);
-                }
-            }
+            // Always fetch a multiple of 4 prefixes (extra ones, the same
+            // all day), so the Pillar can't count my inboxes and rooms.
+            let prefixes = Core::prefixes(&key, &pillar, bits, &list);
             let many = prefixes.len() > 1;
             let mut seen_here = 0usize;
             // Fetch every prefix at the same time, each on its own circuit
@@ -271,7 +270,7 @@ impl Core {
     /// (Pillar, depth, prefix) to watch now, padded like the fetches;
     /// none while mixing or High-risk mode is on.
     fn watch_keys(&self) -> HashSet<(String, u8, u16)> {
-        let Ok((_, store)) = self.unlocked() else { return HashSet::new() };
+        let Ok((key, store)) = self.unlocked() else { return HashSet::new() };
         if store.privacy.mix || store.privacy.high_risk || self.with(|i| i.net.is_none()) {
             return HashSet::new();
         }
@@ -282,24 +281,8 @@ impl Core {
                 continue;
             }
             let bits = self.depth(&pillar);
-            let real: BTreeSet<u16> = list.iter().map(|id| dm::prefix_of(dm::shard_of(id), bits)).collect();
-            // Padding prefixes are kept while the real ones stay the same,
-            // so the set watched doesn't change at every look.
-            let prefixes = self.with(|i| {
-                let e = i.mail.watch_pad.entry((pillar.clone(), bits)).or_default();
-                if e.1 != real {
-                    let mut set = real.clone();
-                    if bits > 0 {
-                        let space = 1u32 << bits;
-                        let target = (set.len().div_ceil(4) * 4).min(space as usize);
-                        while set.len() < target {
-                            set.insert((u32::from_le_bytes(sentinel_core::random_bytes::<4>()) % space) as u16);
-                        }
-                    }
-                    *e = (set, real.clone());
-                }
-                e.0.clone()
-            });
+            // Padded like the fetches (the same set all day).
+            let prefixes = Core::prefixes(&key, &pillar, bits, &list);
             keys.extend(prefixes.into_iter().map(|p| (pillar.clone(), bits, p)));
         }
         keys

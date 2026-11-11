@@ -129,6 +129,50 @@ pub fn prefix_matches(shard: u16, bits: u8, prefix: u16) -> bool {
     prefix_of(shard, bits) == prefix
 }
 
+/// Most prefix bits a reader uses. The reader picks its depth from the
+/// volume it downloads, which a Pillar controls (it can pad its answers);
+/// this fixed limit keeps every prefix shared by at least 1/16 of the
+/// Pillar's mailboxes, whatever a Pillar does.
+pub const MAX_READ_DEPTH: u8 = 4;
+
+/// The prefixes a reader fetches: its real ones plus padding up to a
+/// multiple of 4, so the Pillar can't count its inboxes and rooms. The
+/// padding comes from `pad_secret` (a key only this reader has), the
+/// Pillar, the day and the depth: the same all day, so it can't be told
+/// apart from the real prefixes (which recur) by looking at which change
+/// between polls. A real prefix added during the day keeps the rest.
+pub fn padded_prefixes(pad_secret: &[u8; 32], pillar: &str, day: u64, bits: u8, real: &std::collections::BTreeSet<u16>) -> std::collections::BTreeSet<u16> {
+    let mut set = real.clone();
+    if bits == 0 {
+        return set;
+    }
+    let space = 1usize << bits.min(16);
+    let target = (set.len().div_ceil(4) * 4).min(space);
+    let mut seed = blake3::Hasher::new_keyed(pad_secret);
+    seed.update(b"sentinel/v1/mailbox-padding");
+    seed.update(&day.to_le_bytes());
+    seed.update(&[bits]);
+    seed.update(pillar.as_bytes());
+    let mut stream = seed.finalize_xof();
+    let mut tries = 0;
+    while set.len() < target {
+        let mut b = [0u8; 2];
+        stream.fill(&mut b);
+        set.insert((u16::from_le_bytes(b) as usize % space) as u16);
+        tries += 1;
+        if tries > 100_000 {
+            // Can't happen in practice; fill in order rather than loop on.
+            for p in 0..space as u16 {
+                if set.len() >= target {
+                    break;
+                }
+                set.insert(p);
+            }
+        }
+    }
+    set
+}
+
 /// Deposit proof-of-work grows with size (a shard flooded with big junk
 /// blobs costs the flooder, not just the readers).
 pub fn deposit_bits(len: usize) -> u32 {
@@ -524,6 +568,36 @@ mod tests {
     }
 
     #[test]
+    fn first_messages_and_replies_are_the_same_size() {
+        let (a_key, a_acc, _, a_card) = party("a.onion");
+        let (_, mut b_acc, b_inbox, b_card) = party("b.onion");
+        let reply_info = |c: &ContactCard| ReplyInfo { pillar: c.pillar.clone(), inbox_pub: c.inbox_pub, inbox_ids: c.inbox_ids.clone(), inbox_kem: c.inbox_kem.clone() };
+        let mut a_sess = outbound_session(&a_acc, &b_card).unwrap();
+        let mut f = first(&a_key, "hi bob", &a_card, &b_card.inbox_pub);
+        f.reply = Some(reply_info(&a_card));
+        let first_blob = encrypt(&a_acc, &mut a_sess, &f, &b_card).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &first_blob).unwrap();
+        let (mut b_sess, got) = decrypt(&mut b_acc, None, sender, &msg).unwrap();
+        assert_eq!(got.text, "hi bob");
+        let mut r = f.clone();
+        r.card = None;
+        r.card_mac = None;
+        r.reply = Some(reply_info(&b_card));
+        r.text = "a longer reply that goes on for a while".repeat(20);
+        let reply_blob = encrypt(&b_acc, &mut b_sess, &r, &a_card).unwrap();
+        assert_eq!(first_blob.len(), reply_blob.len());
+        assert!(first_blob.len() <= MAX_BLOB);
+        // Every bucket is hit exactly, and stays a deposit after sealing.
+        for len in (0..2100).chain((24_000..24_600).step_by(37)).chain([30_000, 50_000]) {
+            let mut w = Wire { sender_identity: [1; 32], olm_type: 1, olm: vec![7; len], pad: Vec::new() };
+            pad_wire(&mut w);
+            let n = cbor(&w).len();
+            assert!(PAD_BUCKETS.contains(&n), "{len} -> {n}");
+            assert!(n + 1200 <= MAX_BLOB);
+        }
+    }
+
+    #[test]
     fn cards_without_an_ml_kem_key_still_work() {
         let (a_key, a_acc, _, a_card) = party("a.onion");
         let (_, mut b_acc, b_inbox, mut b_card) = party("b.onion");
@@ -562,18 +636,6 @@ mod tests {
     }
 
     #[test]
-    fn inbox_ids_rotate_daily() {
-        let k = crate::random_bytes::<32>();
-        assert_ne!(inbox_id(&k, 100), inbox_id(&k, 101));
-        assert_eq!(inbox_id(&k, 100), inbox_id(&k, 100));
-    }
-}
-
-#[cfg(test)]
-mod inbox_capability_tests {
-    use super::*;
-
-    #[test]
     fn mailbox_padding_is_stable_for_the_day_and_hides_the_count() {
         use std::collections::BTreeSet;
         let secret = [9u8; 32];
@@ -600,6 +662,18 @@ mod inbox_capability_tests {
         assert_eq!(padded_prefixes(&secret, "p.onion", 100, 1, &all), all);
         assert_eq!(padded_prefixes(&secret, "p.onion", 100, 2, &[1].into_iter().collect()).len(), 4);
     }
+
+    #[test]
+    fn inbox_ids_rotate_daily() {
+        let k = crate::random_bytes::<32>();
+        assert_ne!(inbox_id(&k, 100), inbox_id(&k, 101));
+        assert_eq!(inbox_id(&k, 100), inbox_id(&k, 100));
+    }
+}
+
+#[cfg(test)]
+mod inbox_capability_tests {
+    use super::*;
 
     #[test]
     fn only_the_owner_can_derive_the_fetch_token() {
