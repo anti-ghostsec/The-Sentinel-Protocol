@@ -331,7 +331,7 @@ impl Core {
             return (1, 0);
         }
         if let Some(st) = &store.dm {
-            if dm::unseal(&st.inbox_secret, blob).is_some() {
+            if dm::unseal(&st.inbox_secret, &st.fetch_secret, blob).is_some() {
                 handled = true;
                 if self.receive_blob(key, blob).unwrap_or(false) {
                     out = (1, 0);

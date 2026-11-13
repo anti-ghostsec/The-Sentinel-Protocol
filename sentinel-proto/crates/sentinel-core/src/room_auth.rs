@@ -78,15 +78,15 @@ pub fn reseal_ask(room_id: &[u8; 32], m: &mut Moderator, ask: Option<&[u8; 32]>)
 }
 
 /// Member: my moderator seed and the ask key, if I'm on the list.
-pub fn my_moderator(room_id: &[u8; 32], mods: &[Moderator], my_member_secret: &[u8; 32]) -> Option<([u8; 32], Option<[u8; 32]>)> {
+pub fn my_moderator(room_id: &[u8; 32], mods: &[Moderator], my_member_secret: &[u8; 32], kem_secret: Option<&[u8; 32]>) -> Option<([u8; 32], Option<[u8; 32]>)> {
     let mine = crate::room::member_pub(my_member_secret);
     let m = mods.iter().find(|m| m.member == mine)?;
-    let seed = crate::room::open_secret(my_member_secret, &m.seed, room_id)?;
+    let seed = crate::room::open_secret(my_member_secret, kem_secret, &m.seed, room_id)?;
     // The seed must match the key everyone else checks against.
     if ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes() != m.key {
         return None;
     }
-    let ask = (!m.ask.is_empty()).then(|| crate::room::open_secret(my_member_secret, &m.ask, room_id)).flatten();
+    let ask = (!m.ask.is_empty()).then(|| crate::room::open_secret(my_member_secret, kem_secret, &m.ask, room_id)).flatten();
     Some((seed, ask))
 }
 
@@ -236,10 +236,10 @@ pub fn rekey_action(room_id: &[u8; 32], epoch: u64, new_secret: &[u8; 32], membe
 }
 
 /// Member: my new secret from a rekey, if I'm included.
-pub fn open_rekey(room_id: &[u8; 32], entries: &[([u8; 32], Vec<u8>)], my_member_secret: &[u8; 32]) -> Option<[u8; 32]> {
+pub fn open_rekey(room_id: &[u8; 32], entries: &[([u8; 32], Vec<u8>)], my_member_secret: &[u8; 32], kem_secret: Option<&[u8; 32]>) -> Option<[u8; 32]> {
     let mine = crate::room::member_pub(my_member_secret);
     let (_, sealed) = entries.iter().find(|(m, _)| *m == mine)?;
-    crate::room::open_secret(my_member_secret, sealed, room_id)
+    crate::room::open_secret(my_member_secret, kem_secret, sealed, room_id)
 }
 
 /// Is message `index` of `session` beyond the cut (to be dropped)?
@@ -338,6 +338,11 @@ impl Log {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests give each member an ML-KEM secret derived from its X25519 one.
+    fn kem(member_secret: &[u8; 32]) -> [u8; 32] {
+        blake3::derive_key("test member kem", member_secret)
+    }
     use crate::room::{member_pub, new_room_with_admin};
 
     fn entry(room_id: [u8; 32], seq: u64, prev: [u8; 32], action: Action) -> Entry {
@@ -407,13 +412,13 @@ mod tests {
         assert!(log.offer(&room, &s12).is_empty());
         let member = crate::random_bytes::<32>();
         let secret = crate::random_bytes::<32>();
-        let rk = rekey_action(&room, 2, &secret, &[(member_pub(&member), Some(crate::room::member_kem_public(&member)))], vec![]);
+        let rk = rekey_action(&room, 2, &secret, &[(member_pub(&member), Some(crate::room::member_kem_public(&kem(&member))))], vec![]);
         let (s11, _) = sign(&admin, &entry(room, 11, h9, rk.clone()));
         let got = log.offer(&room, &s11);
         assert_eq!(got.len(), 1);
         let Action::Rekey { entries, .. } = &got[0].action else { panic!() };
-        assert_eq!(open_rekey(&room, entries, &member), Some(secret));
-        assert!(open_rekey(&room, entries, &crate::random_bytes::<32>()).is_none());
+        assert_eq!(open_rekey(&room, entries, &member, Some(&kem(&member))), Some(secret));
+        assert!(open_rekey(&room, entries, &crate::random_bytes::<32>(), None).is_none());
     }
 
     #[test]
@@ -421,12 +426,12 @@ mod tests {
         let (room, _, admin) = new_room_with_admin();
         let (m_secret, other) = (crate::random_bytes::<32>(), crate::random_bytes::<32>());
         let ask = crate::random_bytes::<32>();
-        let m = new_moderator(&room, &member_pub(&m_secret), Some(&crate::room::member_kem_public(&m_secret)), Some(&ask));
+        let m = new_moderator(&room, &member_pub(&m_secret), Some(&crate::room::member_kem_public(&kem(&m_secret))), Some(&ask));
         let mods = vec![m.clone()];
         // Only the named member can open the moderator key and the ask key.
-        let (seed, got_ask) = my_moderator(&room, &mods, &m_secret).unwrap();
+        let (seed, got_ask) = my_moderator(&room, &mods, &m_secret, Some(&kem(&m_secret))).unwrap();
         assert_eq!(got_ask, Some(ask));
-        assert!(my_moderator(&room, &mods, &other).is_none());
+        assert!(my_moderator(&room, &mods, &other, None).is_none());
         // Their actions verify; anyone else's don't; the admin's do.
         let hide = ModAction::Hide { session_id: "s".into(), index: 1 };
         let signed = sign_mod(&seed, &room, hide.clone());
@@ -441,11 +446,11 @@ mod tests {
         // A moderator entry whose sealed seed doesn't match its key is ignored.
         let mut bad = m.clone();
         bad.key = [9; 32];
-        assert!(my_moderator(&room, &[bad], &m_secret).is_none());
+        assert!(my_moderator(&room, &[bad], &m_secret, Some(&kem(&m_secret))).is_none());
         // No ask key when approval is off.
         let mut m2 = m;
         reseal_ask(&room, &mut m2, None);
-        assert_eq!(my_moderator(&room, &[m2], &m_secret).unwrap().1, None);
+        assert_eq!(my_moderator(&room, &[m2], &m_secret, Some(&kem(&m_secret))).unwrap().1, None);
     }
 
     #[test]

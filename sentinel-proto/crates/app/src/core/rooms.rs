@@ -142,6 +142,10 @@ pub struct RoomState {
     /// My room-only X25519 secret (members MAC their hellos to it).
     #[serde(default)]
     pub member_secret: Option<[u8; 32]>,
+    /// My room-only ML-KEM secret (kept apart from `member_secret`, whose
+    /// public half every hello carries).
+    #[serde(default)]
+    pub member_kem_secret: Option<[u8; 32]>,
     /// Members' room-only keys (hex) -> who they claim to be.
     #[serde(default)]
     pub members: HashMap<String, MemberInfo>,
@@ -349,6 +353,7 @@ fn new_state(room_id: [u8; 32], secret: [u8; 32], pillar: String, name: String, 
         announced_day: 0,
         queue: Vec::new(),
         member_secret: Some(sentinel_core::random_bytes::<32>()),
+        member_kem_secret: Some(sentinel_core::random_bytes::<32>()),
         members: HashMap::new(),
         hello_covers: Vec::new(),
         // Say hello on joining, so members can verify me before I post.
@@ -388,7 +393,7 @@ fn apply_mods(x: &mut RoomState, mods: Vec<Moderator>, approval: bool) {
     let mods: Vec<Moderator> = mods.into_iter().take(room_auth::MAX_MODS).collect();
     x.approval = approval;
     if x.admin.is_none() {
-        match room_auth::my_moderator(&x.room_id, &mods, &x.member_secret.unwrap_or_default()) {
+        match room_auth::my_moderator(&x.room_id, &mods, &x.member_secret.unwrap_or_default(), x.member_kem_secret.as_ref()) {
             Some((seed, ask)) => {
                 x.my_mod = Some(seed);
                 if x.ask != ask {
@@ -556,7 +561,7 @@ impl Core {
             note: note.to_owned(),
             member_pub: room::member_pub(&st.member_secret.unwrap_or_default()),
             reply,
-            member_kem: Some(room::member_kem_public(&st.member_secret.unwrap_or_default())),
+            member_kem: Some(room::member_kem_public(&st.member_kem_secret.unwrap_or_default())),
         };
         st.queue.push(Queued { sealed: room::seal_blob(&l.ask, &RoomBlob::Ask(req)), nonce: 0, secret: Some(l.ask) });
         let id = hex(&l.room_id);
@@ -1273,7 +1278,7 @@ impl Core {
         members.sort();
         members.dedup();
         let secret = r.member_secret.unwrap_or_default();
-        (room::seal_blob(&r.secret, &room::hello(key, &r.room_id, name, &secret, session, &members)), members)
+        (room::seal_blob(&r.secret, &room::hello(key, &r.room_id, name, &secret, &r.member_kem_secret.unwrap_or_default(), session, &members)), members)
     }
 
     /// Queue a hello if one is due (joined, new members, new day), without
@@ -1404,7 +1409,7 @@ impl Core {
             RoomBlob::Rekey { signed } => {
                 let (_, store) = self.unlocked()?;
                 let Some(r) = store.rooms.iter().find(|x| x.room_id == *room_id) else { return Ok(false) };
-                let Some((epoch, new_secret)) = room::accept_rekey(room_id, &signed, &r.member_secret.unwrap_or_default()) else { return Ok(false) };
+                let Some((epoch, new_secret)) = room::accept_rekey(room_id, &signed, &r.member_secret.unwrap_or_default(), r.member_kem_secret.as_ref()) else { return Ok(false) };
                 if epoch > r.epoch {
                     self.update(|s| {
                         if let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == *room_id) {
@@ -1482,7 +1487,7 @@ impl Core {
                                 // Drop old-epoch messages beyond the cut (no back-dating).
                                 let old = x.epoch;
                                 x.messages.retain(|m| m.mine || m.epoch != old || m.session.is_empty() || !room_auth::beyond_cut(&cut, &m.session, m.index));
-                                if let Some(new_secret) = room_auth::open_rekey(room_id, &entries, &x.member_secret.unwrap_or_default()) {
+                                if let Some(new_secret) = room_auth::open_rekey(room_id, &entries, &x.member_secret.unwrap_or_default(), x.member_kem_secret.as_ref()) {
                                     x.secret = new_secret;
                                     x.epoch = epoch;
                                     x.needs_hello = true;
@@ -1567,7 +1572,7 @@ impl Core {
                     }
                     match sealed {
                         Some(b) => {
-                            if let Some(room_secret) = room::open_answer(room_id, &b, &x.member_secret.unwrap_or_default()) {
+                            if let Some(room_secret) = room::open_answer(room_id, &b, &x.member_secret.unwrap_or_default(), x.member_kem_secret.as_ref()) {
                                 x.secret = room_secret;
                                 x.epoch = epoch;
                                 x.waiting = false;
@@ -1601,7 +1606,7 @@ impl Core {
                     return Ok(false);
                 }
                 let Some(my) = r.member_secret else { return Ok(false) };
-                let Some(report) = sealed.iter().take(30).find_map(|b| room::open_report(&my, room_id, b)) else { return Ok(false) };
+                let Some(report) = sealed.iter().take(30).find_map(|b| room::open_report(&my, r.member_kem_secret.as_ref(), room_id, b)) else { return Ok(false) };
                 if !super::REPORT_CATEGORY_NAMES.iter().any(|(k, _)| *k == report.category) {
                     return Ok(false);
                 }

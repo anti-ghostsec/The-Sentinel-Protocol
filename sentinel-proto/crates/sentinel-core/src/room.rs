@@ -142,8 +142,8 @@ pub fn seal_report(to: &[u8; 32], to_kem: &[u8], room_id: &[u8; 32], r: &RoomRep
 }
 
 /// Open a report sealed to me, if it is.
-pub fn open_report(member_secret: &[u8; 32], room_id: &[u8; 32], sealed: &[u8]) -> Option<RoomReport> {
-    let plain = crate::pq::open(REPORT_CONTEXT, room_id, member_secret, Some(&member_kem_seed(member_secret)), sealed)?;
+pub fn open_report(member_secret: &[u8; 32], kem_secret: Option<&[u8; 32]>, room_id: &[u8; 32], sealed: &[u8]) -> Option<RoomReport> {
+    let plain = open_hybrid(REPORT_CONTEXT, member_secret, kem_secret, room_id, sealed)?;
     let r: RoomReport = ciborium::from_reader(plain.as_slice()).ok()?;
     (r.text.chars().count() <= 5000 && r.note.chars().count() <= 500 && r.category.len() <= 40).then_some(r)
 }
@@ -187,8 +187,8 @@ pub fn answer(room_id: &[u8; 32], req: &JoinRequest, secret: Option<&[u8; 32]>, 
 }
 
 /// Requester: the room secret from an answer, if approved.
-pub fn open_answer(room_id: &[u8; 32], sealed: &[u8], my_member_secret: &[u8; 32]) -> Option<[u8; 32]> {
-    open_secret(my_member_secret, sealed, room_id)
+pub fn open_answer(room_id: &[u8; 32], sealed: &[u8], my_member_secret: &[u8; 32], kem_secret: Option<&[u8; 32]>) -> Option<[u8; 32]> {
+    open_secret(my_member_secret, kem_secret, sealed, room_id)
 }
 
 /// `sentinel://ask/<room_id>@<pillar-host>#<ask key>/<name>`: asks to join
@@ -230,13 +230,30 @@ pub struct RekeyBody {
     pub entries: Vec<([u8; 32], Vec<u8>)>,
 }
 
-/// A member's post-quantum (ML-KEM) key seed, derived from their room-only key.
-pub fn member_kem_seed(member_secret: &[u8; 32]) -> zeroize::Zeroizing<[u8; 64]> {
+/// A member's post-quantum (ML-KEM) key seed, from a secret of its own
+/// (`kem_secret`), kept apart from the room-only X25519 secret: that one's
+/// public half is in every hello, so whoever can break X25519 would get an
+/// ML-KEM key derived from it too, and the hybrid would protect nothing.
+pub fn member_kem_seed(kem_secret: &[u8; 32]) -> zeroize::Zeroizing<[u8; 64]> {
+    crate::pq::kem_seed_from("sentinel/v1/room-member-kem", kem_secret, 0)
+}
+
+pub fn member_kem_public(kem_secret: &[u8; 32]) -> Vec<u8> {
+    crate::pq::kem_public(&member_kem_seed(kem_secret))
+}
+
+/// The ML-KEM key members announced before `member_kem_seed` (derived
+/// from the X25519 secret). Still opened, for secrets sealed to it.
+fn legacy_member_kem_seed(member_secret: &[u8; 32]) -> zeroize::Zeroizing<[u8; 64]> {
     crate::pq::kem_seed_from("sentinel/v0/room-member-kem", member_secret, 0)
 }
 
-pub fn member_kem_public(member_secret: &[u8; 32]) -> Vec<u8> {
-    crate::pq::kem_public(&member_kem_seed(member_secret))
+/// Open something hybrid-sealed to me: with my own ML-KEM key, or the
+/// legacy one.
+fn open_hybrid(context: &str, member_secret: &[u8; 32], kem_secret: Option<&[u8; 32]>, room_id: &[u8; 32], b: &[u8]) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    kem_secret
+        .and_then(|k| crate::pq::open(context, room_id, member_secret, Some(&member_kem_seed(k)), b))
+        .or_else(|| crate::pq::open(context, room_id, member_secret, Some(&legacy_member_kem_seed(member_secret)), b))
 }
 
 /// Classical sealed secrets are exactly this long; hybrid ones are longer.
@@ -267,9 +284,9 @@ pub(crate) fn seal_secret(to: &[u8; 32], secret: &[u8; 32], room_id: &[u8; 32]) 
     out
 }
 
-pub(crate) fn open_secret(member_secret: &[u8; 32], b: &[u8], room_id: &[u8; 32]) -> Option<[u8; 32]> {
+pub(crate) fn open_secret(member_secret: &[u8; 32], kem_secret: Option<&[u8; 32]>, b: &[u8], room_id: &[u8; 32]) -> Option<[u8; 32]> {
     if b.len() != CLASSICAL_SEALED {
-        let plain = crate::pq::open(PQ_CONTEXT, room_id, member_secret, Some(&member_kem_seed(member_secret)), b)?;
+        let plain = open_hybrid(PQ_CONTEXT, member_secret, kem_secret, room_id, b)?;
         return plain.as_slice().try_into().ok();
     }
     let eph_pub: [u8; 32] = b[..32].try_into().ok()?;
@@ -291,7 +308,7 @@ pub fn rekey(admin_seed: &[u8; 32], room_id: &[u8; 32], epoch: u64, new_secret: 
 }
 
 /// Member: (epoch, new secret) if the admin included me.
-pub fn accept_rekey(room_id: &[u8; 32], signed: &[u8], my_member_secret: &[u8; 32]) -> Option<(u64, [u8; 32])> {
+pub fn accept_rekey(room_id: &[u8; 32], signed: &[u8], my_member_secret: &[u8; 32], kem_secret: Option<&[u8; 32]>) -> Option<(u64, [u8; 32])> {
     let env = Envelope::decode_verified(signed).ok()?;
     if env.kind != KIND_ROOM_REKEY || room_id_for(&env.author) != *room_id {
         return None;
@@ -302,7 +319,7 @@ pub fn accept_rekey(room_id: &[u8; 32], signed: &[u8], my_member_secret: &[u8; 3
     }
     let mine = member_pub(my_member_secret);
     let (_, sealed) = body.entries.iter().find(|(m, _)| *m == mine)?;
-    Some((body.epoch, open_secret(my_member_secret, sealed, room_id)?))
+    Some((body.epoch, open_secret(my_member_secret, kem_secret, sealed, room_id)?))
 }
 
 /// Link to buy access to a paid room: the creator's follow link (to pay
@@ -428,6 +445,7 @@ pub fn hello(
     room_id: &[u8; 32],
     name: &str,
     member_secret: &[u8; 32],
+    kem_secret: &[u8; 32],
     session: &GroupSession,
     members: &[[u8; 32]],
 ) -> RoomBlob {
@@ -439,7 +457,7 @@ pub fn hello(
         member_pub: member_pub(member_secret),
         session_key: session.session_key().to_bytes(),
         macs: Vec::new(),
-        member_kem: Some(member_kem_public(member_secret)),
+        member_kem: Some(member_kem_public(kem_secret)),
     };
     let body = hello_body(&h);
     let id_secret = x25519_dalek::StaticSecret::from(identity.to_scalar_bytes());
@@ -548,16 +566,37 @@ pub fn new_room() -> ([u8; 32], [u8; 32]) {
 mod tests {
     use super::*;
 
+    /// Tests give each member an ML-KEM secret derived from its X25519 one.
+    fn kem(member_secret: &[u8; 32]) -> [u8; 32] {
+        blake3::derive_key("test member kem", member_secret)
+    }
+
     #[test]
     fn room_reports_open_only_for_the_admin_and_moderators() {
         let room_id = [3u8; 32];
         let admin = crate::random_bytes::<32>();
         let other = crate::random_bytes::<32>();
         let r = RoomReport { session_id: "s".into(), index: 4, category: "violence".into(), note: "".into(), text: "bad".into(), minute: 1 };
-        let sealed = seal_report(&member_pub(&admin), &member_kem_public(&admin), &room_id, &r).unwrap();
-        assert_eq!(open_report(&admin, &room_id, &sealed), Some(r));
-        assert!(open_report(&other, &room_id, &sealed).is_none(), "another member can't read it");
-        assert!(open_report(&admin, &[4u8; 32], &sealed).is_none(), "another room");
+        let sealed = seal_report(&member_pub(&admin), &member_kem_public(&kem(&admin)), &room_id, &r).unwrap();
+        assert_eq!(open_report(&admin, Some(&kem(&admin)), &room_id, &sealed), Some(r));
+        assert!(open_report(&other, Some(&kem(&other)), &room_id, &sealed).is_none(), "another member can't read it");
+        assert!(open_report(&admin, Some(&kem(&admin)), &[4u8; 32], &sealed).is_none(), "another room");
+    }
+
+    #[test]
+    fn a_member_ml_kem_key_does_not_come_from_the_x25519_secret() {
+        let room_id = [3u8; 32];
+        let member = crate::random_bytes::<32>();
+        let k = kem(&member);
+        assert_ne!(member_kem_public(&k), crate::pq::kem_public(&legacy_member_kem_seed(&member)));
+        let secret = crate::random_bytes::<32>();
+        // Sealed to the new key: the X25519 secret alone doesn't open it.
+        let sealed = seal_secret_to(&member_pub(&member), Some(&member_kem_public(&k)), &secret, &room_id);
+        assert!(open_secret(&member, None, &sealed, &room_id).is_none());
+        assert_eq!(open_secret(&member, Some(&k), &sealed, &room_id), Some(secret));
+        // Sealed to the key members announced before: still opens.
+        let old = seal_secret_to(&member_pub(&member), Some(&crate::pq::kem_public(&legacy_member_kem_seed(&member))), &secret, &room_id);
+        assert_eq!(open_secret(&member, Some(&k), &old, &room_id), Some(secret));
     }
 
     #[test]
@@ -570,7 +609,7 @@ mod tests {
 
         // Alice says hello to the members she knows (Bob) and sends.
         let a_member = crate::random_bytes::<32>();
-        let h = seal_blob(&secret, &hello(&alice, &room_id, "Alice", &a_member, &a_out, &[member_pub(&bob_member)]));
+        let h = seal_blob(&secret, &hello(&alice, &room_id, "Alice", &a_member, &kem(&a_member), &a_out, &[member_pub(&bob_member)]));
         let msg = seal_blob(&secret, &encrypt_message(&mut a_out, &RoomPayload { text: "hello room".into(), minute: 5, from: None, lamport: 0, app: None }));
         assert!(!msg.windows(10).any(|w| w == b"hello room"));
 
@@ -618,11 +657,11 @@ mod tests {
         let (a, b) = (crate::random_bytes::<32>(), crate::random_bytes::<32>());
         let new_secret = crate::random_bytes::<32>();
         let RoomBlob::Rekey { signed } = rekey(&admin, &room_id, 2, &new_secret, &[member_pub(&a)]) else { panic!() };
-        assert_eq!(accept_rekey(&room_id, &signed, &a), Some((2, new_secret)));
-        assert!(accept_rekey(&room_id, &signed, &b).is_none()); // removed
+        assert_eq!(accept_rekey(&room_id, &signed, &a, None), Some((2, new_secret)));
+        assert!(accept_rekey(&room_id, &signed, &b, None).is_none()); // removed
         // Only the admin key can rekey.
         let RoomBlob::Rekey { signed: forged } = rekey(&crate::random_bytes::<32>(), &room_id, 3, &new_secret, &[member_pub(&a)]) else { panic!() };
-        assert!(accept_rekey(&room_id, &forged, &a).is_none());
+        assert!(accept_rekey(&room_id, &forged, &a, None).is_none());
     }
 
     #[test]
@@ -640,17 +679,17 @@ mod tests {
         assert_eq!(AskLink::parse(&l.to_text()), Some(l.clone()));
         assert!(!l.to_text().contains(&b32(&secret)), "an ask link never holds the room secret");
         let member = crate::random_bytes::<32>();
-        let req = JoinRequest { room_id, from: [1; 32], name: "Ana".into(), note: "hi".into(), member_pub: member_pub(&member), reply: [8; 32], member_kem: Some(member_kem_public(&member)) };
+        let req = JoinRequest { room_id, from: [1; 32], name: "Ana".into(), note: "hi".into(), member_pub: member_pub(&member), reply: [8; 32], member_kem: Some(member_kem_public(&kem(&member))) };
         let RoomBlob::Answer { sealed: Some(sealed), .. } = answer(&room_id, &req, Some(&secret), 3) else { panic!() };
-        assert_eq!(open_answer(&room_id, &sealed, &member), Some(secret));
-        assert!(open_answer(&room_id, &sealed, &crate::random_bytes::<32>()).is_none());
+        assert_eq!(open_answer(&room_id, &sealed, &member, Some(&kem(&member))), Some(secret));
+        assert!(open_answer(&room_id, &sealed, &crate::random_bytes::<32>(), None).is_none());
         assert_ne!(req.id(), req.reply);
         assert!(sealed.len() > CLASSICAL_SEALED, "sealed post-quantum");
         // An older requester without an ML-KEM key still gets a classical answer.
         let old = JoinRequest { member_kem: None, ..req };
         let RoomBlob::Answer { sealed: Some(c), .. } = answer(&room_id, &old, Some(&secret), 3) else { panic!() };
         assert_eq!(c.len(), CLASSICAL_SEALED);
-        assert_eq!(open_answer(&room_id, &c, &member), Some(secret));
+        assert_eq!(open_answer(&room_id, &c, &member, None), Some(secret));
     }
 
     #[test]

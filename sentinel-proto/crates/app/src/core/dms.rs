@@ -83,7 +83,7 @@ fn my_intro_card(account: &Account, st: &DmState, pillar: &str) -> ContactCard {
         inbox_ids: dm::upcoming_inbox_ids(&st.fetch_secret),
         pillar: pillar.to_owned(),
         minute: social::coarse_minute(),
-        inbox_kem: Some(dm::inbox_kem_public(&st.inbox_secret)),
+        inbox_kem: Some(dm::inbox_kem_public(&st.fetch_secret)),
     }
 }
 
@@ -99,7 +99,7 @@ impl Core {
             return Ok(());
         }
         let mut account = load_account(&key, &st)?;
-        let card = dm::make_card(&mut account, dm::inbox_public(&st.inbox_secret), Some(dm::inbox_kem_public(&st.inbox_secret)), st.fetch_secret, pillar.clone());
+        let card = dm::make_card(&mut account, dm::inbox_public(&st.inbox_secret), Some(dm::inbox_kem_public(&st.fetch_secret)), st.fetch_secret, pillar.clone());
         let feed_key = store.feed_key.context("no feed key")?;
         let env = social::card_envelope(&key, &feed_key, &card).map_err(|e| anyhow!(e))?;
         let pickled = account.pickle().encrypt(&pickle_key(&key));
@@ -246,7 +246,7 @@ impl Core {
                     pillar: my_pillar.clone(),
                     inbox_pub: dm::inbox_public(&st.inbox_secret),
                     inbox_ids: dm::upcoming_inbox_ids(&st.fetch_secret),
-                    inbox_kem: Some(dm::inbox_kem_public(&st.inbox_secret)),
+                    inbox_kem: Some(dm::inbox_kem_public(&st.fetch_secret)),
                 }),
                 credits: if own || out.iter().any(|o| targets.iter().any(|t| t.olm_identity == o.olm)) { Vec::new() } else { credits.clone() },
                 purchase: if own || out.iter().any(|o| targets.iter().any(|t| t.olm_identity == o.olm)) { None } else { purchase.clone() },
@@ -466,7 +466,7 @@ impl Core {
     pub(super) fn receive_blob(&self, key: &super::Keys, blob: &[u8]) -> Result<bool> {
         let (_, store) = self.unlocked()?;
         let st = store.dm.clone().context("no messaging keys")?;
-        let Some((sender, msg)) = dm::unseal(&st.inbox_secret, blob) else { return Ok(false) };
+        let Some((sender, msg)) = dm::unseal(&st.inbox_secret, &st.fetch_secret, blob) else { return Ok(false) };
         let peer = hex(&sender);
         let mut account = load_account(key, &st)?;
         let existing = st.sessions.get(&peer).and_then(|p| load_session(key, p));

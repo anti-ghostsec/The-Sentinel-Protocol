@@ -342,13 +342,24 @@ pub fn kem_period(day: u64) -> u64 {
 /// Periods of inbox ML-KEM keys still opened (a card can be a while old).
 const KEM_PERIODS_KEPT: u64 = 4;
 
-pub fn inbox_kem_seed(inbox_secret: &[u8; 32], period: u64) -> zeroize::Zeroizing<[u8; 64]> {
+/// The inbox ML-KEM key for `period`. It comes from the fetch secret,
+/// which never leaves this device, and not from the inbox X25519 secret:
+/// that one's public half is in every card, so whoever can break X25519
+/// would get the ML-KEM key with it and the hybrid would protect nothing.
+pub fn inbox_kem_seed(fetch_secret: &[u8; 32], period: u64) -> zeroize::Zeroizing<[u8; 64]> {
+    let root = zeroize::Zeroizing::new(blake3::derive_key("sentinel/v1/inbox-kem-secret", fetch_secret));
+    crate::pq::kem_seed_from("sentinel/v1/inbox-kem", &root, period)
+}
+
+/// The ML-KEM key cards carried before `inbox_kem_seed` (derived from the
+/// inbox X25519 secret). Still opened, for messages sealed to old cards.
+fn legacy_inbox_kem_seed(inbox_secret: &[u8; 32], period: u64) -> zeroize::Zeroizing<[u8; 64]> {
     crate::pq::kem_seed_from("sentinel/v0/inbox-kem", inbox_secret, period)
 }
 
 /// This period's inbox ML-KEM key (for my card).
-pub fn inbox_kem_public(inbox_secret: &[u8; 32]) -> Vec<u8> {
-    crate::pq::kem_public(&inbox_kem_seed(inbox_secret, kem_period(today())))
+pub fn inbox_kem_public(fetch_secret: &[u8; 32]) -> Vec<u8> {
+    crate::pq::kem_public(&inbox_kem_seed(fetch_secret, kem_period(today())))
 }
 
 pub fn make_card(account: &mut Account, inbox_pub: [u8; 32], inbox_kem: Option<Vec<u8>>, fetch_secret: [u8; 32], pillar: String) -> ContactCard {
@@ -446,7 +457,7 @@ fn sealed_key(shared: &[u8; 32], eph_pub: &[u8; 32], recipient: &[u8; 32]) -> [u
 }
 
 /// Remove the sealed-sender layer: (sender's Olm identity, Olm message).
-pub fn unseal(inbox_secret: &[u8; 32], blob: &[u8]) -> Option<([u8; 32], OlmMessage)> {
+pub fn unseal(inbox_secret: &[u8; 32], fetch_secret: &[u8; 32], blob: &[u8]) -> Option<([u8; 32], OlmMessage)> {
     if blob.len() < 32 + 24 + 16 || blob.len() > MAX_BLOB {
         return None;
     }
@@ -458,7 +469,10 @@ pub fn unseal(inbox_secret: &[u8; 32], blob: &[u8]) -> Option<([u8; 32], OlmMess
         let now = kem_period(today());
         (0..KEM_PERIODS_KEPT)
             .filter_map(|back| now.checked_sub(back))
-            .find_map(|p| crate::pq::open(PQ_SEAL, my_pub.as_bytes(), inbox_secret, Some(&inbox_kem_seed(inbox_secret, p)), blob))?
+            .find_map(|p| {
+                crate::pq::open(PQ_SEAL, my_pub.as_bytes(), inbox_secret, Some(&inbox_kem_seed(fetch_secret, p)), blob)
+                    .or_else(|| crate::pq::open(PQ_SEAL, my_pub.as_bytes(), inbox_secret, Some(&legacy_inbox_kem_seed(inbox_secret, p)), blob))
+            })?
     } else {
         let eph_pub: [u8; 32] = blob[..32].try_into().ok()?;
         let shared = secret.diffie_hellman(&PublicKey::from(eph_pub));
@@ -529,12 +543,44 @@ mod tests {
         }
     }
 
+    /// Tests keep each party's fetch secret derivable from its inbox secret.
+    fn fetch_of(inbox_secret: &[u8; 32]) -> [u8; 32] {
+        blake3::derive_key("test fetch secret", inbox_secret)
+    }
+
     fn party(pillar: &str) -> (ed25519_dalek::SigningKey, Account, [u8; 32], ContactCard) {
         let key = crate::identity::generate();
         let mut acc = Account::new();
         let inbox_secret = crate::random_bytes::<32>();
-        let card = make_card(&mut acc, inbox_public(&inbox_secret), Some(inbox_kem_public(&inbox_secret)), crate::random_bytes::<32>(), pillar.into());
+        let fetch = fetch_of(&inbox_secret);
+        let card = make_card(&mut acc, inbox_public(&inbox_secret), Some(inbox_kem_public(&fetch)), fetch, pillar.into());
         (key, acc, inbox_secret, card)
+    }
+
+    #[test]
+    fn the_inbox_ml_kem_key_does_not_come_from_the_x25519_secret() {
+        let (a_key, a_acc, _, a_card) = party("a.onion");
+        let (_, mut b_acc, b_inbox, mut b_card) = party("b.onion");
+        // Knowing the inbox X25519 secret alone gives a different ML-KEM key.
+        let period = kem_period(today());
+        assert_ne!(b_card.inbox_kem.as_deref(), Some(crate::pq::kem_public(&legacy_inbox_kem_seed(&b_inbox, period)).as_slice()));
+        assert_ne!(b_card.inbox_kem.as_deref(), Some(crate::pq::kem_public(&inbox_kem_seed(&b_inbox, period)).as_slice()));
+        // A card from before still works: its key is opened as a fallback.
+        b_card.inbox_kem = Some(crate::pq::kem_public(&legacy_inbox_kem_seed(&b_inbox, period)));
+        let mut sess = outbound_session(&a_acc, &b_card).unwrap();
+        let blob = encrypt(&a_acc, &mut sess, &first(&a_key, "old card", &a_card, &b_card.inbox_pub), &b_card).unwrap();
+        assert_eq!(u16::from_le_bytes([blob[32], blob[33]]) as usize, crate::pq::KEM_CT);
+        let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
+        assert_eq!(decrypt(&mut b_acc, None, sender, &msg).unwrap().1.text, "old card");
+        // Without the fetch secret, the X25519 secret alone opens nothing new.
+        let blob = encrypt(&a_acc, &mut sess, &first(&a_key, "new card", &a_card, &b_card.inbox_pub), &{
+            let mut c = b_card.clone();
+            c.inbox_kem = Some(inbox_kem_public(&fetch_of(&b_inbox)));
+            c
+        })
+        .unwrap();
+        assert!(unseal(&b_inbox, &[9; 32], &blob).is_none());
+        assert!(unseal(&b_inbox, &fetch_of(&b_inbox), &blob).is_some());
     }
 
     #[test]
@@ -550,7 +596,7 @@ mod tests {
 
         // Post-quantum hybrid sealing (the card has an ML-KEM key).
         assert_eq!(u16::from_le_bytes([blob[32], blob[33]]) as usize, crate::pq::KEM_CT);
-        let (sender, msg) = unseal(&b_inbox, &blob).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
         let (mut b_sess, got) = decrypt(&mut b_acc, None, sender, &msg).unwrap();
         assert_eq!(got.text, "hi bob");
         let a_card_seen = authenticate_first(&got, sender, &b_inbox).expect("sender authenticated");
@@ -567,7 +613,7 @@ mod tests {
         let reply = DmPayload { from: [0; 32], name: "Bob".into(), text: "hey alice".into(), minute: 2, card: None, card_mac: None, reply: None, expire_days: None, credits: Vec::new(), purchase: None, grant: None, circle: None, sync: None, delete: None };
         let blob2 = encrypt(&b_acc, &mut b_sess, &reply, &a_card_seen).unwrap();
         // Alice can't unseal with the wrong inbox secret...
-        assert!(unseal(&b_inbox, &blob2).is_none());
+        assert!(unseal(&b_inbox, &fetch_of(&b_inbox), &blob2).is_none());
     }
 
     #[test]
@@ -579,7 +625,7 @@ mod tests {
         let mut f = first(&a_key, "hi bob", &a_card, &b_card.inbox_pub);
         f.reply = Some(reply_info(&a_card));
         let first_blob = encrypt(&a_acc, &mut a_sess, &f, &b_card).unwrap();
-        let (sender, msg) = unseal(&b_inbox, &first_blob).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &first_blob).unwrap();
         let (mut b_sess, got) = decrypt(&mut b_acc, None, sender, &msg).unwrap();
         assert_eq!(got.text, "hi bob");
         let mut r = f.clone();
@@ -607,7 +653,7 @@ mod tests {
         b_card.inbox_kem = None; // an older app
         let mut sess = outbound_session(&a_acc, &b_card).unwrap();
         let blob = encrypt(&a_acc, &mut sess, &first(&a_key, "hi", &a_card, &b_card.inbox_pub), &b_card).unwrap();
-        let (sender, msg) = unseal(&b_inbox, &blob).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
         assert_eq!(decrypt(&mut b_acc, None, sender, &msg).unwrap().1.text, "hi");
     }
 
@@ -621,7 +667,7 @@ mod tests {
         let mut forged = first(&mallory_key, "send money", &a_card, &b_card.inbox_pub);
         forged.from = a_key.verifying_key().to_bytes();
         let blob = encrypt(&a_acc, &mut sess, &forged, &b_card).unwrap();
-        let (sender, msg) = unseal(&b_inbox, &blob).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
         let (_, got) = decrypt(&mut b_acc, None, sender, &msg).unwrap();
         assert!(authenticate_first(&got, sender, &b_inbox).is_none());
     }

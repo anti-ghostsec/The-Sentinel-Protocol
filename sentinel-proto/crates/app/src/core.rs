@@ -1038,9 +1038,15 @@ impl Core {
         let stale: Vec<String> = store.rooms.iter().filter(|r| r.admin.is_none() && r.info_version == 0).map(|r| format!("{}|", r.pillar)).collect();
         let rescan = !stale.is_empty();
         store.mail_cursors.retain(|k, _| !stale.iter().any(|p| k.starts_with(p)));
-        let missing_room_keys = store.rooms.iter().any(|r| r.member_secret.is_none());
+        let missing_room_keys = store.rooms.iter().any(|r| r.member_secret.is_none() || r.member_kem_secret.is_none());
         for r in store.rooms.iter_mut().filter(|r| r.member_secret.is_none()) {
             r.member_secret = Some(sentinel_core::random_bytes::<32>());
+            r.needs_hello = true;
+        }
+        // Rooms joined while the ML-KEM key came from the X25519 secret: a
+        // key of its own, announced in the next hello.
+        for r in store.rooms.iter_mut().filter(|r| r.member_kem_secret.is_none()) {
+            r.member_kem_secret = Some(sentinel_core::random_bytes::<32>());
             r.needs_hello = true;
         }
         let migrated = wallet::migrate(&mut store);

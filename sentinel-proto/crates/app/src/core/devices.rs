@@ -238,7 +238,7 @@ impl Core {
         let (key, store) = self.unlocked()?;
         let st = store.dm.clone().context("no messaging keys")?;
         let mut account = super::dms::load_account_pub(&key, &st)?;
-        let card = sentinel_core::dm::make_card(&mut account, sentinel_core::dm::inbox_public(&st.inbox_secret), Some(sentinel_core::dm::inbox_kem_public(&st.inbox_secret)), st.fetch_secret, code.pillar.clone());
+        let card = sentinel_core::dm::make_card(&mut account, sentinel_core::dm::inbox_public(&st.inbox_secret), Some(sentinel_core::dm::inbox_kem_public(&st.fetch_secret)), st.fetch_secret, code.pillar.clone());
         let answer_secret = sentinel_core::random_bytes::<32>();
         let kem = sentinel_core::pq::kem_seed();
         let request = LinkRequest {

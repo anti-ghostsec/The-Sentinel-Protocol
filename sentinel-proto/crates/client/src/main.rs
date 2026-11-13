@@ -693,13 +693,14 @@ async fn bench(pillar: &str, rounds: usize, fresh: usize) -> Result<()> {
 const APP_SYNC_SECS: f64 = 90.0;
 
 /// One throwaway party: identity, Olm account, inbox secret, contact card.
-fn bench_party(pillar: &str) -> (SigningKey, vodozemac::olm::Account, [u8; 32], sentinel_core::social::ContactCard) {
+fn bench_party(pillar: &str) -> (SigningKey, vodozemac::olm::Account, ([u8; 32], [u8; 32]), sentinel_core::social::ContactCard) {
     use sentinel_core::dm;
     let key = identity::generate();
     let mut acc = vodozemac::olm::Account::new();
     let inbox_secret = sentinel_core::random_bytes::<32>();
-    let card = dm::make_card(&mut acc, dm::inbox_public(&inbox_secret), Some(dm::inbox_kem_public(&inbox_secret)), sentinel_core::random_bytes::<32>(), pillar.to_owned());
-    (key, acc, inbox_secret, card)
+    let fetch_secret = sentinel_core::random_bytes::<32>();
+    let card = dm::make_card(&mut acc, dm::inbox_public(&inbox_secret), Some(dm::inbox_kem_public(&fetch_secret)), fetch_secret, pillar.to_owned());
+    (key, acc, (inbox_secret, fetch_secret), card)
 }
 
 /// Sender to receiver through one Pillar, as the app does it: the sender
@@ -827,7 +828,7 @@ async fn msg_bench(pillar: &str, messages: usize, bits: u8) -> Result<()> {
         let mut found = false;
         for (seq, b) in &blobs {
             after = after.max(*seq);
-            let Some((sender, msg)) = dm::unseal(&b_inbox, b) else { continue };
+            let Some((sender, msg)) = dm::unseal(&b_inbox.0, &b_inbox.1, b) else { continue };
             if let Some((sess, p)) = dm::decrypt(&mut b_acc, b_sess.take(), sender, &msg) {
                 b_sess = Some(sess);
                 found |= p.text == text;
