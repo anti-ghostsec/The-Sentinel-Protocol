@@ -1505,10 +1505,12 @@ impl Core {
         // Messages first: they're what people wait on. The steps don't
         // depend on each other, so they run at the same time (each on its
         // own circuits), and a slow one doesn't hold up the rest.
-        let (sent, _, paid, mail) = tokio::join!(self.retry_dms(), self.room_maintenance(), self.process_payments(app), self.poll_mail());
-        if sent.unwrap_or(0) > 0 {
-            let _ = app.emit("messages", ());
-        }
+        let retried = async {
+            if self.retry_dms().await.unwrap_or(0) > 0 {
+                let _ = app.emit("messages", ());
+            }
+        };
+        let (_, _, paid, mail) = tokio::join!(retried, self.room_maintenance(), self.process_payments(app), self.poll_mail());
         if paid.unwrap_or(0) > 0 {
             let _ = app.emit("rooms", ());
             let _ = app.emit("status", ());
@@ -1522,18 +1524,26 @@ impl Core {
                 let _ = app.emit("rooms", ());
             }
         }
-        let (_, _, _, flushed, refreshed, discovered, count, _, rewards) = tokio::join!(
+        let (_, _, _, _, refreshed, discovered, count, _, rewards) = tokio::join!(
             self.publish_profile(),
             self.publish_card(),
             self.publish_prekeys(),
-            self.flush_outbox(),
+            // Repainted as soon as posts go out, not when the slowest of
+            // these steps is done (that left posts showing as sending).
+            async {
+                let n = self.flush_outbox().await;
+                if n > 0 {
+                    let _ = app.emit("timeline", ());
+                }
+                n
+            },
             self.refresh(),
             self.discover(),
             self.fetch_follower_count(),
             self.refresh_archives(),
             self.collect_rewards(),
         );
-        if flushed > 0 || refreshed.unwrap_or(0) > 0 {
+        if refreshed.unwrap_or(0) > 0 {
             let _ = app.emit("timeline", ());
         }
         if discovered.unwrap_or(0) > 0 {
