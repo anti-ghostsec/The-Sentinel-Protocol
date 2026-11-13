@@ -61,7 +61,17 @@ pub struct MemberInfo {
     /// Their room-only ML-KEM key (new room keys are sealed to it post-quantum).
     #[serde(default)]
     pub kem: Option<Vec<u8>>,
+    /// When their hello first reached me (minutes since 1970): unverified
+    /// entries are dropped after a day.
+    #[serde(default)]
+    pub first: u64,
 }
+
+/// Members remembered per room (a member could otherwise post hellos with
+/// endless made-up keys and grow everyone's store).
+const MAX_MEMBERS: usize = 1000;
+/// Hellos sent in reply to new members, at most once per this many minutes.
+const HELLO_REPLY_MINUTES: u64 = 60;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RoomMsg {
@@ -155,6 +165,12 @@ pub struct RoomState {
     /// A member appeared that my last hello didn't cover.
     #[serde(default)]
     pub needs_hello: bool,
+    /// New members appeared: a hello is owed, sent at most once an hour.
+    #[serde(default)]
+    pub member_hello: bool,
+    /// When I last sent a hello (minutes since 1970).
+    #[serde(default)]
+    pub hello_minute: u64,
     /// Paid rooms: price in credits.
     #[serde(default)]
     pub price: u32,
@@ -248,6 +264,20 @@ pub struct RoomState {
     /// answers to join requests, so requesters can check them).
     #[serde(default)]
     pub mod_proof: Vec<u8>,
+    /// Admin: the ask root was made after ask links stopped carrying it
+    /// (older links let anyone holding one read every request).
+    #[serde(default)]
+    pub ask_sealed: bool,
+    /// Moderator actions signed at an earlier log position than this are
+    /// refused (an Unban, or a moderator removed, came after them).
+    #[serde(default)]
+    pub mod_floor: u64,
+}
+
+/// Is `secret` one of this room's ask boxes (the one sealed requests use,
+/// or the older one keyed by the root itself)?
+fn is_ask_box(x: &RoomState, secret: &[u8; 32]) -> bool {
+    x.ask.is_some_and(|a| a == *secret || room::ask_box(&a) == *secret)
 }
 
 /// Admin: note a member key let in (see `RoomState::admitted`).
@@ -377,6 +407,8 @@ fn new_state(room_id: [u8; 32], secret: [u8; 32], pillar: String, name: String, 
         hello_covers: Vec::new(),
         // Say hello on joining, so members can verify me before I post.
         needs_hello: true,
+        member_hello: false,
+        hello_minute: 0,
         price: 0,
         paid: HashMap::new(),
         epoch: 0,
@@ -406,6 +438,8 @@ fn new_state(room_id: [u8; 32], secret: [u8; 32], pillar: String, name: String, 
         reports: Vec::new(),
         admitted: None,
         mod_proof: Vec::new(),
+        ask_sealed: true,
+        mod_floor: 0,
     }
 }
 
@@ -433,8 +467,8 @@ fn apply_mods(x: &mut RoomState, mods: Vec<Moderator>, approval: bool) {
 }
 
 /// A moderator action, sealed for a box.
-fn mod_blob(box_secret: &[u8; 32], seed: &[u8; 32], room_id: &[u8; 32], action: ModAction) -> Vec<u8> {
-    room::seal_blob(box_secret, &RoomBlob::Mod { signed: room_auth::sign_mod(seed, room_id, action) })
+fn mod_blob(box_secret: &[u8; 32], seed: &[u8; 32], room_id: &[u8; 32], seq: u64, action: ModAction) -> Vec<u8> {
+    room::seal_blob(box_secret, &RoomBlob::Mod { signed: room_auth::sign_mod(seed, room_id, seq, action) })
 }
 
 /// Admin: a new ask key (an ex-moderator knew the old one), resealed to
@@ -584,7 +618,9 @@ impl Core {
             reply,
             member_kem: Some(room::member_kem_public(&st.member_kem_secret.unwrap_or_default())),
         };
-        st.queue.push(Queued { sealed: room::seal_blob(&l.ask, &RoomBlob::Ask(req)), nonce: 0, secret: Some(l.ask) });
+        // Sealed to the approvers when the link allows (older links: as is).
+        let blob = room::seal_request(&l, &req).unwrap_or(RoomBlob::Ask(req));
+        st.queue.push(Queued { sealed: room::seal_blob(&l.ask, &blob), nonce: 0, secret: Some(l.ask) });
         let id = hex(&l.room_id);
         self.update(|s| s.rooms.push(st))?;
         let core = Arc::clone(self);
@@ -622,7 +658,8 @@ impl Core {
         let req = r.requests.iter().find(|q| hex(&q.id()) == request).cloned().context("That request was already answered.")?;
         let proof = if r.admin.is_some() { Vec::new() } else { r.mod_proof.clone() };
         let ans = room::answer(&r.room_id, &req, approve.then_some(&r.secret), r.epoch, &signer, proof);
-        let handled = mod_blob(&ask, &signer, &r.room_id, ModAction::Handled { request: req.id(), admitted: approve.then_some(req.member_pub) });
+        let ask = room::ask_box(&ask);
+        let handled = mod_blob(&ask, &signer, &r.room_id, r.auth.seq, ModAction::Handled { request: req.id(), admitted: approve.then_some(req.member_pub) });
         self.update(|s| {
             if let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == r.room_id) {
                 if approve && x.admin.is_some() {
@@ -768,7 +805,7 @@ impl Core {
         // and moderators only.
         if r.approval && r.access == "free" {
             let ask = r.ask.context("This room needs approval to join: only its admin and moderators can share the link.")?;
-            return Ok(AskLink { room_id: r.room_id, pillar: r.pillar.clone(), ask, name: r.name.clone() }.to_text());
+            return Ok(room::ask_link(&r.room_id, &r.pillar, &ask, &r.name).to_text());
         }
         if r.admin.is_some() && r.access != "free" {
             let creator = self.status().link.context("Connect first.")?;
@@ -928,7 +965,7 @@ impl Core {
             return self.update(|s| {
                 if let Some(x) = s.rooms.iter_mut().find(|x| hex(&x.room_id) == id) {
                     for k in keys {
-                        x.queue.push(Queued { sealed: mod_blob(&x.secret, &seed, &x.room_id, ModAction::Ban { member: k }), nonce: 0, secret: Some(x.secret) });
+                        x.queue.push(Queued { sealed: mod_blob(&x.secret, &seed, &x.room_id, x.auth.seq, ModAction::Ban { member: k }), nonce: 0, secret: Some(x.secret) });
                         if !x.banned.contains(&k) {
                             x.banned.push(k);
                         }
@@ -1052,7 +1089,7 @@ impl Core {
                         ok = true;
                     }
                 } else if let Some(seed) = x.my_mod {
-                    let b = mod_blob(&x.secret, &seed, &x.room_id, ModAction::Hide { session_id: session.clone(), index });
+                    let b = mod_blob(&x.secret, &seed, &x.room_id, x.auth.seq, ModAction::Hide { session_id: session.clone(), index });
                     x.queue.push(Queued { sealed: b, nonce: 0, secret: Some(x.secret) });
                     x.redacted.push((session.clone(), index));
                     ok = true;
@@ -1289,6 +1326,8 @@ impl Core {
                     x.announced = true;
                     x.hello_covers = covers;
                     x.needs_hello = false;
+                    x.member_hello = false;
+                    x.hello_minute = social::coarse_minute();
                 }
                 x.queue.push(Queued { sealed: msg, nonce, secret: Some(r.secret) });
                 x.lamport = x.lamport.max(lamport);
@@ -1319,7 +1358,8 @@ impl Core {
     fn queue_hello_if_needed(&self, room_id: &[u8; 32]) -> Result<()> {
         let (key, store) = self.unlocked()?;
         let Some(r) = store.rooms.iter().find(|r| r.room_id == *room_id).cloned() else { return Ok(()) };
-        if !r.needs_hello || r.waiting {
+        let reply_due = r.member_hello && social::coarse_minute().saturating_sub(r.hello_minute) >= HELLO_REPLY_MINUTES;
+        if !(r.needs_hello || reply_due) || r.waiting {
             return Ok(());
         }
         let session = match r.outbound.as_deref().and_then(|p| load_group(&key, p)) {
@@ -1337,6 +1377,8 @@ impl Core {
                 x.queue.push(Queued { sealed: blob, nonce: 0, secret: Some(r.secret) });
                 x.hello_covers = covers;
                 x.needs_hello = false;
+                x.member_hello = false;
+                x.hello_minute = social::coarse_minute();
                 x.announced_day = today;
                 x.announced = true;
             }
@@ -1352,6 +1394,21 @@ impl Core {
             if r.waiting {
                 let _ = self.flush_room_queue(&r.room_id).await; // my request
                 continue;
+            }
+            // Approval rooms from before sealed requests: a new ask root
+            // once (old links carried the old one, which opens requests);
+            // old links stop working and the link must be shared again.
+            if r.admin.is_some() && r.approval && !r.ask_sealed {
+                self.update(|s| {
+                    if let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == r.room_id) {
+                        rotate_ask(x);
+                        x.ask_sealed = true;
+                        let action = Action::Moderators { mods: x.mods.clone(), approval: x.approval };
+                        if let Some(b) = admin_entry(x, action) {
+                            x.queue.push(Queued { sealed: b, nonce: 0, secret: Some(x.secret) });
+                        }
+                    }
+                })?;
             }
             // Members a moderator banned: remove them fully (new keys).
             if r.admin.is_some() && !r.pending_bans.is_empty() {
@@ -1417,6 +1474,26 @@ impl Core {
         Ok(self.poll_mail().await?.1)
     }
 
+    /// After reading everything on a Pillar: apply the newest checkpoint or
+    /// rekey still waiting in each room's Authority Log (a resync jump is
+    /// only taken once every entry posted before it has been seen).
+    pub(super) fn settle_rooms(&self, pillar: &str) -> Result<()> {
+        let mut rescan = Vec::new();
+        self.update(|s| {
+            for x in s.rooms.iter_mut().filter(|x| x.pillar == pillar) {
+                let room_id = x.room_id;
+                let entries = x.auth.settle(&room_id);
+                if let Some(p) = apply_authority(x, &room_id, entries) {
+                    rescan.push(p);
+                }
+            }
+        })?;
+        for p in rescan {
+            self.rescan_pillar(&p);
+        }
+        Ok(())
+    }
+
     pub(super) fn apply_room_blob(&self, key: &super::Keys, room_id: &[u8; 32], secret: &[u8; 32], bytes: &[u8]) -> Result<bool> {
         let Some(blob) = room::open_blob(secret, bytes) else { return Ok(false) };
         let me = social::author_text(&key.verifying_key().to_bytes());
@@ -1429,7 +1506,7 @@ impl Core {
                 }
                 self.update(|s| {
                     if let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == *room_id) {
-                        if info.version >= x.info_version {
+                        if info.version > x.info_version {
                             x.name = info.name.chars().take(60).collect();
                             x.visibility = info.visibility;
                             x.access = info.access;
@@ -1463,90 +1540,8 @@ impl Core {
                 let mut rescan = None;
                 self.update(|s| {
                     let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == *room_id) else { return };
-                    let this_seq = room_auth::verify(room_id, &signed).map(|(e, _)| e.seq);
-                    for e in x.auth.offer(room_id, &signed) {
-                        // Keep the entry that names me a moderator, as proof
-                        // for my answers to join requests.
-                        let names_me = |x: &RoomState| x.my_mod.is_some_and(|seed| {
-                            let key = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-                            x.mods.iter().any(|m| m.key == key)
-                        });
-                        let from_this = this_seq == Some(e.seq);
-                        match e.action {
-                            Action::Moderators { mods, approval } => {
-                                if x.admin.is_none() {
-                                    apply_mods(x, mods, approval);
-                                    if from_this && names_me(x) {
-                                        x.mod_proof = signed.clone();
-                                    }
-                                }
-                            }
-                            Action::Checkpoint { name, visibility, access, banned, redacted, mods, approval, apps, admin_member, .. } => {
-                                if admin_member.is_some() {
-                                    x.admin_member = admin_member;
-                                }
-                                if matches!(visibility.as_str(), "public" | "private") && matches!(access.as_str(), "free" | "pass" | "membership") {
-                                    x.name = name.chars().take(60).collect();
-                                    x.visibility = visibility;
-                                    x.access = access;
-                                }
-                                if x.admin.is_none() {
-                                    x.apps.set_list(apps);
-                                    apply_mods(x, mods, approval);
-                                    if from_this && names_me(x) {
-                                        x.mod_proof = signed.clone();
-                                    }
-                                    x.banned = banned;
-                                    for r in redacted {
-                                        if !x.redacted.contains(&r) {
-                                            x.redacted.push(r);
-                                        }
-                                    }
-                                }
-                            }
-                            Action::Apps { apps } => {
-                                if x.admin.is_none() {
-                                    x.apps.set_list(apps);
-                                }
-                            }
-                            Action::Details { name, visibility, access } => {
-                                if matches!(visibility.as_str(), "public" | "private") && matches!(access.as_str(), "free" | "pass" | "membership") {
-                                    x.name = name.chars().take(60).collect();
-                                    x.visibility = visibility;
-                                    x.access = access;
-                                }
-                            }
-                            Action::Ban { member } => {
-                                if !x.banned.contains(&member) {
-                                    x.banned.push(member);
-                                }
-                            }
-                            Action::Unban { member } => x.banned.retain(|m| *m != member),
-                            Action::Redact { session_id, index } => {
-                                if !x.redacted.iter().any(|(s, i)| *s == session_id && *i == index) {
-                                    x.redacted.push((session_id, index));
-                                }
-                            }
-                            Action::Rekey { epoch, entries, cut } => {
-                                if x.admin.is_some() || epoch <= x.epoch {
-                                    continue;
-                                }
-                                // Drop old-epoch messages beyond the cut (no back-dating).
-                                let old = x.epoch;
-                                x.messages.retain(|m| m.mine || m.epoch != old || m.session.is_empty() || !room_auth::beyond_cut(&cut, &m.session, m.index));
-                                if let Some(new_secret) = room_auth::open_rekey(room_id, &entries, &x.member_secret.unwrap_or_default(), x.member_kem_secret.as_ref()) {
-                                    x.secret = new_secret;
-                                    x.epoch = epoch;
-                                    x.needs_hello = true;
-                                    x.cursors.clear();
-                                    x.outbound = None;
-                                    x.outbound_id = None;
-                                    x.seen_max.clear();
-                                    rescan = Some(x.pillar.clone());
-                                }
-                            }
-                        }
-                    }
+                    let entries = x.auth.offer_signed(room_id, &signed);
+                    rescan = apply_authority(x, room_id, entries);
                 })?;
                 if let Some(p) = rescan {
                     self.rescan_pillar(&p);
@@ -1557,7 +1552,10 @@ impl Core {
                 self.update(|s| {
                     let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == *room_id) else { return };
                     let Some((_, e)) = room_auth::verify_mod(room_id, &x.mods, &signed) else { return };
-                    if x.mod_seen.contains(&e.id) {
+                    // Signed before an Unban or a moderator change: no longer
+                    // counts. Far ahead of the log: not yet (left unseen so a
+                    // later read can apply it).
+                    if e.seq < x.mod_floor || e.seq > x.auth.seq + 16 || x.mod_seen.contains(&e.id) {
                         return;
                     }
                     x.mod_seen.push(e.id);
@@ -1572,8 +1570,8 @@ impl Core {
                             }
                         }
                         ModAction::Ban { member } if in_room => {
-                            // Moderators can't ban each other.
-                            if x.mods.iter().any(|m| m.member == member) {
+                            // Moderators can't ban each other, or the admin.
+                            if x.mods.iter().any(|m| m.member == member) || (x.admin.is_none() && x.admin_member == Some(member)) {
                                 return;
                             }
                             if x.admin.is_some() {
@@ -1590,7 +1588,7 @@ impl Core {
                                 x.banned.push(member);
                             }
                         }
-                        ModAction::Handled { request, admitted } if Some(*secret) == x.ask => {
+                        ModAction::Handled { request, admitted } if is_ask_box(x, secret) => {
                             x.requests.retain(|q| q.id() != request);
                             if let (Some(k), true) = (admitted, x.admin.is_some()) {
                                 admit(x, k);
@@ -1601,11 +1599,22 @@ impl Core {
                 })?;
                 Ok(false)
             }
-            RoomBlob::Ask(req) => {
+            ask_blob @ (RoomBlob::Ask(_) | RoomBlob::AskSealed { .. }) => {
                 self.update(|s| {
                     let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == *room_id) else { return };
                     let approver = x.admin.is_some() || x.my_mod.is_some();
-                    if !approver || x.ask != Some(*secret) || req.room_id != *room_id || !req.valid() {
+                    if !approver || !is_ask_box(x, secret) {
+                        return;
+                    }
+                    let req = match &ask_blob {
+                        RoomBlob::Ask(req) => req.clone(),
+                        RoomBlob::AskSealed { sealed } => match x.ask.and_then(|a| room::open_request(&a, room_id, sealed)) {
+                            Some(r) => r,
+                            None => return,
+                        },
+                        _ => return,
+                    };
+                    if req.room_id != *room_id || !req.valid() {
                         return;
                     }
                     if x.removed.contains(&social::author_text(&req.from)) || x.requests.iter().any(|q| q.reply == req.reply) || x.requests.len() >= MAX_REQUESTS {
@@ -1711,14 +1720,29 @@ impl Core {
                         // Keyed by (member key, identity): nobody can claim
                         // someone else's key away from them.
                         let key = format!("{}:{}", hex(&h.member_pub), author);
-                        let entry = x.members.entry(key).or_insert(MemberInfo { author: author.clone(), name: name.clone(), verified: false, kem: None });
+                        let now = social::coarse_minute();
+                        if !x.members.contains_key(&key) {
+                            // Unverified entries older than a day go; when
+                            // still full, the oldest unverified one makes room.
+                            x.members.retain(|_, m| m.verified || m.first == 0 || now.saturating_sub(m.first) < 24 * 60);
+                            if x.members.len() >= MAX_MEMBERS {
+                                let oldest = x.members.iter().filter(|(_, m)| !m.verified).min_by_key(|(_, m)| m.first).map(|(k, _)| k.clone());
+                                match oldest {
+                                    Some(k) => {
+                                        x.members.remove(&k);
+                                    }
+                                    None => return,
+                                }
+                            }
+                        }
+                        let entry = x.members.entry(key).or_insert(MemberInfo { author: author.clone(), name: name.clone(), verified: false, kem: None, first: now });
                         if h.member_kem.is_some() {
                             entry.kem = h.member_kem.clone();
                         }
                         entry.name = name.clone();
                         entry.verified |= verified;
                         if !x.hello_covers.contains(&h.member_pub) && x.members.len() <= 500 {
-                            x.needs_hello = true; // let them verify me too
+                            x.member_hello = true; // let them verify me too (rate-limited)
                         }
                         // A session belongs to the first identity that claimed
                         // it; a later valid MAC from that identity verifies it.
@@ -1727,6 +1751,13 @@ impl Core {
                         let shown = if verified { name.clone() } else { handle_of(&author) };
                         let e = x.inbound.entry(sid.clone()).or_insert(InboundEntry { pickle, author: author.clone(), name: shown.clone(), verified, member: Some(h.member_pub) });
                         let same = e.author == author && e.member == Some(h.member_pub);
+                        let sid_kept = sid.clone();
+                        if x.inbound.len() > 4 * MAX_MEMBERS {
+                            // Sessions of unverified keys no longer remembered go.
+                            let known: std::collections::HashSet<[u8; 32]> = x.members.keys().filter_map(|k| member_key(k)).collect();
+                            x.inbound.retain(|k, e| *k == sid_kept || e.verified || e.member.is_some_and(|m| known.contains(&m)));
+                        }
+                        let Some(e) = x.inbound.get_mut(&sid) else { return };
                         if same && (verified || !e.verified) {
                             e.name = shown;
                             e.verified |= verified;
@@ -1809,6 +1840,107 @@ impl Core {
             }
         }
     }
+}
+
+/// Apply authority entries (from the log, in order) to my copy of the room.
+/// Returns the Pillar to read again when a rekey gave me a new secret.
+fn apply_authority(x: &mut RoomState, room_id: &[u8; 32], entries: Vec<(room_auth::Entry, Vec<u8>)>) -> Option<String> {
+    let mut rescan = None;
+    // Keep the entry that names me a moderator, as proof for my answers to
+    // join requests.
+    let names_me = |x: &RoomState| {
+        x.my_mod.is_some_and(|seed| {
+            let key = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+            x.mods.iter().any(|m| m.key == key)
+        })
+    };
+    for (e, signed) in entries {
+        let seq = e.seq;
+        match e.action {
+            Action::Moderators { mods, approval } => {
+                // Someone stopped being a moderator: their earlier actions
+                // (which anyone could re-post) stop counting.
+                if x.mods.iter().any(|old| !mods.iter().any(|m| m.key == old.key)) {
+                    x.mod_floor = x.mod_floor.max(seq);
+                }
+                if x.admin.is_none() {
+                    apply_mods(x, mods, approval);
+                    if names_me(x) {
+                        x.mod_proof = signed.clone();
+                    }
+                }
+            }
+            Action::Checkpoint { name, visibility, access, banned, redacted, mods, approval, apps, admin_member, .. } => {
+                if admin_member.is_some() {
+                    x.admin_member = admin_member;
+                }
+                if matches!(visibility.as_str(), "public" | "private") && matches!(access.as_str(), "free" | "pass" | "membership") {
+                    x.name = name.chars().take(60).collect();
+                    x.visibility = visibility;
+                    x.access = access;
+                }
+                if x.admin.is_none() {
+                    x.apps.set_list(apps);
+                    apply_mods(x, mods, approval);
+                    if names_me(x) {
+                        x.mod_proof = signed.clone();
+                    }
+                    x.banned = banned;
+                    for r in redacted {
+                        if !x.redacted.contains(&r) {
+                            x.redacted.push(r);
+                        }
+                    }
+                }
+            }
+            Action::Apps { apps } => {
+                if x.admin.is_none() {
+                    x.apps.set_list(apps);
+                }
+            }
+            Action::Details { name, visibility, access } => {
+                if matches!(visibility.as_str(), "public" | "private") && matches!(access.as_str(), "free" | "pass" | "membership") {
+                    x.name = name.chars().take(60).collect();
+                    x.visibility = visibility;
+                    x.access = access;
+                }
+            }
+            Action::Ban { member } => {
+                if !x.banned.contains(&member) {
+                    x.banned.push(member);
+                }
+            }
+            Action::Unban { member } => {
+                x.banned.retain(|m| *m != member);
+                // Moderator bans signed before this don't count any more.
+                x.mod_floor = x.mod_floor.max(seq);
+            }
+            Action::Redact { session_id, index } => {
+                if !x.redacted.iter().any(|(s, i)| *s == session_id && *i == index) {
+                    x.redacted.push((session_id, index));
+                }
+            }
+            Action::Rekey { epoch, entries, cut } => {
+                if x.admin.is_some() || epoch <= x.epoch {
+                    continue;
+                }
+                // Drop old-epoch messages beyond the cut (no back-dating).
+                let old = x.epoch;
+                x.messages.retain(|m| m.mine || m.epoch != old || m.session.is_empty() || !room_auth::beyond_cut(&cut, &m.session, m.index));
+                if let Some(new_secret) = room_auth::open_rekey(room_id, &entries, &x.member_secret.unwrap_or_default(), x.member_kem_secret.as_ref()) {
+                    x.secret = new_secret;
+                    x.epoch = epoch;
+                    x.needs_hello = true;
+                    x.cursors.clear();
+                    x.outbound = None;
+                    x.outbound_id = None;
+                    x.seen_max.clear();
+                    rescan = Some(x.pillar.clone());
+                }
+            }
+        }
+    }
+    rescan
 }
 
 fn load_group(key: &super::Keys, p: &str) -> Option<GroupSession> {

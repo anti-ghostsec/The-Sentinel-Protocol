@@ -95,9 +95,12 @@ pub enum RoomBlob {
     /// A moderator's action (or the admin's note that a request was
     /// handled), signed with their room-only key (see `room_auth::ModEntry`).
     Mod { signed: Vec<u8> },
-    /// A request to join an approval room. Sealed with the room's *ask*
-    /// key and left in the ask box, which only the admin and moderators read.
+    /// A request to join an approval room, unsealed inside the ask box
+    /// (older links: anyone with the link could read these).
     Ask(JoinRequest),
+    /// A request to join, sealed to the approvers' key ([`seal_request`]):
+    /// someone with the ask link can leave one but not read anyone's.
+    AskSealed { sealed: Vec<u8> },
     /// The answer to a request, left in the requester's reply box: the room
     /// secret sealed to the room-only key they sent, or nothing (declined).
     /// `signed`: by the admin key, or by a moderator's key with `proof`, the
@@ -247,32 +250,80 @@ pub fn open_answer(room_id: &[u8; 32], sealed: &[u8], my_member_secret: &[u8; 32
     open_secret(my_member_secret, kem_secret, sealed, room_id)
 }
 
-/// `sentinel://ask/<room_id>@<pillar-host>#<ask key>/<name>`: asks to join
-/// an approval room. It never carries the room secret.
+/// `sentinel://ask/<room_id>@<pillar-host>#<ask box key>.<approvers' key>/<name>`:
+/// asks to join an approval room. It never carries the room secret, nor
+/// anything that opens other people's requests.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AskLink {
     pub room_id: [u8; 32],
     pub pillar: String,
+    /// The ask box key.
     pub ask: [u8; 32],
+    /// The approvers' public key requests are sealed to (None: an older
+    /// link, whose requests anyone with the link can read).
+    pub seal: Option<[u8; 32]>,
     pub name: String,
+}
+
+/// Approval rooms: the admin and moderators hold the *ask root*; the link
+/// carries only what's derived from it for askers: the box key and a
+/// public key.
+pub fn ask_box(root: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("sentinel/v1/room-ask-box", root)
+}
+
+fn ask_seal_secret(root: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("sentinel/v1/room-ask-seal", root)
+}
+
+pub fn ask_seal_public(root: &[u8; 32]) -> [u8; 32] {
+    *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(ask_seal_secret(root))).as_bytes()
+}
+
+/// The ask link for a room whose approvers hold `root`.
+pub fn ask_link(room_id: &[u8; 32], pillar: &str, root: &[u8; 32], name: &str) -> AskLink {
+    AskLink { room_id: *room_id, pillar: pillar.to_owned(), ask: ask_box(root), seal: Some(ask_seal_public(root)), name: name.to_owned() }
+}
+
+const ASK_CONTEXT: &str = "sentinel/v1/room-ask";
+
+/// Asker: a request sealed to the approvers. Classical (X25519) only: an
+/// ML-KEM key would make the link too long to share.
+pub fn seal_request(link: &AskLink, req: &JoinRequest) -> Option<RoomBlob> {
+    let seal = link.seal?;
+    Some(RoomBlob::AskSealed { sealed: crate::pq::seal(ASK_CONTEXT, &link.room_id, &seal, None, &cbor(req))? })
+}
+
+/// Approver: open a sealed request.
+pub fn open_request(root: &[u8; 32], room_id: &[u8; 32], sealed: &[u8]) -> Option<JoinRequest> {
+    let plain = crate::pq::open(ASK_CONTEXT, room_id, &ask_seal_secret(root), None, sealed)?;
+    ciborium::from_reader(plain.as_slice()).ok()
 }
 
 impl AskLink {
     pub fn to_text(&self) -> String {
-        format!("sentinel://ask/{}@{}#{}/{}", b32(&self.room_id), self.pillar.trim_end_matches(".onion"), b32(&self.ask), b32(self.name.as_bytes()))
+        let key = match &self.seal {
+            Some(s) => format!("{}.{}", b32(&self.ask), b32(s)),
+            None => b32(&self.ask),
+        };
+        format!("sentinel://ask/{}@{}#{}/{}", b32(&self.room_id), self.pillar.trim_end_matches(".onion"), key, b32(self.name.as_bytes()))
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         let rest = s.trim().strip_prefix("sentinel://ask/")?;
         let (rest, tail) = rest.split_once('#')?;
-        let (ask, name) = tail.split_once('/')?;
+        let (key, name) = tail.split_once('/')?;
+        let (ask, seal) = match key.split_once('.') {
+            Some((a, s)) => (a, Some(from_b32(s)?)),
+            None => (key, None),
+        };
         let (id, host) = rest.split_once('@')?;
         let host = host.trim_end_matches(".onion").to_ascii_lowercase();
         if host.len() != 56 || !host.bytes().all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c)) {
             return None;
         }
         let name = data_encoding::BASE32_NOPAD.decode(name.to_uppercase().as_bytes()).ok().and_then(|v| String::from_utf8(v).ok())?;
-        Some(AskLink { room_id: from_b32(id)?, pillar: format!("{host}.onion"), ask: from_b32(ask)?, name: name.chars().take(60).collect() })
+        Some(AskLink { room_id: from_b32(id)?, pillar: format!("{host}.onion"), ask: from_b32(ask)?, seal, name: name.chars().take(60).collect() })
     }
 }
 
@@ -741,9 +792,13 @@ mod tests {
         let (_, secret) = new_room();
         let admin = [21u8; 32];
         let room_id = room_id_for(&ed25519_dalek::SigningKey::from_bytes(&admin).verifying_key().to_bytes());
-        let l = AskLink { room_id, pillar: format!("{}.onion", "d".repeat(56)), ask: [5; 32], name: "Quiet Garden".into() };
+        let old = AskLink { room_id, pillar: format!("{}.onion", "d".repeat(56)), ask: [5; 32], seal: None, name: "Quiet Garden".into() };
+        assert_eq!(AskLink::parse(&old.to_text()), Some(old.clone()));
+        let root = [6u8; 32];
+        let l = ask_link(&room_id, &old.pillar, &root, "Quiet Garden");
         assert_eq!(AskLink::parse(&l.to_text()), Some(l.clone()));
         assert!(!l.to_text().contains(&b32(&secret)), "an ask link never holds the room secret");
+        assert!(!l.to_text().contains(&b32(&root)), "nor the approvers' root");
         let member = crate::random_bytes::<32>();
         let req = JoinRequest { room_id, from: [1; 32], name: "Ana".into(), note: "hi".into(), member_pub: member_pub(&member), reply: [8; 32], member_kem: Some(member_kem_public(&kem(&member))) };
         let RoomBlob::Answer { sealed: Some(sealed), signed, proof, .. } = answer(&room_id, &req, Some(&secret), 3, &admin, Vec::new()) else { panic!() };
@@ -767,6 +822,11 @@ mod tests {
         assert!(!answer_genuine(&room_id, &req.reply, &mp, &s3, 3, &by_mod, &[]));
         assert!(open_answer(&room_id, &sealed, &crate::random_bytes::<32>(), None).is_none());
         assert_ne!(req.id(), req.reply);
+        // Sealed to the approvers: they open it, someone with the link can't.
+        let Some(RoomBlob::AskSealed { sealed: s }) = seal_request(&l, &req) else { panic!() };
+        assert_eq!(open_request(&root, &room_id, &s), Some(req.clone()));
+        assert!(open_request(&l.ask, &room_id, &s).is_none());
+        assert!(open_request(&[7; 32], &room_id, &s).is_none());
         assert!(sealed.len() > CLASSICAL_SEALED, "sealed post-quantum");
         // An older requester without an ML-KEM key still gets a classical answer.
         let old = JoinRequest { member_kem: None, ..req };

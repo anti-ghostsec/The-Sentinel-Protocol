@@ -684,6 +684,7 @@ impl Core {
         }
         let session_p = session.pickle().encrypt(&pickle_key(key));
         let account_p = account.pickle().encrypt(&pickle_key(key));
+        let peer_delete_mine = store.privacy.peer_delete_mine;
         self.update(|s| {
             if let Some(d) = s.dm.as_mut() {
                 d.sessions.insert(peer.clone(), session_p);
@@ -739,11 +740,14 @@ impl Core {
                 s.incoming_grants.push((owner.clone(), g.clone()));
             }
             // They asked my app to delete messages of our conversation.
+            // Unless I allowed it, only their own messages go: nobody can
+            // erase what I sent them (threats, say) from my device.
             if let Some(d) = &payload.delete {
+                let mine_too = peer_delete_mine;
                 if d.all {
-                    c.messages.retain(|m| m.mine && !m.sent); // (mine still being sent stay)
+                    c.messages.retain(|m| m.mine && (!m.sent || !mine_too)); // (mine still being sent stay)
                 } else {
-                    c.messages.retain(|m| !d.keys.contains(&dm::message_key(m.minute, &m.text)));
+                    c.messages.retain(|m| (m.mine && !mine_too) || !d.keys.contains(&dm::message_key(m.minute, &m.text)));
                 }
             }
             // The same message may also arrive passed on by my other device.

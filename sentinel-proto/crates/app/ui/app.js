@@ -2746,6 +2746,7 @@ const PRIVACY = [
   ["screenSecurity", "Screen security", "Blocks screenshots, screen recording, screen sharing and Windows Recall from capturing this window."],
   ["autoLock", "Lock when I step away", "Locks Sentinel after 15 minutes without use (5 minutes in High-risk mode), so a computer left open doesn't stay readable."],
   ["mix", "Mix my messages", "Messages and room posts travel through two other Pillars, each holding them for a random time (usually a minute or two, up to ten) before passing them on. Someone watching the whole network can't match when you send with when it arrives. Slower; always on in High-risk mode."],
+  ["peerDeleteMine", "Let contacts delete my messages here", "When someone deletes a conversation for both of you, their app can also remove the messages you sent from this device. Off: only their own messages go, so what you sent stays on your device."],
   ["showCount", "Show my follower count", "Counts come from anonymous notices; nobody can see who follows you either way."],
   ["highRisk", "High-risk mode", "Keeps your posts out of Discover, stops follow notices, sends posts after a random 2–20 minute delay, adds background cover traffic so activity bursts don't show when you read or post, never keeps viewed media on disk, and turns off running a Pillar."],
 ];

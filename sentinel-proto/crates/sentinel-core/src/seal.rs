@@ -68,9 +68,35 @@ struct Inner {
     /// ML-DSA-65 signature by the author's account (empty in old objects).
     #[serde(default, with = "serde_bytes_vec")]
     pq: Vec<u8>,
+    /// ML-DSA-65 signature that also covers the discovery shards, so a
+    /// quantum forger can't re-file an old object under new outer fields
+    /// (empty in older objects, which only carry `pq`).
+    #[serde(default, with = "serde_bytes_vec")]
+    pq2: Vec<u8>,
+}
+
+/// An object's post-quantum signatures, as found inside it.
+#[derive(Clone, Debug, Default)]
+pub struct PqSigs {
+    /// Over (author, kind, body).
+    pub v1: Vec<u8>,
+    /// Over (author, kind, body, shards).
+    pub v2: Vec<u8>,
+    /// The outer shards the object was filed under.
+    pub shards: Vec<u16>,
 }
 
 const PQ_CTX: &[u8] = b"sentinel/v0/sealed";
+const PQ_CTX2: &[u8] = b"sentinel/v1/sealed";
+
+fn pq_message2(author: &[u8; 32], kind: &str, body: &[u8], shards: &[u16]) -> Vec<u8> {
+    let mut m = pq_message(author, kind, body);
+    m.extend_from_slice(&(shards.len() as u32).to_be_bytes());
+    for s in shards {
+        m.extend_from_slice(&s.to_be_bytes());
+    }
+    m
+}
 
 fn pq_message(author: &[u8; 32], kind: &str, body: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(48 + kind.len() + body.len());
@@ -84,8 +110,13 @@ fn pq_message(author: &[u8; 32], kind: &str, body: &[u8]) -> Vec<u8> {
 
 /// Check an object's post-quantum signature against the author's pinned
 /// ML-DSA-65 key.
-pub fn verify_pq(author: &[u8; 32], kind: &str, body: &[u8], sig: &[u8], dsa_public: &[u8]) -> bool {
-    !sig.is_empty() && crate::pq::dsa_verify(dsa_public, &pq_message(author, kind, body), PQ_CTX, sig)
+/// An object carrying the newer signature is held to it (and so to its
+/// shards); older objects only to the first.
+pub fn verify_pq(author: &[u8; 32], kind: &str, body: &[u8], sigs: &PqSigs, dsa_public: &[u8]) -> bool {
+    if !sigs.v2.is_empty() {
+        return crate::pq::dsa_verify(dsa_public, &pq_message2(author, kind, body, &sigs.shards), PQ_CTX2, &sigs.v2);
+    }
+    !sigs.v1.is_empty() && crate::pq::dsa_verify(dsa_public, &pq_message(author, kind, body), PQ_CTX, &sigs.v1)
 }
 
 pub fn topic_key(topic: &str) -> [u8; 32] {
@@ -113,8 +144,11 @@ pub fn seal(author: &SigningKey, kind: &str, body: Vec<u8>, readers: &[[u8; 32]]
         return Err("bad reader count");
     }
     let content_key = crate::random_bytes::<32>();
-    let pq = crate::pq::dsa_sign(&crate::pq::identity_dsa_seed(author), &pq_message(&author.verifying_key().to_bytes(), kind, &body), PQ_CTX).unwrap_or_default();
-    let mut inner = Inner { kind: kind.to_owned(), body, pad: Vec::new(), pq };
+    let dsa = crate::pq::identity_dsa_seed(author);
+    let me = author.verifying_key().to_bytes();
+    let pq = crate::pq::dsa_sign(&dsa, &pq_message(&me, kind, &body), PQ_CTX).unwrap_or_default();
+    let pq2 = crate::pq::dsa_sign(&dsa, &pq_message2(&me, kind, &body, &shards), PQ_CTX2).unwrap_or_default();
+    let mut inner = Inner { kind: kind.to_owned(), body, pad: Vec::new(), pq, pq2 };
     let unpadded = cbor(&inner).len();
     let target = unpadded.div_ceil(PAD) * PAD + PAD;
     inner.pad = vec![0u8; target.saturating_sub(unpadded + 3)];
@@ -163,7 +197,7 @@ pub fn open_pinned(env: &Envelope, candidates: &[[u8; 32]], pinned: Option<&[u8]
 }
 
 /// (kind, body, post-quantum signature).
-pub fn open_full(env: &Envelope, candidates: &[[u8; 32]]) -> Option<(String, Vec<u8>, Vec<u8>)> {
+pub fn open_full(env: &Envelope, candidates: &[[u8; 32]]) -> Option<(String, Vec<u8>, PqSigs)> {
     let sealed = sealed_body(env)?;
     let nonce = XNonce::from_slice(sealed.nonce.get(..24)?);
     for k in candidates {
@@ -175,7 +209,7 @@ pub fn open_full(env: &Envelope, candidates: &[[u8; 32]]) -> Option<(String, Vec
             let Ok(ck): Result<[u8; 32], _> = ck.try_into() else { continue };
             let Ok(plain) = aead(&ck).decrypt(nonce, sealed.ct.as_slice()) else { continue };
             let inner: Inner = ciborium::from_reader(plain.as_slice()).ok()?;
-            return Some((inner.kind, inner.body, inner.pq));
+            return Some((inner.kind, inner.body, PqSigs { v1: inner.pq, v2: inner.pq2, shards: sealed.shards }));
         }
     }
     None
@@ -229,6 +263,22 @@ mod tests {
         assert!(open_pinned(&forged, &[feed], Some(&pin)).is_none());
         // Without a pin (not followed), it opens as before.
         assert!(open_pinned(&env, &[feed], None).is_some());
+    }
+
+    #[test]
+    fn post_quantum_signature_covers_shards() {
+        let author = crate::identity::generate();
+        let feed = crate::random_bytes::<32>();
+        let pin = crate::pq::identity_dsa_public(&author);
+        let env = seal(&author, "post", b"hi".to_vec(), &[feed], vec![3]).unwrap();
+        assert!(open_pinned(&env, &[feed], Some(&pin)).is_some());
+        // Re-filed under other shards (the outer signature re-made, as a
+        // quantum forger could): the inner signature no longer matches.
+        let mut body = sealed_body(&env).unwrap();
+        body.shards = vec![9];
+        let refiled = Envelope::sign(&author, KIND_SEALED, cbor(&body));
+        assert!(open(&refiled, &[feed]).is_some());
+        assert!(open_pinned(&refiled, &[feed], Some(&pin)).is_none());
     }
 
     #[test]

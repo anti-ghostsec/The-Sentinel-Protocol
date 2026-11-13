@@ -1408,10 +1408,10 @@ async fn fetch_bundle<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(c
     use sentinel_core::update as up;
     use tokio::io::AsyncWriteExt;
     let Response::Update { prefix, size } = exchange(s, &Request::UpdateInfo { product: product.into() }).await? else { return Ok(()) };
-    let (h, _) = up::read_header(&prefix)?;
+    let (h, start) = up::read_header(&prefix)?;
     let mine = carried_version(dir, product).await.unwrap_or_else(|| "0.0.0".into());
     let keys = up::release_keys();
-    if size > up::MAX_BUNDLE || up::verify_header(&h, &keys, product, &h.manifest.platform.clone(), &mine).is_err() {
+    if size > up::MAX_BUNDLE || size != up::bundle_len(&h, start) || up::verify_header(&h, &keys, product, &h.manifest.platform.clone(), &mine).is_err() {
         return Ok(()); // not newer than mine (or not genuine)
     }
     let id = up::manifest_id(&h.manifest);

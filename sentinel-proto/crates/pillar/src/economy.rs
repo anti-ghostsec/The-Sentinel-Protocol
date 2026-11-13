@@ -10,6 +10,10 @@
 //! **Earned class**: the mint seeds each Archive with *filler* chunks it can
 //! regenerate from a secret seed (so the mint stores nothing), challenges
 //! random ones over isolated circuits, and pays Archives that keep passing.
+//! Each day a fixed pool ([`ARCHIVE_POOL_DAILY`]) is shared among them by
+//! the filler they hold: many small Archives on one machine earn what one
+//! Archive holding the same amount would, and the total doesn't grow with
+//! the number of onion addresses.
 //! Rewards are delivered by the mint connecting to the Archive's own onion,
 //! so only its operator receives them; the mint learns which onion earned,
 //! never who runs it.
@@ -39,10 +43,18 @@ use sentinel_core::{media, pow};
 
 use super::{exchange, Ctx};
 
-/// Filler chunks the mint keeps on each Archive (verifies real storage).
-const FILLER_TARGET: u64 = 32;
-/// Most credits one Archive earns per day.
+/// Most filler chunks (1 MiB each) one mint keeps on an Archive: grown a
+/// few at a time while the Archive accepts them; rewards follow it.
+const FILLER_MAX: u64 = 256;
+/// Most credits handed over in one reward exchange.
 const MAX_DAILY_REWARD: u32 = 3;
+/// Credits one mint shares out among all Archives per day.
+pub const ARCHIVE_POOL_DAILY: f64 = 100.0;
+/// Most of a day's pool one Archive can get (what can be handed over in a
+/// day: the Archive checks at most 8 reward offers a day per mint).
+const MAX_SHARE: u32 = 8 * MAX_DAILY_REWARD;
+/// Most credits one Archive can be owed (a week of the most it can be paid).
+const MAX_OWED: u32 = 7 * 8 * MAX_DAILY_REWARD;
 /// The last key period in which old (blind, not quantum-safe) tokens were
 /// issued (October 2026). Only those can still be traded in.
 const LAST_V1_EPOCH: u32 = 115;
@@ -53,6 +65,30 @@ struct FillerState {
     passes: u32,
     fails: u32,
     last_reward_day: u64,
+    /// Last day it passed a check with no failures (in the running for
+    /// that day's pool).
+    #[serde(default)]
+    good_day: u64,
+    /// Credits from the pool not handed over yet.
+    #[serde(default)]
+    owed: u32,
+}
+
+/// One day's pool shared by filler held: (onion, credits). Fractions are
+/// rounded at random, so small Archives earn now and then rather than never.
+fn archive_shares(weights: &[(String, u64)], pool: f64, coin: impl Fn() -> f64) -> Vec<(String, u32)> {
+    let total: u64 = weights.iter().map(|(_, w)| w).sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    weights
+        .iter()
+        .map(|(o, w)| {
+            let x = pool * *w as f64 / total as f64;
+            (o.clone(), (x.floor() as u32 + u32::from(coin() < x.fract())).min(MAX_SHARE))
+        })
+        .filter(|(_, n)| *n > 0)
+        .collect()
 }
 
 pub struct MintState {
@@ -293,10 +329,22 @@ impl MintState {
                 return false;
             }
         }
-        for (e, n) in seen {
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(spent_path(store, e)) {
-                let _ = std::io::Write::write_all(&mut f, &n);
+        // On disk first (a tag only in memory would be spendable again after
+        // a restart): if it can't be written, the payment fails.
+        let mut by_epoch: HashMap<u32, Vec<u8>> = HashMap::new();
+        for (e, n) in &seen {
+            by_epoch.entry(*e).or_default().extend_from_slice(n);
+        }
+        for (e, bytes) in &by_epoch {
+            let wrote = std::fs::OpenOptions::new().create(true).append(true).open(spent_path(store, *e)).and_then(|mut f| {
+                std::io::Write::write_all(&mut f, bytes)?;
+                f.sync_data()
+            });
+            if wrote.is_err() {
+                return false;
             }
+        }
+        for (e, n) in seen {
             spent.entry(e).or_default().insert(n);
             self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(e).or_default().1 += 1;
         }
@@ -388,6 +436,17 @@ impl MintState {
         let mut sd = self.share_day.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if *sd >= today {
             return;
+        }
+        // Archives: yesterday's pool, by filler held among those that passed.
+        {
+            let mut archives = self.archives.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let weights: Vec<(String, u64)> = archives.iter().filter(|(_, a)| a.good_day + 1 >= today && a.fails == 0).map(|(o, a)| (o.clone(), a.count)).collect();
+            let coin = || u64::from_le_bytes(sentinel_core::random_bytes::<8>()) as f64 / u64::MAX as f64;
+            for (onion, n) in archive_shares(&weights, ARCHIVE_POOL_DAILY, coin) {
+                if let Some(a) = archives.get_mut(&onion) {
+                    a.owed = (a.owed + n).min(MAX_OWED);
+                }
+            }
         }
         let mut pillars = self.pillars.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for s in pillars.values_mut() {
@@ -608,10 +667,17 @@ async fn take_payment(ctx: &Ctx, bundles: &[credits::Bundle]) -> Result<()> {
 }
 
 async fn pin(ctx: &Ctx, addrs: &[[u8; 32]], months: u32, bundles: &[credits::Bundle]) -> Result<u64> {
-    if addrs.is_empty() || addrs.len() > 100_000 || !(1..=24).contains(&months) {
+    if addrs.is_empty() || addrs.len() > 20_000 || !(1..=24).contains(&months) {
         bail!("bad pin request");
     }
-    let held: Vec<&[u8; 32]> = addrs.iter().filter(|a| ctx.store.join("chunks").join(Address(**a).to_text()).is_file()).collect();
+    // Cheap check before touching the disk: a payment of a possible size,
+    // and the disk checks run off the request thread.
+    if bundles.is_empty() || bundles.len() > credits::MAX_BATCH {
+        bail!("bad pin request");
+    }
+    let (dir, list) = (ctx.store.join("chunks"), addrs.to_vec());
+    let held: Vec<[u8; 32]> = tokio::task::spawn_blocking(move || list.into_iter().filter(|a| dir.join(Address(*a).to_text()).is_file()).collect()).await?;
+    let held: Vec<&[u8; 32]> = held.iter().collect();
     let price = credits::pin_price(held.len() as u64 * media::CHUNK_CT as u64, months);
     if (bundles.len() as u64) < price || bundles.len() > credits::MAX_BATCH {
         bail!("this pin costs {price} credits");
@@ -669,7 +735,7 @@ async fn tend_archive(ctx: &Ctx, m: &MintState, onion: &str) -> Result<()> {
     let mut s = ctx.tor.isolated_client().connect((onion, sentinel_net::SENTINEL_PORT)).await?;
     // Top up filler (it is regenerated from the seed, never stored here).
     for _ in 0..4 {
-        if st.count >= FILLER_TARGET {
+        if st.count >= FILLER_MAX {
             break;
         }
         let data = m.filler(onion, st.count);
@@ -688,28 +754,31 @@ async fn tend_archive(ctx: &Ctx, m: &MintState, onion: &str) -> Result<()> {
         let ok = matches!(exchange(&mut s, &Request::Prove { addr: media::address(&data), nonce }).await, Ok(Response::Proof(p)) if p == media::proof(&nonce, &data));
         if ok {
             st.passes += 1;
+            if st.fails == 0 {
+                st.good_day = day();
+            }
         } else {
             st.fails += 1;
             st.count = st.count.min(i); // re-seed from the lost one
         }
     }
-    // Daily reward for Archives with passes and no recent failures.
+    // Hand over what the pool owes it, a few at a time.
     let today = day();
-    if st.last_reward_day < today && st.passes > 0 && st.fails == 0 {
-        let amount = (1 + st.count / 16).min(MAX_DAILY_REWARD as u64) as u32;
+    if st.owed > 0 && st.fails == 0 {
+        let amount = st.owed.min(MAX_DAILY_REWARD);
         if let Response::Commitments(cms) = exchange(&mut s, &Request::RewardOfferPq { count: amount, mint: ctx.self_onion.clone() }).await? {
             if !cms.is_empty() && cms.len() <= MAX_DAILY_REWARD as usize {
                 if let Some((epoch, first)) = m.pq.append(&ctx.store, &cms) {
                     m.count_issued(&ctx.store, epoch, cms.len());
                     if matches!(exchange(&mut s, &Request::RewardAppended { mint: ctx.self_onion.clone(), epoch, first }).await, Ok(Response::Pong)) {
                         st.last_reward_day = today;
-                        st.passes = 0;
+                        st.owed -= cms.len().min(st.owed as usize) as u32;
                     }
                 }
             }
         }
     }
-    if st.last_reward_day + 7 < today {
+    if st.last_reward_day + 7 < today && st.good_day + 7 < today {
         st.fails = 0; // forgive old failures after a quiet week
     }
     m.archives.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(onion.to_owned(), st);
@@ -789,4 +858,24 @@ async fn tend_pillar(ctx: &Ctx, m: &MintState, onion: &str) {
     let passed = matches!(check.await, Ok(true));
     st.record(today, passed);
     m.pillars.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(onion.to_owned(), st);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_archive_pool_follows_storage_not_addresses() {
+        // One Archive with 256 filler chunks, and one machine posing as
+        // eight Archives with 32 each: the same storage, the same credits.
+        let mut w = vec![("big".to_owned(), 256u64)];
+        w.extend((0..8).map(|i| (format!("sybil{i}"), 32u64)));
+        let shares = archive_shares(&w, 64.0, || 0.99);
+        let big = shares.iter().find(|(o, _)| o == "big").unwrap().1;
+        let sybils: u32 = shares.iter().filter(|(o, _)| o.starts_with("sybil")).map(|(_, n)| n).sum();
+        assert_eq!((big, sybils), (24, 32), "big is capped at a day's handover");
+        let total: u32 = archive_shares(&w, ARCHIVE_POOL_DAILY, || 0.0).iter().map(|(_, n)| n).sum();
+        assert!(total as f64 <= ARCHIVE_POOL_DAILY + w.len() as f64, "the pool doesn't grow with addresses");
+        assert!(archive_shares(&[], 10.0, || 0.0).is_empty());
+    }
 }

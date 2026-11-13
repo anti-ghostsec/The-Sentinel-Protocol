@@ -40,10 +40,10 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn append_file(path: &Path, bytes: &[u8]) {
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let _ = std::io::Write::write_all(&mut f, bytes);
-    }
+fn append_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    std::io::Write::write_all(&mut f, bytes)?;
+    f.sync_data()
 }
 
 impl PqLedger {
@@ -81,7 +81,7 @@ impl PqLedger {
         let mut trees = lock(&self.trees);
         let tree = trees.entry(e).or_default();
         let first = tree.push(&digests)? as u64;
-        append_file(&notes_path(store, e), &cms.concat());
+        let _ = append_file(&notes_path(store, e), &cms.concat());
         Some((e, first))
     }
 
@@ -152,10 +152,12 @@ impl PqLedger {
             if nullifiers.iter().any(|n| set.contains(n) || !seen.insert(*n)) {
                 bail!("already spent");
             }
+            // On disk first: a tag only in memory would be spendable again
+            // after a restart.
+            append_file(&spent_path(store, epoch), &nullifiers.concat()).map_err(|e| anyhow::anyhow!("can't record spent notes: {e}"))?;
             for n in &nullifiers {
                 set.insert(*n);
             }
-            append_file(&spent_path(store, epoch), &nullifiers.concat());
         }
         let (e, first) = self.append(store, commitments).ok_or_else(|| anyhow::anyhow!("bad commitments"))?;
         Ok((e, first, nullifiers.len()))

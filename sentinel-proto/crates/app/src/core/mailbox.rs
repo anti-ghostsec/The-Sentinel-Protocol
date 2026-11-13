@@ -132,19 +132,26 @@ impl Core {
                 }
             });
             let fetched = futures::future::join_all(fetches).await;
+            let mut pillar_read = true;
             for (ck, got) in fetched {
                 let Some((pages, complete)) = got else {
                     all_read = false;
+                    pillar_read = false;
                     continue;
                 };
                 all_read &= complete;
+                pillar_read &= complete;
                 seen_here += pages.iter().map(Vec::len).sum::<usize>();
                 let (d, r, rescanned) = self.take_pages(&key, &pillar, &ck, pages)?;
                 dms += d;
                 rooms += r;
                 if rescanned {
+                    pillar_read = false;
                     break;
                 }
+            }
+            if pillar_read {
+                self.settle_rooms(&pillar)?;
             }
             self.observe(&pillar, seen_here);
             self.with(|i| i.mail.last.insert(pillar.clone(), Instant::now()));
@@ -170,6 +177,7 @@ impl Core {
                 // Approval rooms: the admin and moderators also read the ask box.
                 if let Some(ask) = &r.ask {
                     ids.entry(r.pillar.clone()).or_default().push(room::room_box(ask, d).0);
+                    ids.entry(r.pillar.clone()).or_default().push(room::room_box(&room::ask_box(ask), d).0);
                 }
             }
         }
@@ -340,7 +348,8 @@ impl Core {
         }
         if !handled {
             'rooms: for r in store.rooms.iter().filter(|r| r.pillar == pillar) {
-                for secret in std::iter::once(&r.secret).chain(r.ask.iter()) {
+                let ask_boxes: Vec<[u8; 32]> = r.ask.iter().flat_map(|a| [*a, room::ask_box(a)]).collect();
+                for secret in std::iter::once(&r.secret).chain(ask_boxes.iter()) {
                     if room::open_blob(secret, blob).is_some() {
                         handled = true;
                         let n = self.apply_room_blob(key, &r.room_id, secret, blob).unwrap_or(false);

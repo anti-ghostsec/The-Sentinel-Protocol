@@ -108,6 +108,10 @@ pub struct Privacy {
     /// on in High-risk mode).
     #[serde(default)]
     pub mix: bool,
+    /// A contact's "delete for both" may also remove my own messages on this
+    /// device (off: only theirs, so nobody can erase what I sent them).
+    #[serde(default)]
+    pub peer_delete_mine: bool,
 }
 
 fn yes() -> bool {
@@ -116,7 +120,7 @@ fn yes() -> bool {
 
 impl Default for Privacy {
     fn default() -> Self {
-        Privacy { disappearing: true, high_risk: false, screen_security: true, auto_lock: true, mix: false }
+        Privacy { disappearing: true, high_risk: false, screen_security: true, auto_lock: true, mix: false, peer_delete_mine: false }
     }
 }
 
@@ -2584,6 +2588,7 @@ impl Core {
             "screenSecurity" => s.privacy.screen_security = on,
             "autoLock" => s.privacy.auto_lock = on,
             "mix" => s.privacy.mix = on,
+            "peerDeleteMine" => s.privacy.peer_delete_mine = on,
             "highRisk" => {
                 s.privacy.high_risk = on;
                 if on {

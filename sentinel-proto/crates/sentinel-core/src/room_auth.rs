@@ -117,12 +117,17 @@ pub struct ModEntry {
     /// Random: each action applies once (no replays).
     pub id: [u8; 16],
     pub action: ModAction,
+    /// The signer's Authority Log position, so a later Unban (or the signer
+    /// losing moderator rights) cancels a re-posted copy.
+    #[serde(default)]
+    pub seq: u64,
 }
 
-/// A moderator (or the admin, with the admin seed) signs an action.
-pub fn sign_mod(seed: &[u8; 32], room_id: &[u8; 32], action: ModAction) -> Vec<u8> {
+/// A moderator (or the admin, with the admin seed) signs an action, at
+/// Authority Log position `seq`.
+pub fn sign_mod(seed: &[u8; 32], room_id: &[u8; 32], seq: u64, action: ModAction) -> Vec<u8> {
     let k = ed25519_dalek::SigningKey::from_bytes(seed);
-    let e = ModEntry { room_id: *room_id, id: crate::random_bytes::<16>(), action };
+    let e = ModEntry { room_id: *room_id, id: crate::random_bytes::<16>(), action, seq };
     Envelope::sign(&k, MOD_KIND, cbor(&e)).encode().expect("mod entry encodes")
 }
 
@@ -277,22 +282,33 @@ impl Log {
         }
     }
 
+    fn apply(&mut self, e: &Entry, h: [u8; 32]) {
+        self.seq = e.seq;
+        self.head = h;
+        self.note(e.seq, h);
+    }
+
+    /// The very next entry, pointing at my head.
     fn try_apply(&mut self, e: &Entry, h: [u8; 32]) -> bool {
         let next = e.seq == self.seq + 1 && e.prev == self.head;
-        // A resync only bridges a real gap; the very next number must point
-        // at my head (anything else there is a second history).
-        if next || (e.resync() && e.seq > self.seq + 1) {
-            self.seq = e.seq;
-            self.head = h;
-            self.note(e.seq, h);
-            true
-        } else {
-            false
+        if next {
+            self.apply(e, h);
         }
+        next
     }
 
     /// Offer an entry; returns the entries that now apply, in order.
     pub fn offer(&mut self, room_id: &[u8; 32], signed: &[u8]) -> Vec<Entry> {
+        self.offer_signed(room_id, signed).into_iter().map(|(e, _)| e).collect()
+    }
+
+    /// Like [`Self::offer`], with each applied entry's signed bytes.
+    ///
+    /// Only the very next entry applies at once. A checkpoint or rekey
+    /// further ahead (a gap: a new member, or one who was away) waits for
+    /// [`Self::settle`], after the whole box was read: anyone can re-post an
+    /// old checkpoint, and the newest one must win.
+    pub fn offer_signed(&mut self, room_id: &[u8; 32], signed: &[u8]) -> Vec<(Entry, Vec<u8>)> {
         let Some((e, h)) = verify(room_id, signed) else { return Vec::new() };
         if let Some((_, old)) = self.seen.iter().find(|(s, _)| *s == e.seq) {
             if *old != h {
@@ -305,7 +321,7 @@ impl Log {
         }
         let mut out = Vec::new();
         if self.try_apply(&e, h) {
-            out.push(e);
+            out.push((e, signed.to_vec()));
         } else if e.seq == self.seq + 1 {
             // Right number, wrong parent: a second history.
             self.fork = true;
@@ -316,7 +332,31 @@ impl Log {
             }
             return out;
         }
-        // Waiting entries that now fit.
+        self.drain(room_id, &mut out);
+        out
+    }
+
+    /// After a full read: if I'm behind by a gap, jump to the newest
+    /// checkpoint or rekey seen, then apply what follows it.
+    pub fn settle(&mut self, room_id: &[u8; 32]) -> Vec<(Entry, Vec<u8>)> {
+        let mut out = Vec::new();
+        let best = self
+            .pending
+            .iter()
+            .filter_map(|p| verify(room_id, p).map(|(e, h)| (e, h, p.clone())))
+            .filter(|(e, _, _)| e.resync() && e.seq > self.seq + 1)
+            .max_by_key(|(e, _, _)| e.seq);
+        if let Some((e, h, signed)) = best {
+            self.pending.retain(|p| *p != signed);
+            self.apply(&e, h);
+            out.push((e, signed));
+            self.drain(room_id, &mut out);
+        }
+        out
+    }
+
+    /// Waiting entries that now fit.
+    fn drain(&mut self, room_id: &[u8; 32], out: &mut Vec<(Entry, Vec<u8>)>) {
         loop {
             let mut applied = false;
             let pending = std::mem::take(&mut self.pending);
@@ -324,7 +364,7 @@ impl Log {
                 match verify(room_id, &p) {
                     Some((pe, ph)) if pe.seq > self.seq => {
                         if !applied && self.try_apply(&pe, ph) {
-                            out.push(pe);
+                            out.push((pe, p));
                             applied = true;
                         } else {
                             self.pending.push(p);
@@ -337,7 +377,6 @@ impl Log {
                 break;
             }
         }
-        out
     }
 }
 
@@ -427,9 +466,15 @@ mod tests {
         let (room, _, admin) = new_room_with_admin();
         let mut log = Log::default();
         let cp = Action::Checkpoint { name: "n".into(), visibility: "private".into(), access: "free".into(), epoch: 0, banned: vec![], redacted: vec![], mods: vec![], approval: false, apps: vec![], admin_member: None };
-        let (s9, h9) = sign(&admin, &entry(room, 9, [5; 32], cp));
-        // A late joiner starts from a checkpoint.
-        assert_eq!(log.offer(&room, &s9).len(), 1);
+        let (s9, h9) = sign(&admin, &entry(room, 9, [5; 32], cp.clone()));
+        // A late joiner starts from the newest checkpoint seen in a full
+        // read: an old one someone re-posted doesn't win.
+        let (s5, _) = sign(&admin, &entry(room, 5, [4; 32], cp));
+        assert!(log.offer(&room, &s5).is_empty());
+        assert!(log.offer(&room, &s9).is_empty());
+        let got = log.settle(&room);
+        assert_eq!(got.iter().map(|(e, _)| e.seq).collect::<Vec<_>>(), vec![9]);
+        assert!(log.offer(&room, &s5).is_empty() && log.settle(&room).is_empty());
         // A plain entry across a gap waits; a rekey across a gap applies.
         let (s12, _) = sign(&admin, &entry(room, 12, [6; 32], details("x")));
         assert!(log.offer(&room, &s12).is_empty());
@@ -437,7 +482,8 @@ mod tests {
         let secret = crate::random_bytes::<32>();
         let rk = rekey_action(&room, 2, &secret, &[(member_pub(&member), Some(crate::room::member_kem_public(&kem(&member))))], vec![]);
         let (s11, _) = sign(&admin, &entry(room, 11, h9, rk.clone()));
-        let got = log.offer(&room, &s11);
+        assert!(log.offer(&room, &s11).is_empty());
+        let got: Vec<Entry> = log.settle(&room).into_iter().map(|(e, _)| e).collect();
         assert_eq!(got.len(), 1);
         let Action::Rekey { entries, .. } = &got[0].action else { panic!() };
         assert_eq!(open_rekey(&room, entries, &member, Some(&kem(&member))), Some(secret));
@@ -457,11 +503,11 @@ mod tests {
         assert!(my_moderator(&room, &mods, &other, None).is_none());
         // Their actions verify; anyone else's don't; the admin's do.
         let hide = ModAction::Hide { session_id: "s".into(), index: 1 };
-        let signed = sign_mod(&seed, &room, hide.clone());
+        let signed = sign_mod(&seed, &room, 0, hide.clone());
         let (who, e) = verify_mod(&room, &mods, &signed).unwrap();
         assert_eq!((who, e.action), (m.key, hide.clone()));
-        assert!(verify_mod(&room, &mods, &sign_mod(&other, &room, hide.clone())).is_none());
-        assert!(verify_mod(&room, &mods, &sign_mod(&admin, &room, hide.clone())).is_some());
+        assert!(verify_mod(&room, &mods, &sign_mod(&other, &room, 0, hide.clone())).is_none());
+        assert!(verify_mod(&room, &mods, &sign_mod(&admin, &room, 0, hide.clone())).is_some());
         // Removed from the list: refused. Another room: refused.
         assert!(verify_mod(&room, &[], &signed).is_none());
         let (room2, _, _) = new_room_with_admin();

@@ -97,6 +97,9 @@ struct Seen {
     handed: bool,
     #[serde(default)]
     seed: bool,
+    /// The release's version (its header checked out).
+    #[serde(default)]
+    version: String,
 }
 
 fn seen_path() -> Option<PathBuf> {
@@ -145,6 +148,38 @@ fn revocations() -> Vec<update::RevocationDoc> {
         update::merge_revocations(&mut list, update::decode_revocations(&b), &update::release_keys());
     }
     list
+}
+
+/// Remember a genuine release's version.
+fn note_version(id: &[u8; 32], version: &str) {
+    let mut m = load_seen();
+    if let Some(e) = m.get_mut(&data_encoding::HEXLOWER.encode(id)) {
+        if e.version != version {
+            e.version = version.chars().take(32).collect();
+            save_seen(&m);
+        }
+    } else {
+        note_seen(id, None, false);
+        let mut m = load_seen();
+        if let Some(e) = m.get_mut(&data_encoding::HEXLOWER.encode(id)) {
+            e.version = version.chars().take(32).collect();
+            save_seen(&m);
+        }
+    }
+}
+
+/// The newest version among genuine, not revoked releases I've seen that is
+/// newer than the one running.
+fn newest_seen() -> Option<String> {
+    let now = update::parse_version(current());
+    load_seen()
+        .into_iter()
+        .filter(|(id, e)| {
+            let id: Option<[u8; 32]> = data_encoding::HEXLOWER.decode(id.as_bytes()).ok().and_then(|v| v.try_into().ok());
+            !e.version.is_empty() && id.is_some_and(|id| !is_revoked(&id)) && update::parse_version(&e.version) > now
+        })
+        .map(|(_, e)| e.version)
+        .max_by_key(|v| update::parse_version(v))
 }
 
 fn add_revocations(more: Vec<update::RevocationDoc>) {
@@ -457,14 +492,15 @@ impl Core {
                 add_revocations(update::decode_revocations(&b));
             }
             let Ok(Response::Update { prefix, size }) = request(&mut s, &Request::UpdateInfo { product: PRODUCT.into() }).await else { continue };
-            let Ok((h, _)) = update::read_header(&prefix) else { continue };
-            if update::verify_header(&h, &update::release_keys(), PRODUCT, PLATFORM, current()).is_err() || size > update::MAX_BUNDLE {
+            let Ok((h, start)) = update::read_header(&prefix) else { continue };
+            if update::verify_header(&h, &update::release_keys(), PRODUCT, PLATFORM, current()).is_err() || size > update::MAX_BUNDLE || size != update::bundle_len(&h, start) {
                 continue; // nothing newer here (or not genuine)
             }
             let id = update::manifest_id(&h.manifest);
             if is_revoked(&id) {
                 continue;
             }
+            note_version(&id, &h.manifest.version);
             note_seen(&id, Some(p), false);
             offers.entry(id).or_insert_with(|| (h.manifest.version.clone(), prefix.clone(), size, Vec::new())).3.push(p.clone());
         }
@@ -480,6 +516,17 @@ impl Core {
             let newer = best.as_ref().is_none_or(|(_, b)| update::parse_version(&o.0) > update::parse_version(&b.0));
             if newer {
                 best = Some((id, o));
+            }
+        }
+        // A newer genuine (signed, not revoked) release has been seen
+        // somewhere: don't settle for an older one in the meantime (Pillars
+        // could otherwise hold me on a known-bad release not yet revoked).
+        let newest = newest_seen();
+        let mut held = None;
+        if let (Some((_, b)), Some(n)) = (&best, &newest) {
+            if update::parse_version(&b.0) < update::parse_version(n) {
+                held = Some(n.clone());
+                best = None;
             }
         }
         let mut found = false;
@@ -502,7 +549,7 @@ impl Core {
                 None
             } else if let Some(e) = &err {
                 Some(format!("Couldn't download the update right now ({e})."))
-            } else if let Some(v) = &lonely {
+            } else if let Some(v) = held.as_ref().or(lonely.as_ref()) {
                 Some(format!("Version {v} isn't on enough Pillars yet. Sentinel waits until several, including one of its own, carry the very same update, so everyone gets the same one."))
             } else if reached == 0 {
                 Some("Couldn't reach any Pillar right now.".into())

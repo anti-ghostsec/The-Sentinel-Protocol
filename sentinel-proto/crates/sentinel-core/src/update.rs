@@ -300,6 +300,12 @@ pub fn read_header(prefix: &[u8]) -> Result<(Header, usize), UpdateError> {
     Ok((h, 12 + n))
 }
 
+/// The exact length of a bundle with this header (header ending at
+/// `start`): a Pillar can't make anyone download more than that.
+pub fn bundle_len(h: &Header, start: usize) -> u64 {
+    start as u64 + h.manifest.files.iter().map(|f| f.size).sum::<u64>()
+}
+
 /// Check the header against `keys` (normally [`release_keys`]): signatures,
 /// product, platform, safe paths and that it's newer than `current`.
 pub fn verify_header(h: &Header, keys: &[HybridPublic], product: &str, platform: &str, current: &str) -> Result<(), UpdateError> {
