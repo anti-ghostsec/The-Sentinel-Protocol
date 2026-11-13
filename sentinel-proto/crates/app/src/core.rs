@@ -1640,9 +1640,12 @@ impl Core {
         // other Pillars each pass (ones that answered lately first): people
         // on different Pillars find each other. Cover buckets only on mine.
         let today = directory::today();
+        // One that failed today is left for tomorrow (or for the next start,
+        // which tries it again): waiting on it would hold up the whole pass.
+        let failed_today = |p: &String| store.pillar_health.get(p).is_some_and(|h| h.fails > 0 && h.fail_day == today);
         let others: Vec<String> = directory::order(&[], &sentinel_net::seed_pillars(), &store.known_pillars, &store.vouched_pillars, &store.pillar_health, Some(&pillar), today)
             .into_iter()
-            .filter(|p| *p != pillar)
+            .filter(|p| *p != pillar && !failed_today(p))
             .take(2)
             .collect();
         let mut sources: Vec<(String, u16, bool)> = plan.iter().map(|(s, k)| (pillar.clone(), *s, *k)).collect();
@@ -1651,12 +1654,18 @@ impl Core {
         }
         let fetches = sources.into_iter().map(|(src, shard, keep)| {
             let (net, known, reader_keys) = (net.clone(), &known, &reader_keys);
+            // Other Pillars get less time than mine.
+            let limit = if src == pillar { 120 } else { 45 };
             async move {
-                let r = tokio::time::timeout(std::time::Duration::from_secs(120), fetch_shard(&net, &src, shard, known, reader_keys)).await;
-                (shard, keep, r.ok().and_then(Result::ok))
+                let r = tokio::time::timeout(std::time::Duration::from_secs(limit), fetch_shard(&net, &src, shard, known, reader_keys)).await;
+                (src, shard, keep, r.ok().and_then(Result::ok))
             }
         });
-        for (shard, keep, got) in futures::future::join_all(fetches).await {
+        let mut answered: Vec<(String, bool)> = others.iter().map(|o| (o.clone(), false)).collect();
+        for (src, shard, keep, got) in futures::future::join_all(fetches).await {
+            if let Some(a) = answered.iter_mut().find(|(o, _)| *o == src) {
+                a.1 |= got.is_some();
+            }
             let Some((posts, rooms)) = got else { continue };
             if !keep {
                 continue; // cover traffic: fetched, then discarded
@@ -1679,6 +1688,9 @@ impl Core {
             }
         }
         let n = found.len();
+        if !answered.is_empty() {
+            self.update(|s| directory::record(s, &answered, today))?;
+        }
         if n > 0 || !found_rooms.is_empty() {
             self.update(|s| {
                 s.discovered.extend(found);
@@ -1930,6 +1942,8 @@ impl Core {
         let mut learned: Vec<String> = Vec::new();
         // Why probes failed (shown on the connecting screen so a tester can say).
         let mut problems: Vec<String> = Vec::new();
+        // Probes still running when one answered.
+        let mut unfinished: Vec<String> = Vec::new();
         let mut i = 0;
         // One Pillar that answers is enough to start: the directory can list
         // Pillars that have since gone, and waiting for them only delays the
@@ -1960,7 +1974,14 @@ impl Core {
                 sentinel_net::note(format!("Sentinel: Pillar {}… {how} after {}s", &c[..6.min(c.len())], started.elapsed().as_secs()));
                 (c.clone(), r)
             });
-            for (c, r) in futures::future::join_all(probes).await {
+            // The first answer starts the app: the others in the batch
+            // (a Pillar that is down takes the full minute to say so) are
+            // left for the backup search.
+            use futures::StreamExt;
+            let mut probes: futures::stream::FuturesUnordered<_> = probes.collect();
+            let mut waiting = batch.clone();
+            while let Some((c, r)) = probes.next().await {
+                waiting.retain(|w| *w != c);
                 outcomes.push((c.clone(), matches!(r, Ok(Ok(_)))));
                 let list = match r {
                     Ok(Ok(list)) => list,
@@ -1973,15 +1994,17 @@ impl Core {
                         continue;
                     }
                 };
-                if chosen.len() < 2 {
-                    chosen.push(c);
-                }
+                chosen.push(c);
                 for p in list {
                     if check_onion(&p).is_ok() && !candidates.contains(&p) && Some(&p) != own.as_ref() {
                         learned.push(p.clone());
                         candidates.push(p);
                     }
                 }
+                break;
+            }
+            if !chosen.is_empty() {
+                unfinished = waiting;
             }
         }
         if chosen.is_empty() {
@@ -2003,7 +2026,7 @@ impl Core {
             s.profile_published = false;
             directory::record(s, &outcomes, today);
         })?;
-        Ok(candidates.into_iter().skip(i).filter(|c| !chosen.contains(c)).collect())
+        Ok(unfinished.into_iter().chain(candidates.into_iter().skip(i)).filter(|c| !chosen.contains(c)).collect())
     }
 
     /// After connecting: find one backup Pillar among `candidates` (a few at
