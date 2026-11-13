@@ -315,7 +315,7 @@ The network is built so that **gone Pillars never slow anyone down**, even with 
 - **A sample, not the whole list.** Each answer is a random handful, so it stays small however big the network gets, and nobody learns the whole directory from one request.
 - **Your app remembers what worked.** It keeps the day each Pillar last answered and how many tries failed (days only, nothing finer). Pillars that worked lately are tried first, ones failing today wait, and ones silent for a week are forgotten.
 - **Issuers vouch for proven Pillars.** The credit issuers already test every Pillar at random times for months (to pay them, section 13). Each signs a short list of Pillars that built up real weight that way; apps check the signature against the issuer keys built into Sentinel and try those Pillars early. A flood of fake or dead Pillars can't push them aside, because earning a place takes weeks of really serving.
-- **A race, not a queue.** The app tries a mix at once (Pillars that worked lately, vouched ones and seeds, each on its own circuit) and starts with whichever answers first. A backup Pillar is found quietly in the background afterwards, never holding up the start.
+- **A race, not a queue.** The app tries a mix at once (Pillars that worked lately, vouched ones and seeds, each on its own circuit) and starts with whichever answers first, without waiting for the others to answer or time out. A backup Pillar is found quietly in the background afterwards, never holding up the start.
 - **If your Pillar disappears,** the app notices when it connects and picks another, trying your backup and other Pillars that worked lately first.
 
 *Tested over Tor:* a new account connected as soon as the seed answered (7 to 15 seconds), then fetched the issuer's signed list and checked its signature. Restarted with a working Pillar, the app went straight to it. With its Pillar set to one that was gone, the app noticed within 45 seconds, picked the seed, and was connected 9 seconds later. (Before this, a phone could wait several minutes on gone Pillars left over from an earlier test; it happened to a tester.)
@@ -444,12 +444,14 @@ Custom feeds anyone can publish, anonymous "boosts" into Discover, competing tre
 - **Delivered even if you go offline.** A message goes straight to the other person's Pillar. If that Pillar doesn't answer, your app hands the sealed message to another Pillar, which keeps trying for 7 days (on disk, so even its own restarts don't lose it): the message has left your device, and you can go offline. That Pillar can't read it or tell who sent it. *Tested over Tor:* the recipient's Pillar was switched off, the sender sent a message and went offline, and when the Pillar came back the message arrived 3 minutes later.
 - **Nothing missed while you're away.** Messages wait on your Pillar for 7 days, in the mailbox for the day they were sent; after time offline, your app reads every day it missed, not just today's.
 - Replays and duplicates are recognised and dropped.
+- **One-time keys, one each.** A conversation's first message is encrypted to a key of the recipient's that is used once and then deleted, so a device taken later can't open it. Your contact card goes to many people, so those keys aren't in it (two people picking the same one would lose the second one's messages). Your app leaves ten signed one-time keys a day at your Pillar, under a name that changes daily and that only people holding your card can work out. Opening a conversation with someone takes one for each of their devices, and the Pillar never hands the same key out twice. The Pillar can't add keys of its own (your app signs them, and the sender checks). If it has none left or doesn't answer, the first message uses the card's **fallback key**, which works for everyone and is replaced every 40 days. (When your messages are mixed, your app doesn't ask for a one-time key: asking would mark the moment mixing hides.)
 
 ### Protection against future quantum computers *(Built)*
 
 Someone could record encrypted traffic today and keep it until a quantum computer can break it ("harvest now, decrypt later"). The first such machines will likely belong to the agencies most of our users fear, so Sentinel doesn't wait.
 
 - **Every private message** is sealed for the recipient's mailbox with a **hybrid** of X25519 and **ML-KEM-768** (the NIST post-quantum standard). To read a recording, an attacker must break both. Contact cards carry the mailbox's ML-KEM key, which changes every 30 days.
+- **A post-quantum ratchet inside every conversation.** The mailbox key above lasts a month and can't be deleted early, so on its own it wouldn't protect recorded messages from someone who later takes a device. Each conversation therefore also keeps short-lived ML-KEM-768 keys: every message carries the sender's newest key, every message after the first reply is encrypted under a fresh ML-KEM secret around the Olm message, and once your key has been used your next message brings a new one and the old one is deleted 8 days later. A message is readable only by breaking both Olm and this layer; deleted keys can't open recordings; and a copied device stops being able to read as soon as each side has sent once more. Limits: the first messages, until a reply, have only the mailbox layer; and *who* you're talking to is still proven with classical keys, so an attacker with a quantum computer who sits in the middle from the very first message could impersonate (not read what was recorded).
 - **New room keys** (when someone is removed, a membership renews, or someone is let in) are sealed the same way to each member's room-only ML-KEM key, which every member announces when they join.
 - Older apps without these keys still work; they just get the classical protection until they update.
 - The rest was already quantum-safe: posts, room messages, files and backups use 256-bit symmetric keys (XChaCha20-Poly1305, BLAKE3, Argon2id), which quantum computers don't meaningfully weaken.
@@ -768,7 +770,8 @@ Plainly:
 
 | Part | Today | Against a future quantum computer |
 |------|-------|-----------------------------------|
-| Private messages, new room keys | Hybrid X25519 + ML-KEM-768 | Protected, including recordings made today |
+| Private messages, new room keys | Hybrid X25519 + ML-KEM-768 around each message; inside conversations, a ratchet of short-lived ML-KEM-768 keys around Olm | Protected, including recordings made today, and (after the first reply) even if a device is taken later |
+| Private messages (who sent them) | Olm's classical keys | Someone with a quantum computer, in the middle from a conversation's first message, could impersonate. Recordings stay unreadable. |
 | Posts, room messages, files, backups, the key file on your device | 256-bit symmetric encryption | Protected |
 | Updates | Signed with Ed25519 + ML-DSA-65 | Can't be forged |
 | Tor itself | Classical | A recording of the Tor layer could later be opened, but what's inside is Sentinel's own encryption above. Tor is adding post-quantum handshakes; Sentinel picks them up as arti gains them. |
@@ -815,7 +818,7 @@ Each line: the attack, then what stops it. "Fixed" means a real weakness was fou
 | 29 | Fake followers inflating counts | Each notice costs computing work; counts shown as approximate |
 | 30 | Someone with your link counting how many messages you get | Only you hold the key to list your mailbox (Fixed) |
 | 31 | "Followers-only" posts leaking when a link is shared | The app honestly calls it "People with your link"; for a real private audience, approved followers with removal (Fixed) |
-| 32 | Draining someone's one-time message keys | A fallback key keeps messaging working; limits on fetching |
+| 32 | Draining someone's one-time message keys | Each claim costs proof of work and takes one key; a fallback key keeps messaging working; keys are topped up daily |
 | 33 | File metadata identifying the author | Cleaning, plus clear warnings where cleaning isn't possible |
 | 34 | A booby-trapped media file attacking the app | Decoded only in the sandboxed view; allowed formats only; files never auto-opened |
 | 35 | A censor recognising a known leaked file by its fingerprint | Random key per file and padded sizes |

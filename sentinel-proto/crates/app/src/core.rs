@@ -208,6 +208,9 @@ pub struct DmState {
     /// The card this device published last (handed to a new device).
     #[serde(default)]
     pub last_card: Option<sentinel_core::social::ContactCard>,
+    /// Each conversation's post-quantum ratchet (peer Olm identity hex).
+    #[serde(default)]
+    pub pq: std::collections::HashMap<String, sentinel_core::pqratchet::PqRatchet>,
     /// One-time keys I left at my Pillar, by day (see `dm::prekey_signer`).
     #[serde(default)]
     pub prekeys: Vec<PrekeyDay>,

@@ -184,7 +184,9 @@ pub struct ContactCard {
     pub inbox_kem: Option<Vec<u8>>,
     /// `(day, bundle)`: where my Pillar keeps that day's one-time keys
     /// (see `dm::prekey_signer`).
-    #[serde(default)]
+    /// (Left out when empty, so the card a first message carries reads
+    /// the same to apps from before this field.)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prekey_days: Vec<(u64, [u8; 32])>,
 }
 

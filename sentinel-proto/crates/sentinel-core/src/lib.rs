@@ -16,6 +16,7 @@ pub mod seal;
 pub mod pow;
 pub mod pqcash;
 pub mod pq;
+pub mod pqratchet;
 pub mod recovery;
 pub mod room;
 pub mod room_auth;

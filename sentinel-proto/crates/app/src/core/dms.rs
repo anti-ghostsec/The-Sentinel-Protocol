@@ -355,6 +355,7 @@ impl Core {
         // Their devices, then my other devices (a copy marked as sent by me).
         let mut out: Vec<Outgoing> = Vec::new();
         let mut sessions: Vec<(String, String)> = Vec::new();
+        let mut ratchets = Vec::new();
         let mine: Vec<ContactCard> = store.my_devices.clone();
         for (to, own) in targets.iter().map(|c| (c, false)).chain(mine.iter().map(|c| (c, true))) {
             let peer = hex(&to.olm_identity);
@@ -391,7 +392,9 @@ impl Core {
                 }),
                 delete: if own { None } else { delete.clone() },
             };
-            let Some(blob) = dm::encrypt(&account, &mut session, &payload, to) else { continue };
+            let mut ratchet = st.pq.get(&peer).cloned().unwrap_or_default();
+            let Some(blob) = dm::encrypt_with(&account, &mut session, &mut ratchet, &payload, to) else { continue };
+            ratchets.push((peer.clone(), ratchet));
             sessions.push((peer, session.pickle().encrypt(&pickle_key(&key))));
             out.push(Outgoing { olm: to.olm_identity, blob });
         }
@@ -405,6 +408,7 @@ impl Core {
                     d.sessions.insert(peer.clone(), p.clone());
                     d.claimed.remove(peer); // used (or not needed any more)
                 }
+                d.pq.extend(ratchets.iter().cloned());
                 for t in &targets {
                     d.owners.insert(hex(&t.olm_identity), author_s.clone());
                 }
@@ -550,6 +554,7 @@ impl Core {
         let account = load_account(&key, &st)?;
         let mut out = Vec::new();
         let mut sessions = Vec::new();
+        let mut ratchets = Vec::new();
         for to in &store.my_devices {
             let peer = hex(&to.olm_identity);
             let mut session = match st.sessions.get(&peer).and_then(|p| load_session(&key, p)) {
@@ -576,7 +581,9 @@ impl Core {
                 sync: Some(what.clone()),
                 delete: None,
             };
-            let Some(blob) = dm::encrypt(&account, &mut session, &payload, to) else { continue };
+            let mut ratchet = st.pq.get(&peer).cloned().unwrap_or_default();
+            let Some(blob) = dm::encrypt_with(&account, &mut session, &mut ratchet, &payload, to) else { continue };
+            ratchets.push((peer.clone(), ratchet));
             sessions.push((peer, session.pickle().encrypt(&pickle_key(&key))));
             out.push(Outgoing { olm: to.olm_identity, blob });
         }
@@ -586,6 +593,7 @@ impl Core {
                     d.claimed.remove(&peer);
                     d.sessions.insert(peer, p);
                 }
+                d.pq.extend(ratchets);
             }
             s.device_outbox.extend(out);
         })
@@ -606,7 +614,8 @@ impl Core {
         let mut account = load_account(key, &st)?;
         let existing = st.sessions.get(&peer).and_then(|p| load_session(key, p));
         let had_session = existing.is_some();
-        let Some((session, payload)) = dm::decrypt(&mut account, existing, sender, &msg) else { return Ok(false) };
+        let mut ratchet = st.pq.get(&peer).cloned().unwrap_or_default();
+        let Some((session, payload)) = dm::decrypt_with(&mut account, existing, &mut ratchet, sender, &msg) else { return Ok(false) };
 
         // Who is this? First contact must carry a valid signed card bound to
         // the Olm identity; afterwards the session itself authenticates.
@@ -678,6 +687,7 @@ impl Core {
         self.update(|s| {
             if let Some(d) = s.dm.as_mut() {
                 d.sessions.insert(peer.clone(), session_p);
+                d.pq.insert(peer.clone(), ratchet);
                 d.account = account_p;
                 d.owners.insert(peer.clone(), owner.clone());
                 d.claimed.remove(&peer);

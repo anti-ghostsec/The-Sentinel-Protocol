@@ -298,8 +298,27 @@ pub struct RoomPurchase {
 struct Wire {
     sender_identity: [u8; 32],
     olm_type: u8,
+    /// The Olm message, wrapped by the post-quantum ratchet when `pq` has
+    /// a ciphertext.
     olm: Vec<u8>,
     pad: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pq: Option<crate::pqratchet::Header>,
+}
+
+/// A received message with the sealed-sender layer removed.
+pub struct Incoming {
+    olm_type: u8,
+    body: Vec<u8>,
+    pq: Option<crate::pqratchet::Header>,
+}
+
+/// What ties the post-quantum ratchet's messages to one conversation.
+fn ratchet_bind(sender: &[u8; 32], recipient: &[u8; 32]) -> [u8; 64] {
+    let mut b = [0u8; 64];
+    b[..32].copy_from_slice(sender);
+    b[32..].copy_from_slice(recipient);
+    b
 }
 
 fn cbor<T: Serialize>(v: &T) -> Vec<u8> {
@@ -509,9 +528,27 @@ pub fn outbound_session(account: &Account, card: &ContactCard, claimed: Option<[
 /// Encrypt a payload with an Olm session and seal it for the recipient's
 /// inbox. Returns the blob to deposit.
 pub fn encrypt(account: &Account, session: &mut Session, payload: &DmPayload, card: &ContactCard) -> Option<Vec<u8>> {
+    seal_olm(account, session, None, payload, card)
+}
+
+/// `encrypt`, with the conversation's post-quantum ratchet around the Olm
+/// message (see `pqratchet`).
+pub fn encrypt_with(account: &Account, session: &mut Session, ratchet: &mut crate::pqratchet::PqRatchet, payload: &DmPayload, card: &ContactCard) -> Option<Vec<u8>> {
+    seal_olm(account, session, Some(ratchet), payload, card)
+}
+
+fn seal_olm(account: &Account, session: &mut Session, ratchet: Option<&mut crate::pqratchet::PqRatchet>, payload: &DmPayload, card: &ContactCard) -> Option<Vec<u8>> {
     let msg = session.encrypt(cbor(payload)).ok()?;
     let (t, bytes) = msg.to_parts();
-    let mut wire = Wire { sender_identity: account.curve25519_key().to_bytes(), olm_type: t as u8, olm: bytes, pad: Vec::new() };
+    let sender_identity = account.curve25519_key().to_bytes();
+    let (pq, olm) = match ratchet {
+        Some(r) => {
+            let (h, body) = r.seal(today(), &ratchet_bind(&sender_identity, &card.olm_identity), &bytes);
+            (Some(h), body)
+        }
+        None => (None, bytes),
+    };
+    let mut wire = Wire { sender_identity, olm_type: t as u8, olm, pad: Vec::new(), pq };
     pad_wire(&mut wire);
     match card.inbox_kem.as_deref().filter(|k| k.len() == crate::pq::KEM_PUBLIC) {
         Some(k) => crate::pq::seal(PQ_SEAL, &card.inbox_pub, &card.inbox_pub, Some(k), &cbor(&wire)),
@@ -566,8 +603,8 @@ fn sealed_key(shared: &[u8; 32], eph_pub: &[u8; 32], recipient: &[u8; 32]) -> [u
     blake3::derive_key("sentinel/v0/sealed-sender", &m)
 }
 
-/// Remove the sealed-sender layer: (sender's Olm identity, Olm message).
-pub fn unseal(inbox_secret: &[u8; 32], fetch_secret: &[u8; 32], blob: &[u8]) -> Option<([u8; 32], OlmMessage)> {
+/// Remove the sealed-sender layer: (sender's Olm identity, the message).
+pub fn unseal(inbox_secret: &[u8; 32], fetch_secret: &[u8; 32], blob: &[u8]) -> Option<([u8; 32], Incoming)> {
     if blob.len() < 32 + 24 + 16 || blob.len() > MAX_BLOB {
         return None;
     }
@@ -590,8 +627,7 @@ pub fn unseal(inbox_secret: &[u8; 32], fetch_secret: &[u8; 32], blob: &[u8]) -> 
         zeroize::Zeroizing::new(XChaCha20Poly1305::new((&key).into()).decrypt(XNonce::from_slice(&blob[32..56]), &blob[56..]).ok()?)
     };
     let wire: Wire = ciborium::from_reader(plain.as_slice()).ok()?;
-    let msg = OlmMessage::from_parts(wire.olm_type as usize, &wire.olm).ok()?;
-    Some((wire.sender_identity, msg))
+    Some((wire.sender_identity, Incoming { olm_type: wire.olm_type, body: wire.olm, pq: wire.pq }))
 }
 
 pub fn inbox_public(inbox_secret: &[u8; 32]) -> [u8; 32] {
@@ -600,12 +636,31 @@ pub fn inbox_public(inbox_secret: &[u8; 32]) -> [u8; 32] {
 
 /// Decrypt an incoming Olm message, creating a session from a prekey
 /// message if needed. Returns (session, payload).
-pub fn decrypt(
+pub fn decrypt(account: &mut Account, existing: Option<Session>, sender_identity: [u8; 32], msg: &Incoming) -> Option<(Session, DmPayload)> {
+    decrypt_with(account, existing, &mut crate::pqratchet::PqRatchet::default(), sender_identity, msg)
+}
+
+/// `decrypt`, with the conversation's post-quantum ratchet. The ratchet
+/// only moves when the Olm message inside is genuine.
+pub fn decrypt_with(
     account: &mut Account,
     existing: Option<Session>,
+    ratchet: &mut crate::pqratchet::PqRatchet,
     sender_identity: [u8; 32],
-    msg: &OlmMessage,
+    msg: &Incoming,
 ) -> Option<(Session, DmPayload)> {
+    let mut moved = ratchet.clone();
+    let olm = match &msg.pq {
+        Some(h) => moved.open(today(), &ratchet_bind(&sender_identity, &account.curve25519_key().to_bytes()), h, &msg.body)?,
+        None => msg.body.clone(),
+    };
+    let msg = &OlmMessage::from_parts(msg.olm_type as usize, &olm).ok()?;
+    let got = open_olm(account, existing, sender_identity, msg)?;
+    *ratchet = moved;
+    Some(got)
+}
+
+fn open_olm(account: &mut Account, existing: Option<Session>, sender_identity: [u8; 32], msg: &OlmMessage) -> Option<(Session, DmPayload)> {
     let sender = Curve25519PublicKey::from_bytes(sender_identity);
     if let Some(mut s) = existing {
         if let Ok(plain) = s.decrypt(msg) {
@@ -801,6 +856,47 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_runs_under_the_post_quantum_ratchet() {
+        use crate::pqratchet::PqRatchet;
+        let (a_key, a_acc, a_inbox, a_card) = party("a.onion");
+        let (b_key, mut b_acc, b_inbox, b_card) = party("b.onion");
+        let (mut a_r, mut b_r) = (PqRatchet::default(), PqRatchet::default());
+        let mut a_sess = outbound_session(&a_acc, &b_card, None).unwrap();
+
+        let blob = encrypt_with(&a_acc, &mut a_sess, &mut a_r, &first(&a_key, "hi bob", &a_card, &b_card.inbox_pub), &b_card).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
+        let (mut b_sess, got) = decrypt_with(&mut b_acc, None, &mut b_r, sender, &msg).unwrap();
+        assert_eq!(got.text, "hi bob");
+        assert!(b_r.established() && !a_r.established());
+
+        // Bob's reply is wrapped for Alice's ratchet key.
+        let blob = encrypt_with(&b_acc, &mut b_sess, &mut b_r, &first(&b_key, "hey alice", &b_card, &a_card.inbox_pub), &a_card).unwrap();
+        let (sender, msg) = unseal(&a_inbox, &fetch_of(&a_inbox), &blob).unwrap();
+        assert!(msg.pq.as_ref().is_some_and(|h| h.ct.len() == crate::pq::KEM_CT));
+        // Olm and the inbox keys alone don't open it: the ratchet key is needed.
+        let mut a_copy = Account::from_pickle(a_acc.pickle());
+        assert!(decrypt(&mut a_copy, Some(Session::from_pickle(a_sess.pickle())), sender, &msg).is_none());
+        let mut a_acc = a_acc;
+        let (mut a_sess, got) = decrypt_with(&mut a_acc, Some(a_sess), &mut a_r, sender, &msg).unwrap();
+        assert_eq!(got.text, "hey alice");
+
+        // A message that isn't genuine leaves the ratchet where it was.
+        let before = cbor(&a_r);
+        let (m_key, m_acc, _, m_card) = party("m.onion");
+        let mut m_sess = outbound_session(&m_acc, &a_card, None).unwrap();
+        let forged = encrypt(&m_acc, &mut m_sess, &first(&m_key, "x", &m_card, &a_card.inbox_pub), &a_card).unwrap();
+        let (_, fmsg) = unseal(&a_inbox, &fetch_of(&a_inbox), &forged).unwrap();
+        assert!(decrypt_with(&mut a_acc, None, &mut a_r, sender, &fmsg).is_none());
+        assert_eq!(before, cbor(&a_r));
+
+        // Both directions keep working, and sizes stay in the same bucket.
+        let blob2 = encrypt_with(&a_acc, &mut a_sess, &mut a_r, &first(&a_key, "again", &a_card, &b_card.inbox_pub), &b_card).unwrap();
+        assert_eq!(blob2.len(), blob.len());
+        let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob2).unwrap();
+        assert_eq!(decrypt_with(&mut b_acc, Some(b_sess), &mut b_r, sender, &msg).unwrap().1.text, "again");
+    }
+
+    #[test]
     fn two_senders_with_the_same_card_both_get_through() {
         let (_, mut b_acc, b_inbox, b_card) = party("b.onion");
         for name in ["one", "two", "three"] {
@@ -850,7 +946,7 @@ mod tests {
         assert!(first_blob.len() <= MAX_BLOB);
         // Every bucket is hit exactly, and stays a deposit after sealing.
         for len in (0..2100).chain((24_000..24_600).step_by(37)).chain([30_000, 50_000]) {
-            let mut w = Wire { sender_identity: [1; 32], olm_type: 1, olm: vec![7; len], pad: Vec::new() };
+            let mut w = Wire { sender_identity: [1; 32], olm_type: 1, olm: vec![7; len], pad: Vec::new(), pq: None };
             pad_wire(&mut w);
             let n = cbor(&w).len();
             assert!(PAD_BUCKETS.contains(&n), "{len} -> {n}");

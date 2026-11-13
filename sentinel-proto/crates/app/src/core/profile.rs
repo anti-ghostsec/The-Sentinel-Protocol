@@ -402,6 +402,8 @@ impl Core {
         st.conversations.iter_mut().for_each(|c| c.messages.clear());
         if let Some(d) = st.dm.as_mut() {
             d.sessions.clear();
+            d.pq.clear();
+            d.claimed.clear();
             d.owners.clear();
             d.cursors.clear();
         }
