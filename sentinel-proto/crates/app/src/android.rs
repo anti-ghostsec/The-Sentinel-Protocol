@@ -104,6 +104,18 @@ pub fn rebuild(input: &Path) -> Option<PathBuf> {
     out.is_file().then_some(out)
 }
 
+#[derive(Deserialize)]
+struct Opened {
+    link: String,
+}
+
+/// The `sentinel://` link the app was opened with, if any (handed over
+/// once). Blocking.
+pub fn opened_link() -> Option<String> {
+    let l = HANDLE.get()?.run_mobile_plugin::<Opened>("openedLink", serde_json::json!({})).ok()?.link;
+    (!l.is_empty()).then_some(l)
+}
+
 #[derive(Serialize)]
 struct Install {
     path: String,

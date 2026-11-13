@@ -205,6 +205,15 @@ class MediaPlugin(private val activity: Activity) : Plugin(activity) {
     }
   }
 
+  /** The sentinel:// link the app was opened with, handed over once. */
+  @Command
+  fun openedLink(invoke: Invoke) {
+    val ret = JSObject()
+    ret.put("link", MainActivity.openedLink ?: "")
+    MainActivity.openedLink = null
+    invoke.resolve(ret)
+  }
+
   private val installAction get() = activity.packageName + ".INSTALL_STATUS"
   private var receiver: BroadcastReceiver? = null
 

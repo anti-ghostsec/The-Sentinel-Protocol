@@ -74,17 +74,27 @@ function setError(id, msg) {
 /* ---------- onboarding ---------- */
 
 function paintChoice() {
-  document.querySelectorAll(".choice").forEach((c) => c.setAttribute("aria-checked", String(c.dataset.mode === S.mode)));
+  document.querySelectorAll(".choice[data-mode]").forEach((c) => c.setAttribute("aria-checked", String(c.dataset.mode === S.mode)));
 }
 
-document.querySelectorAll(".choice").forEach((c) =>
+document.querySelectorAll(".choice[data-mode]").forEach((c) =>
   c.addEventListener("click", () => {
     S.mode = c.dataset.mode;
     paintChoice();
   }),
 );
+// Public or private account: asked once, when the account is made.
+document.querySelectorAll(".choice[data-audience]").forEach((c) =>
+  c.addEventListener("click", () => {
+    S.audience = c.dataset.audience;
+    document.querySelectorAll(".choice[data-audience]").forEach((x) => x.setAttribute("aria-checked", String(x === c)));
+    validateAccount();
+  }),
+);
 function accountMode(recover) {
   S.recovering = recover;
+  // A recovered account keeps posting the way it did (the choice shows on each post).
+  $("account-audience").hidden = recover;
   $("account-title").textContent = recover ? "Recover your account" : "Create your account";
   $("account-sub").textContent = recover ? "Type your recovery words, your name and a new passphrase for this device." : "Pick any name. It doesn't have to be your real one.";
   $("account-recover-row").hidden = !recover;
@@ -144,7 +154,7 @@ function validateAccount() {
   // Generated words must be written down before the account exists.
   const generated = showWords("account", pass);
   const wrote = !generated || $("account-wrote").checked;
-  $("account-create").disabled = !($("account-name").value.trim() && pass.length >= 12 && passBits(pass) >= MIN_BITS && wrote);
+  $("account-create").disabled = !($("account-name").value.trim() && pass.length >= 12 && passBits(pass) >= MIN_BITS && wrote && (S.recovering || S.audience));
 }
 $("account-generate").addEventListener("click", async () => {
   const p = await invoke("generate_passphrase");
@@ -180,6 +190,7 @@ $("account-form").addEventListener("submit", async (ev) => {
       $("account-recover-words").value = "";
     } else {
       await invoke("create_account", { name: $("account-name").value, pass, mode: S.mode });
+      await invoke("set_discover_default", { on: S.audience === "public" }).catch(() => {});
     }
     $("account-pass").value = "";
     $("account-pass").type = "password";
@@ -434,6 +445,7 @@ listen("status", () => refreshStatus());
 async function refreshStatus() {
   S.status = await invoke("status");
   const st = S.status;
+  if (st.unlocked) checkOpenedLink();
   document.body.classList.toggle("is-phone", st.platform === "android" || st.platform === "ios");
   const name = st.name || "You";
   document.querySelectorAll(".me-avatar").forEach((a) => {
@@ -2637,6 +2649,72 @@ $("copy-link").addEventListener("click", async () => {
   // Copied outside clipboard history and cloud sync; cleared after a minute.
   const ok = await invoke("copy_secret", { text: S.status.link });
   $("copy-link-label").textContent = ok ? "Copied · clears in 1 minute" : "Couldn't copy";
+});
+
+/* my follow link as a code to scan */
+$("show-qr").addEventListener("click", async () => {
+  if (!S.status || !S.status.link) return;
+  noteShared();
+  try {
+    $("qr-img").src = await invoke("follow_qr");
+    $("qr-dialog").showModal();
+  } catch (e) {
+    $("copy-link-label").textContent = String(e);
+  }
+});
+$("qr-copy").addEventListener("click", async () => {
+  const ok = await invoke("copy_secret", { text: S.status.link });
+  $("qr-copy").textContent = ok ? "Copied · clears in 1 minute" : "Couldn't copy";
+});
+
+/* a sentinel:// link the app was opened with (tapped or scanned) */
+const OPENED = {
+  follow: ["Follow this account?", "You opened a follow link. Following lets you read their posts; they aren't told who you are.", "Follow", (link) => invoke("follow", { link })],
+};
+async function checkOpenedLink() {
+  if (S.openingLink || !S.status || $("open-link-dialog").open) return;
+  S.openingLink = true;
+  try {
+    const link = await invoke("opened_link");
+    if (!link) return;
+    const kind = (link.match(/^sentinel:\/\/([a-z]+)\//) || [])[1];
+    const how = OPENED[kind];
+    const d = $("open-link-dialog");
+    $("open-link-title").textContent = how ? how[0] : "This link can't be opened here";
+    $("open-link-text").textContent = how ? how[1] : "Paste it where it belongs in Sentinel instead (for a room: Rooms, then Join).";
+    $("open-link-what").textContent = link.length > 80 ? link.slice(0, 80) + "…" : link;
+    $("open-link-ok").hidden = !how;
+    $("open-link-cancel").textContent = how ? "Not now" : "Close";
+    if (how) $("open-link-ok").textContent = how[2];
+    d.onclose = async () => {
+      if (!how || d.returnValue !== "ok") return;
+      let said = "Their posts will appear shortly.";
+      let title = "Following";
+      try {
+        await how[3](link);
+      } catch (e) {
+        title = "That didn't work";
+        said = String(e);
+      }
+      // Say how it went in the same box.
+      d.onclose = null;
+      $("open-link-title").textContent = title;
+      $("open-link-text").textContent = said;
+      $("open-link-what").textContent = "";
+      $("open-link-ok").hidden = true;
+      $("open-link-cancel").textContent = "Close";
+      d.showModal();
+    };
+    d.returnValue = "";
+    d.showModal();
+  } catch (_) {
+    /* not available here */
+  } finally {
+    S.openingLink = false;
+  }
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) checkOpenedLink();
 });
 
 /* privacy */

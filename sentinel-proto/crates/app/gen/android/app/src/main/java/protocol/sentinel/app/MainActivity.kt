@@ -1,5 +1,6 @@
 package protocol.sentinel.app
 
+import android.content.Intent
 import android.os.Bundle
 import android.view.View
 import android.view.WindowManager
@@ -9,7 +10,24 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 
 class MainActivity : TauriActivity() {
+  companion object {
+    /** A sentinel:// link the app was opened with (the page asks before using it). */
+    @Volatile
+    var openedLink: String? = null
+  }
+
+  private fun keepLink(intent: Intent?) {
+    val link = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.dataString ?: return
+    if (link.startsWith("sentinel://") && link.length < 1024) openedLink = link
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    super.onNewIntent(intent)
+    keepLink(intent)
+  }
+
   override fun onCreate(savedInstanceState: Bundle?) {
+    keepLink(intent)
     enableEdgeToEdge()
     // Always: no screenshots, no screen recording or casting of Sentinel's
     // screen, and a blank preview in the recent-apps list.

@@ -460,6 +460,9 @@ body { padding-top: env(safe-area-inset-top); }
 /* reports */
 .report-dialog { max-width: 440px; width: calc(100% - 32px); border: 1px solid var(--line); border-radius: 16px; background: var(--surface); color: inherit; padding: 20px; }
 .report-dialog::backdrop { background: rgba(0, 0, 0, 0.6); }
+.qr-box { align-items: center; text-align: center; }
+.qr-img { width: min(260px, 70vw); height: auto; aspect-ratio: 1; border-radius: 12px; background: #fff; padding: 10px; }
+.open-link-what { overflow-wrap: anywhere; }
 .report-option { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
 .report-box { border: 1px solid var(--line); border-radius: 12px; padding: 12px; }
 .report-quote { border-left: 3px solid var(--line); padding-left: 10px; white-space: pre-wrap; word-break: break-word; }

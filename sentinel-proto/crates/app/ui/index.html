@@ -72,6 +72,18 @@
       <ol id="account-word-list" class="word-list"></ol>
       <label class="check"><input id="account-wrote" type="checkbox"> I've written these words down somewhere safe</label>
     </div>
+    <div id="account-audience" class="stack-10" role="radiogroup" aria-label="Who can find and follow you">
+      <span class="label">Who can find and follow you?</span>
+      <button type="button" class="choice" data-audience="public" role="radio" aria-checked="false">
+        <span class="choice-text"><span class="choice-title">Public account</span><span class="muted">Your posts appear in Discover with a Follow button. Anyone can read them and follow you.</span></span>
+        <span class="radio"></span>
+      </button>
+      <button type="button" class="choice" data-audience="private" role="radio" aria-checked="false">
+        <span class="choice-text"><span class="choice-title">Private account</span><span class="muted">Only people you give your follow link or code to can read your posts.</span></span>
+        <span class="radio"></span>
+      </button>
+      <span class="hint">This is only the starting choice for new posts: you can change it on any post. Your name and profile are visible to anyone who can read your posts.</span>
+    </div>
     <details class="advanced-inline">
       <summary class="muted small">Also require a key file (optional)</summary>
       <div class="stack-8">
@@ -434,6 +446,7 @@
             <div class="inline-actions">
               <button type="button" id="edit-profile" class="btn outline">Edit profile</button>
               <button type="button" id="copy-link" class="btn outline"><span class="icon" data-icon="link"></span><span id="copy-link-label">Copy follow link</span></button>
+              <button type="button" id="show-qr" class="btn outline">Show code</button>
             </div>
           </div>
           <div class="stack-2">
@@ -800,6 +813,30 @@
 </div>
 
 <!-- REPORT -->
+<dialog id="qr-dialog" class="report-dialog">
+  <form method="dialog" class="stack-16 qr-box">
+    <h2 class="title-sm">Follow me on Sentinel</h2>
+    <img id="qr-img" class="qr-img" alt="A code holding your follow link" width="260" height="260">
+    <p class="muted small">Someone with Sentinel on their phone can point their camera at this and tap the link to follow you. It holds your follow link: anyone who gets it can read your posts.</p>
+    <div class="inline-actions">
+      <button type="button" id="qr-copy" class="btn outline small-btn">Copy the link instead</button>
+      <button type="submit" value="close" class="btn primary small-btn">Done</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="open-link-dialog" class="report-dialog">
+  <form method="dialog" class="stack-16">
+    <h2 class="title-sm" id="open-link-title">Follow this account?</h2>
+    <p id="open-link-text" class="muted small"></p>
+    <p id="open-link-what" class="mono small open-link-what"></p>
+    <div class="inline-actions">
+      <button type="submit" value="cancel" id="open-link-cancel" class="btn ghost small-btn">Not now</button>
+      <button type="submit" value="ok" id="open-link-ok" class="btn primary small-btn">Follow</button>
+    </div>
+  </form>
+</dialog>
+
 <dialog id="report-dialog" class="report-dialog">
   <form method="dialog" class="stack-16">
     <h2 class="title-sm">What's wrong with it?</h2>

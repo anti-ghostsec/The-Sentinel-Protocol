@@ -50,6 +50,48 @@ fn copy_secret(text: String) -> bool {
     text.starts_with("sentinel://") && text.len() < 1024 && oshardening::copy_secret(text, 60)
 }
 
+/// Whether new posts start as Discoverable (asked when the account is made).
+#[tauri::command]
+fn set_discover_default(core: State<'_, Arc<Core>>, on: bool) -> Res<()> {
+    core.set_discover_default(on).map_err(err)
+}
+
+/// My follow link as a QR code (an SVG picture, as a data: address).
+#[tauri::command]
+fn follow_qr(core: State<'_, Arc<Core>>) -> Res<String> {
+    let link = core.status().link.ok_or("Connect first: your link names your Pillar.")?;
+    qr_picture(&link).ok_or_else(|| "Your link is too long for a code.".to_string())
+}
+
+fn qr_picture(text: &str) -> Option<String> {
+    let code = qrcode::QrCode::with_error_correction_level(text.as_bytes(), qrcode::EcLevel::M).ok()?;
+    let svg = code.render::<qrcode::render::svg::Color>().min_dimensions(260, 260).quiet_zone(true).build();
+    Some(format!("data:image/svg+xml;base64,{}", data_encoding::BASE64.encode(svg.as_bytes())))
+}
+
+#[cfg(test)]
+mod qr_tests {
+    #[test]
+    fn a_follow_link_fits_in_a_code() {
+        use sentinel_core::social::FollowLink;
+        let link = FollowLink { author: [7; 32], pillar: format!("{}.onion", "a".repeat(56)), feed_key: Some([9; 32]) }.to_text();
+        let pic = super::qr_picture(&link).expect("fits");
+        assert!(pic.starts_with("data:image/svg+xml;base64,"));
+        assert!(super::qr_picture(&"x".repeat(5000)).is_none());
+    }
+}
+
+/// A `sentinel://` link the app was opened with (tapped or scanned on a
+/// phone), handed over once. The page asks before doing anything with it.
+#[tauri::command]
+async fn opened_link() -> Option<String> {
+    #[cfg(target_os = "android")]
+    let link = tokio::task::spawn_blocking(android::opened_link).await.ok().flatten();
+    #[cfg(not(target_os = "android"))]
+    let link: Option<String> = None;
+    link.filter(|l| l.starts_with("sentinel://") && l.len() < 1024 && !l.chars().any(char::is_control))
+}
+
 #[tauri::command]
 fn lock(core: State<'_, Arc<Core>>) {
     core.lock()
@@ -1162,6 +1204,9 @@ pub fn run() {
             timeline,
             toggle_like,
             follow,
+            set_discover_default,
+            follow_qr,
+            opened_link,
             refresh,
             set_pillar,
             app_catalog,

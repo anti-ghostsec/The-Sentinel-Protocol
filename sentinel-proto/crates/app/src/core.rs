@@ -1018,6 +1018,12 @@ impl Core {
         })
     }
 
+    /// Whether new posts start as Discoverable: the "public or private
+    /// account" choice made with the account (each post can still differ).
+    pub fn set_discover_default(&self, on: bool) -> Result<()> {
+        self.update(|s| s.discover_default = on && !s.privacy.high_risk)
+    }
+
     pub fn create_account(&self, name: &str, pass: &str, mode: &str) -> Result<()> {
         // Everything comes from new recovery words: the identity (generation
         // 0), the feed key and the recovery key.

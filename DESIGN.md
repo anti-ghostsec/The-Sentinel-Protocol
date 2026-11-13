@@ -379,6 +379,10 @@ Your app picks how finely to split buckets from its own download sizes, never fr
 
 You share a **follow link**. It carries the key that unlocks your posts. Anyone who has your link can read your posts; nobody else can, including the Pillars storing them. The app calls this **"People with your link"** and never calls it private, because a link can be passed on. To lock out everyone, you change your key and share a new link.
 
+**Public or private, asked once.** Making an account asks who can find you. A **public account** starts every post as Discoverable: it appears in Discover with a Follow button, like any microblog. A **private account** starts every post as "People with your link". It's only the starting point; each post can still be set either way, and High-risk mode keeps posts out of Discover whatever was chosen.
+
+**Passing your link on.** Your profile has *Copy follow link* and *Show code*, which draws the link as a QR code (made inside the app). On Android, a `sentinel://follow/…` link that is tapped, or scanned with the camera, opens Sentinel, which shows the link and asks before following; other kinds of link are shown but not acted on. On a computer, links are pasted: registering Sentinel as a link handler would list it in the system's settings, which the disguise is there to avoid.
+
 ### Approved followers *(Built)*
 
 For things you only want certain people to see. Someone who follows you can **ask to be approved** (from your profile); the request arrives as an encrypted message. If you approve, your app sends them the key for your "Approved followers" posts, in the same encrypted chat.
