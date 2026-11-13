@@ -6,10 +6,12 @@
 //! other devices (marked as sent by me), each over its own session.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use sentinel_core::dm;
 use sentinel_core::social::{self, ContactCard};
+use sentinel_core::wire::{Request, Response};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
@@ -84,10 +86,134 @@ fn my_intro_card(account: &Account, st: &DmState, pillar: &str) -> ContactCard {
         pillar: pillar.to_owned(),
         minute: social::coarse_minute(),
         inbox_kem: Some(dm::inbox_kem_public(&st.fetch_secret)),
+        prekey_days: Vec::new(),
     }
 }
 
 impl Core {
+    /// Keep one-time keys ready at my Pillar for today and tomorrow, so
+    /// each person starting a conversation with me gets one of their own.
+    pub(super) async fn publish_prekeys(&self) -> Result<()> {
+        let (key, store) = self.unlocked()?;
+        let pillar = store.pillar.clone().context("no Pillar")?;
+        let st = store.dm.clone().context("no messaging keys")?;
+        if self.with(|i| i.no_prekeys.get(&pillar).is_some_and(|t| t.elapsed() < super::mailbox::NO_WATCH_RETRY)) {
+            return Ok(());
+        }
+        // Make what's missing and save it before anything is sent: a key
+        // must never be out there without its secret half kept here.
+        let mut account = load_account(&key, &st)?;
+        let held: Vec<[u8; 32]> = account.one_time_keys().values().map(|k| k.to_bytes()).collect();
+        let today = dm::today();
+        let mut days: Vec<super::PrekeyDay> = st.prekeys.iter().filter(|d| d.day + 1 >= today).cloned().collect();
+        let mut changed = days.len() != st.prekeys.len();
+        for day in [today, today + 1] {
+            if !days.iter().any(|d| d.day == day) {
+                days.push(super::PrekeyDay { day, keys: Vec::new(), sent: true });
+            }
+            let d = days.iter_mut().find(|d| d.day == day).expect("just added");
+            let before = d.keys.len();
+            d.keys.retain(|k| held.contains(k)); // used ones are gone from the account
+            if d.keys.len() < dm::PREKEYS_PER_DAY / 2 {
+                let made = account.generate_one_time_keys(dm::PREKEYS_PER_DAY - d.keys.len());
+                d.keys.extend(made.created.iter().map(|k| k.to_bytes()));
+                d.sent = false;
+            }
+            changed |= d.keys.len() != before || !d.sent;
+        }
+        if changed {
+            let pickled = account.pickle().encrypt(&pickle_key(&key));
+            let save = days.clone();
+            self.update(|s| {
+                if let Some(d) = s.dm.as_mut() {
+                    d.account = pickled;
+                    d.prekeys = save;
+                }
+            })?;
+        }
+        let net = self.with(|i| i.net.clone()).context("not connected")?;
+        for d in days.iter().filter(|d| !d.sent) {
+            let signer = dm::prekey_signer(&st.fetch_secret, d.day);
+            let bundle = signer.verifying_key().to_bytes();
+            let entries = dm::prekey_bundle(&signer, &d.keys);
+            let data = dm::prekey_put_pow_data(&bundle, &entries);
+            let nonce = tokio::task::spawn_blocking(move || sentinel_core::pow::stamp(dm::PREKEY_PUT_POW_DOMAIN, &data, dm::PREKEY_PUT_POW_BITS)).await?;
+            let mut s = self.stream_to(&net, &pillar).await?;
+            let r = super::request(&mut s, &Request::PutPrekeys { bundle, entries, nonce }).await?;
+            if sentinel_core::wire::is_unknown_request(&r) {
+                // An older Pillar: people use my fallback key until it updates.
+                self.with(|i| i.no_prekeys.insert(pillar.clone(), std::time::Instant::now()));
+                return Ok(());
+            }
+            if matches!(r, Response::Pong) {
+                let day = d.day;
+                self.update(|s| {
+                    if let Some(x) = s.dm.as_mut().and_then(|dm| dm.prekeys.iter_mut().find(|x| x.day == day)) {
+                        x.sent = true;
+                    }
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Before the first message to someone: take a one-time key for each
+    /// of their devices from their Pillar, in the background (called when
+    /// their conversation is opened). Without one the first message uses
+    /// the card's fallback key. Not done when messages are mixed: asking
+    /// their Pillar for a key would mark the moment mixing hides.
+    pub fn prefetch_prekeys(self: &Arc<Self>, author: &str) {
+        let Ok((_, store)) = self.unlocked() else { return };
+        let Some(st) = store.dm.as_ref() else { return };
+        if store.privacy.mix || store.privacy.high_risk {
+            return;
+        }
+        let wanted: Vec<(String, [u8; 32], String)> = cards_for(&store, author)
+            .into_iter()
+            .filter_map(|c| {
+                let peer = hex(&c.olm_identity);
+                (!st.sessions.contains_key(&peer) && !st.claimed.contains_key(&peer)).then(|| Some((peer, dm::prekey_bundle_of(&c)?, c.pillar.clone())))?
+            })
+            .collect();
+        for (peer, bundle, pillar) in wanted {
+            // One try an hour per device.
+            let due = self.with(|i| {
+                let due = i.prekey_tries.get(&peer).is_none_or(|t| t.elapsed() > Duration::from_secs(3600));
+                if due {
+                    i.prekey_tries.insert(peer.clone(), std::time::Instant::now());
+                }
+                due
+            });
+            if !due {
+                continue;
+            }
+            let core = Arc::clone(self);
+            tauri::async_runtime::spawn(async move {
+                let claim = async {
+                    let net = core.with(|i| i.net.clone()).context("not connected")?;
+                    let salt = sentinel_core::random_bytes::<16>();
+                    let data = dm::prekey_claim_pow_data(&bundle, &salt);
+                    let nonce = tokio::task::spawn_blocking(move || sentinel_core::pow::stamp(dm::PREKEY_CLAIM_POW_DOMAIN, &data, dm::PREKEY_CLAIM_POW_BITS)).await?;
+                    let mut s = core.stream_to(&net, &pillar).await?;
+                    match super::request(&mut s, &Request::ClaimPrekey { bundle, salt, nonce }).await? {
+                        // Checked: a Pillar can't slip in a key of its own.
+                        Response::Object(entry) => dm::check_prekey(&bundle, &entry).context("not their key"),
+                        _ => bail!("none"),
+                    }
+                };
+                if let Ok(Ok(otk)) = tokio::time::timeout(Duration::from_secs(60), claim).await {
+                    let _ = core.update(|s| {
+                        if let Some(d) = s.dm.as_mut() {
+                            if !d.sessions.contains_key(&peer) {
+                                d.claimed.insert(peer, otk);
+                            }
+                        }
+                    });
+                }
+            });
+        }
+    }
+
     /// Publish (or refresh, daily) my contact card, sealed under my feed key.
     pub async fn publish_card(&self) -> Result<()> {
         let (key, store) = self.unlocked()?;
@@ -234,7 +360,7 @@ impl Core {
             let peer = hex(&to.olm_identity);
             let mut session = match st.sessions.get(&peer).and_then(|p| load_session(&key, p)) {
                 Some(s) => s,
-                None => match dm::outbound_session(&account, to) {
+                None => match dm::outbound_session(&account, to, st.claimed.get(&peer).copied()) {
                     Some(s) => s,
                     None => continue,
                 },
@@ -277,6 +403,7 @@ impl Core {
             if let Some(d) = s.dm.as_mut() {
                 for (peer, p) in &sessions {
                     d.sessions.insert(peer.clone(), p.clone());
+                    d.claimed.remove(peer); // used (or not needed any more)
                 }
                 for t in &targets {
                     d.owners.insert(hex(&t.olm_identity), author_s.clone());
@@ -427,7 +554,7 @@ impl Core {
             let peer = hex(&to.olm_identity);
             let mut session = match st.sessions.get(&peer).and_then(|p| load_session(&key, p)) {
                 Some(s) => s,
-                None => match dm::outbound_session(&account, to) {
+                None => match dm::outbound_session(&account, to, st.claimed.get(&peer).copied()) {
                     Some(s) => s,
                     None => continue,
                 },
@@ -456,6 +583,7 @@ impl Core {
         self.update(|s| {
             if let Some(d) = s.dm.as_mut() {
                 for (peer, p) in sessions {
+                    d.claimed.remove(&peer);
                     d.sessions.insert(peer, p);
                 }
             }
@@ -552,9 +680,7 @@ impl Core {
                 d.sessions.insert(peer.clone(), session_p);
                 d.account = account_p;
                 d.owners.insert(peer.clone(), owner.clone());
-                if !had_session {
-                    d.card_minute = 0; // a prekey was used: republish my card
-                }
+                d.claimed.remove(&peer);
             }
             let idx = match s.conversations.iter().position(|c| c.author == owner) {
                 Some(i) => i,

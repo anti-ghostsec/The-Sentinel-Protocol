@@ -725,7 +725,7 @@ async fn msg_bench(pillar: &str, messages: usize, bits: u8) -> Result<()> {
     let inbox = dm::deliver_to(&b_card.inbox_ids).context("no inbox for today")?;
     let shard = dm::shard_of(&inbox);
     let prefix = dm::prefix_of(shard, bits);
-    let mut a_sess = dm::outbound_session(&a_acc, &b_card).context("no session")?;
+    let mut a_sess = dm::outbound_session(&a_acc, &b_card, None).context("no session")?;
     let mut b_sess: Option<vodozemac::olm::Session> = None;
     let reply = dm::ReplyInfo {
         pillar: pillar.to_owned(),

@@ -592,6 +592,8 @@ fn conversations(core: State<'_, Arc<Core>>) -> Res<Vec<crate::core::dms::Conver
 
 #[tauri::command]
 fn thread(core: State<'_, Arc<Core>>, author: String) -> Res<Vec<crate::core::dms::MessageView>> {
+    // Opening a conversation is when a first message is likely.
+    core.prefetch_prekeys(&author);
     core.thread(&author).map_err(err)
 }
 

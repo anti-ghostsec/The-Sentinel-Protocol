@@ -52,7 +52,7 @@ pub struct MailState {
 /// An older Pillar's answer to a request it doesn't know.
 const NO_WATCH: &str = "Pillar doesn't hold watches";
 /// Ask an older Pillar again after this long (it may have been updated).
-const NO_WATCH_RETRY: Duration = Duration::from_secs(6 * 3600);
+pub(super) const NO_WATCH_RETRY: Duration = Duration::from_secs(6 * 3600);
 
 impl Core {
     /// My own choice of prefix length for a Pillar, from what I observed.

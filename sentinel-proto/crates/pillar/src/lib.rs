@@ -19,6 +19,7 @@
 
 mod directory;
 mod economy;
+mod prekeys;
 mod limits;
 mod mixkeys;
 mod relay;
@@ -145,6 +146,8 @@ struct Ctx {
     deposits: tokio::sync::broadcast::Sender<u16>,
     /// `Watch` requests being held.
     watching: AtomicU64,
+    /// One-time key claims seen lately (a proof of work counts once).
+    prekey_claims: prekeys::Claims,
 }
 
 /// Most mixed packets held at once.
@@ -227,6 +230,7 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         dir: Arc::default(),
         deposits: tokio::sync::broadcast::channel(1024).0,
         watching: AtomicU64::new(0),
+        prekey_claims: prekeys::Claims::default(),
     });
     let (max_seq, count) = mailbox_scan(&cfg.store);
     // The counter survives restarts even after every deposit expired (a
@@ -268,7 +272,11 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         tasks.push(tokio::spawn(async move {
             loop {
                 let s2 = store.clone();
-                let _ = tokio::task::spawn_blocking(move || prune(&s2, max_age, chunk_age)).await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    prune(&s2, max_age, chunk_age);
+                    prekeys::expire(&s2);
+                })
+                .await;
                 let (objects, mail, chunks) = usage(&store);
                 stats.used_bytes.store(objects + mail, Ordering::Relaxed);
                 stats.mail_bytes.store(mail, Ordering::Relaxed);
@@ -1066,6 +1074,26 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             };
             let hold = Duration::from_secs(wire::WATCH_HOLD_SECS);
             Response::Blobs(watch_mailbox(store, ctx.deposits.subscribe(), bits, prefix, after, hold).await)
+        }
+        Request::PutPrekeys { bundle, entries, nonce } => {
+            if !pow::check(dm::PREKEY_PUT_POW_DOMAIN, &dm::prekey_put_pow_data(&bundle, &entries), nonce, dm::PREKEY_PUT_POW_BITS) {
+                stats.rejected.fetch_add(1, Ordering::Relaxed);
+                return Response::Rejected("invalid prekeys".into());
+            }
+            match prekeys::put(store, &bundle, &entries).await {
+                Ok(()) => Response::Pong,
+                Err(why) => Response::Rejected(why.into()),
+            }
+        }
+        Request::ClaimPrekey { bundle, salt, nonce } => {
+            if !pow::check(dm::PREKEY_CLAIM_POW_DOMAIN, &dm::prekey_claim_pow_data(&bundle, &salt), nonce, dm::PREKEY_CLAIM_POW_BITS) || !ctx.prekey_claims.first_time(&bundle, &salt) {
+                stats.rejected.fetch_add(1, Ordering::Relaxed);
+                return Response::Rejected("invalid claim".into());
+            }
+            match prekeys::claim(store, &bundle).await {
+                Some(entry) => Response::Object(entry),
+                None => Response::NotFound,
+            }
         }
         Request::PutChunk { data, nonce } => {
             // Media chunks are ciphertext with keys this node is never given.

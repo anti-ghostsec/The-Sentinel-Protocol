@@ -152,6 +152,17 @@ pub enum Request {
         object: Vec<u8>,
         nonce: u64,
     },
+    /// Add signed one-time keys to a bundle (`dm::prekey_bundle`; `bundle`
+    /// is the key that signed them). Answered with `Pong`.
+    PutPrekeys {
+        bundle: [u8; 32],
+        #[serde(with = "bytes")]
+        entries: Vec<u8>,
+        nonce: u64,
+    },
+    /// Take one one-time key from a bundle: each is handed out once
+    /// (`Object`: one entry, or `NotFound` when none are left).
+    ClaimPrekey { bundle: [u8; 32], salt: [u8; 16], nonce: u64 },
 }
 
 /// What a Pillar answers to a request it doesn't know (an older version).

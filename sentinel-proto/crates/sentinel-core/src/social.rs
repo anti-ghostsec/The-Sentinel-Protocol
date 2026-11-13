@@ -182,6 +182,10 @@ pub struct ContactCard {
     /// me is post-quantum hybrid.
     #[serde(default)]
     pub inbox_kem: Option<Vec<u8>>,
+    /// `(day, bundle)`: where my Pillar keeps that day's one-time keys
+    /// (see `dm::prekey_signer`).
+    #[serde(default)]
+    pub prekey_days: Vec<(u64, [u8; 32])>,
 }
 
 /// Current Unix time coarsened to the minute.

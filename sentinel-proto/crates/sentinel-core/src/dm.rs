@@ -31,7 +31,6 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::social::ContactCard;
 
 /// One-time prekeys kept published in a contact card.
-pub const ONE_TIME_KEYS: usize = 20;
 /// Maximum deposited blob size.
 pub const MAX_BLOB: usize = 64 * 1024;
 /// Proof-of-work for inbox deposits (anti-spam without identity).
@@ -367,26 +366,103 @@ pub fn inbox_kem_public(fetch_secret: &[u8; 32]) -> Vec<u8> {
     crate::pq::kem_public(&inbox_kem_seed(fetch_secret, kem_period(today())))
 }
 
+/// Describe the account as a contact card.
+///
+/// The card carries the fallback key and no one-time keys: those are
+/// handed out one at a time by my Pillar (see `prekey_bundle`), since a
+/// card goes to many people and a one-time key works for one of them.
+/// Keys are never marked as published: vodozemac only shows the fallback
+/// key while it is unpublished, and a card made after that would get a
+/// new one, dropping the key cards already handed out depend on.
 pub fn make_card(account: &mut Account, inbox_pub: [u8; 32], inbox_kem: Option<Vec<u8>>, fetch_secret: [u8; 32], pillar: String) -> ContactCard {
-    let have = account.one_time_keys().len();
-    if have < ONE_TIME_KEYS {
-        account.generate_one_time_keys(ONE_TIME_KEYS - have);
-    }
     if account.fallback_key().is_empty() {
         account.generate_fallback_key();
     }
-    let card = ContactCard {
+    let t = today();
+    ContactCard {
         olm_identity: account.curve25519_key().to_bytes(),
-        one_time_keys: account.one_time_keys().values().map(|k| k.to_bytes()).collect(),
+        one_time_keys: Vec::new(),
         fallback_key: account.fallback_key().values().next().map(|k| k.to_bytes()),
         inbox_pub,
         inbox_ids: upcoming_inbox_ids(&fetch_secret),
         pillar,
         minute: crate::social::coarse_minute(),
         inbox_kem,
-    };
-    account.mark_keys_as_published();
-    card
+        prekey_days: (t.saturating_sub(1)..t + PREKEY_DAYS_AHEAD).map(|d| (d, prekey_signer(&fetch_secret, d).verifying_key().to_bytes())).collect(),
+    }
+}
+
+/* ---- one-time keys handed out by my Pillar ---- */
+
+/// One-time keys kept ready per day.
+pub const PREKEYS_PER_DAY: usize = 10;
+/// Days of bundle keys a card lists (from yesterday).
+pub const PREKEY_DAYS_AHEAD: u64 = 7;
+/// One entry of a bundle: the one-time key and my signature over it.
+pub const PREKEY_ENTRY: usize = 32 + 64;
+/// Most entries in one bundle.
+pub const MAX_PREKEYS: usize = 16;
+pub const PREKEY_PUT_POW_DOMAIN: &str = "sentinel/v1/prekey-put";
+pub const PREKEY_PUT_POW_BITS: u32 = 16;
+pub const PREKEY_CLAIM_POW_DOMAIN: &str = "sentinel/v1/prekey-claim";
+pub const PREKEY_CLAIM_POW_BITS: u32 = 14;
+
+/// The key that signs day `day`'s one-time keys. Its public half names the
+/// bundle on the Pillar: a different, unlinkable name every day, which
+/// only people holding my card can compute, and only I can fill.
+pub fn prekey_signer(fetch_secret: &[u8; 32], day: u64) -> ed25519_dalek::SigningKey {
+    let mut m = zeroize::Zeroizing::new(fetch_secret.to_vec());
+    m.extend_from_slice(&day.to_le_bytes());
+    ed25519_dalek::SigningKey::from_bytes(&blake3::derive_key("sentinel/v1/prekey-signer", &m))
+}
+
+fn prekey_message(key: &[u8; 32]) -> Vec<u8> {
+    let mut m = b"sentinel/v1/prekey".to_vec();
+    m.extend_from_slice(key);
+    m
+}
+
+/// Bundle entries for these one-time keys (`PREKEY_ENTRY` bytes each).
+pub fn prekey_bundle(signer: &ed25519_dalek::SigningKey, keys: &[[u8; 32]]) -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    let mut out = Vec::with_capacity(keys.len() * PREKEY_ENTRY);
+    for k in keys {
+        out.extend_from_slice(k);
+        out.extend_from_slice(&signer.sign(&prekey_message(k)).to_bytes());
+    }
+    out
+}
+
+/// The one-time key in a bundle entry, if `bundle` (the bundle's name, a
+/// verifying key) signed it. Pillars check uploads with this, and senders
+/// check what a Pillar hands them.
+pub fn check_prekey(bundle: &[u8; 32], entry: &[u8]) -> Option<[u8; 32]> {
+    if entry.len() != PREKEY_ENTRY {
+        return None;
+    }
+    let key: [u8; 32] = entry[..32].try_into().ok()?;
+    let sig = ed25519_dalek::Signature::from_bytes(entry[32..].try_into().ok()?);
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(bundle).ok()?;
+    vk.verify_strict(&prekey_message(&key), &sig).ok()?;
+    Some(key)
+}
+
+/// The bundle to claim a one-time key from for `card` today, if it lists one.
+pub fn prekey_bundle_of(card: &ContactCard) -> Option<[u8; 32]> {
+    let t = today();
+    card.prekey_days.iter().find(|(d, _)| *d == t).map(|(_, b)| *b)
+}
+
+pub fn prekey_put_pow_data(bundle: &[u8; 32], entries: &[u8]) -> Vec<u8> {
+    let mut m = bundle.to_vec();
+    m.extend_from_slice(blake3::hash(entries).as_bytes());
+    m
+}
+
+pub fn prekey_claim_pow_data(bundle: &[u8; 32], salt: &[u8; 16]) -> Vec<u8> {
+    let mut m = bundle.to_vec();
+    m.extend_from_slice(salt);
+    m
 }
 
 /// Days between fallback key changes. The account keeps the previous key
@@ -406,17 +482,20 @@ pub fn rotate_fallback_if_due(account: &mut Account, made_day: u64, today: u64) 
     true
 }
 
-/// Start a session to `card` using its fallback key (or a random one-time
-/// key from a card without one).
+/// Start a session to `card`: on `claimed`, a one-time key its Pillar
+/// handed to me alone (checked with `check_prekey`), or else on its
+/// fallback key (or a random one-time key from a card without one).
 ///
 /// A card is given to many people, and a one-time key works only for the
-/// first of them: two senders picking the same one meant the second one's
-/// messages could never be opened, all of them, until a reply that never
-/// came. The fallback key works for everyone. The cost is that the first
-/// messages, until a reply, rest on a key that isn't deleted after use.
-pub fn outbound_session(account: &Account, card: &ContactCard) -> Option<Session> {
+/// first of them: two senders picking the same one from the card meant the
+/// second one's messages could never be opened, all of them, until a reply
+/// that never came. So one-time keys come from the Pillar, one each, and
+/// the fallback key, which works for everyone, covers the rest; first
+/// messages on it, until a reply, rest on a key that is deleted only when
+/// it is replaced.
+pub fn outbound_session(account: &Account, card: &ContactCard, claimed: Option<[u8; 32]>) -> Option<Session> {
     let identity = Curve25519PublicKey::from_bytes(card.olm_identity);
-    let otk = match card.fallback_key {
+    let otk = match claimed.or(card.fallback_key) {
         Some(k) => k,
         None if !card.one_time_keys.is_empty() => {
             let i = (u32::from_le_bytes(crate::random_bytes::<4>()) as usize) % card.one_time_keys.len();
@@ -599,7 +678,7 @@ mod tests {
         assert_ne!(b_card.inbox_kem.as_deref(), Some(crate::pq::kem_public(&inbox_kem_seed(&b_inbox, period)).as_slice()));
         // A card from before still works: its key is opened as a fallback.
         b_card.inbox_kem = Some(crate::pq::kem_public(&legacy_inbox_kem_seed(&b_inbox, period)));
-        let mut sess = outbound_session(&a_acc, &b_card).unwrap();
+        let mut sess = outbound_session(&a_acc, &b_card, None).unwrap();
         let blob = encrypt(&a_acc, &mut sess, &first(&a_key, "old card", &a_card, &b_card.inbox_pub), &b_card).unwrap();
         assert_eq!(u16::from_le_bytes([blob[32], blob[33]]) as usize, crate::pq::KEM_CT);
         let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
@@ -621,7 +700,7 @@ mod tests {
         let (_b_key, mut b_acc, b_inbox, b_card) = party("b.onion");
 
         // Alice -> Bob (first message carries her signed card).
-        let mut a_sess = outbound_session(&a_acc, &b_card).unwrap();
+        let mut a_sess = outbound_session(&a_acc, &b_card, None).unwrap();
         let first = first(&a_key, "hi bob", &a_card, &b_card.inbox_pub);
         let blob = encrypt(&a_acc, &mut a_sess, &first, &b_card).unwrap();
         assert!(!blob.windows(6).any(|w| w == b"hi bob")); // Pillar sees ciphertext only
@@ -653,7 +732,7 @@ mod tests {
         let (a_key, a_acc, _, a_card) = party("a.onion");
         let (_, mut b_acc, b_inbox, old_card) = party("b.onion");
         let send = |acc: &Account, card: &ContactCard, text: &str| {
-            let mut sess = outbound_session(acc, card).unwrap();
+            let mut sess = outbound_session(acc, card, None).unwrap();
             encrypt(acc, &mut sess, &first(&a_key, text, &a_card, &card.inbox_pub), card).unwrap()
         };
         let open = |acc: &mut Account, blob: &[u8]| {
@@ -674,11 +753,59 @@ mod tests {
     }
 
     #[test]
+    fn a_new_card_keeps_the_fallback_key() {
+        let mut acc = Account::new();
+        let fetch = [3u8; 32];
+        let c1 = make_card(&mut acc, [1; 32], None, fetch, "p.onion".into());
+        let c2 = make_card(&mut acc, [1; 32], None, fetch, "p.onion".into());
+        let c3 = make_card(&mut acc, [1; 32], None, fetch, "p.onion".into());
+        assert!(c1.fallback_key.is_some());
+        assert_eq!(c1.fallback_key, c2.fallback_key);
+        assert_eq!(c1.fallback_key, c3.fallback_key);
+        assert!(c1.one_time_keys.is_empty());
+    }
+
+    #[test]
+    fn a_claimed_one_time_key_starts_a_session_once() {
+        let (_, mut b_acc, b_inbox, b_card) = party("b.onion");
+        let fetch = fetch_of(&b_inbox);
+        let day = today();
+        // Bob leaves signed keys in today's bundle, named in his card.
+        let made = b_acc.generate_one_time_keys(2);
+        let keys: Vec<[u8; 32]> = made.created.iter().map(|k| k.to_bytes()).collect();
+        let signer = prekey_signer(&fetch, day);
+        let bundle = prekey_bundle_of(&b_card).expect("the card names today's bundle");
+        assert_eq!(bundle, signer.verifying_key().to_bytes());
+        let entries = prekey_bundle(&signer, &keys);
+        let entry = &entries[..PREKEY_ENTRY];
+        assert_eq!(check_prekey(&bundle, entry), Some(keys[0]));
+        // Another day's bundle, or a changed key, doesn't check.
+        assert!(check_prekey(&prekey_signer(&fetch, day + 1).verifying_key().to_bytes(), entry).is_none());
+        let mut bad = entry.to_vec();
+        bad[0] ^= 1;
+        assert!(check_prekey(&bundle, &bad).is_none());
+
+        let (a_key, a_acc, _, a_card) = party("a.onion");
+        let mut sess = outbound_session(&a_acc, &b_card, Some(keys[0])).unwrap();
+        let blob = encrypt(&a_acc, &mut sess, &first(&a_key, "one-time", &a_card, &b_card.inbox_pub), &b_card).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &fetch, &blob).unwrap();
+        assert_eq!(decrypt(&mut b_acc, None, sender, &msg).unwrap().1.text, "one-time");
+        // The key is gone from Bob's account: it can't start a second session.
+        assert!(!b_acc.one_time_keys().values().any(|k| k.to_bytes() == keys[0]));
+        assert!(b_acc.one_time_keys().values().any(|k| k.to_bytes() == keys[1]));
+        let (c_key, c_acc, _, c_card) = party("c.onion");
+        let mut sess = outbound_session(&c_acc, &b_card, Some(keys[0])).unwrap();
+        let blob = encrypt(&c_acc, &mut sess, &first(&c_key, "again", &c_card, &b_card.inbox_pub), &b_card).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &fetch, &blob).unwrap();
+        assert!(decrypt(&mut b_acc, None, sender, &msg).is_none());
+    }
+
+    #[test]
     fn two_senders_with_the_same_card_both_get_through() {
         let (_, mut b_acc, b_inbox, b_card) = party("b.onion");
         for name in ["one", "two", "three"] {
             let (key, acc, _, card) = party("a.onion");
-            let mut sess = outbound_session(&acc, &b_card).unwrap();
+            let mut sess = outbound_session(&acc, &b_card, None).unwrap();
             for n in 0..2 {
                 let text = format!("{name} {n}");
                 let blob = encrypt(&acc, &mut sess, &first(&key, &text, &card, &b_card.inbox_pub), &b_card).unwrap();
@@ -706,7 +833,7 @@ mod tests {
         let (a_key, a_acc, _, a_card) = party("a.onion");
         let (_, mut b_acc, b_inbox, b_card) = party("b.onion");
         let reply_info = |c: &ContactCard| ReplyInfo { pillar: c.pillar.clone(), inbox_pub: c.inbox_pub, inbox_ids: c.inbox_ids.clone(), inbox_kem: c.inbox_kem.clone() };
-        let mut a_sess = outbound_session(&a_acc, &b_card).unwrap();
+        let mut a_sess = outbound_session(&a_acc, &b_card, None).unwrap();
         let mut f = first(&a_key, "hi bob", &a_card, &b_card.inbox_pub);
         f.reply = Some(reply_info(&a_card));
         let first_blob = encrypt(&a_acc, &mut a_sess, &f, &b_card).unwrap();
@@ -736,7 +863,7 @@ mod tests {
         let (a_key, a_acc, _, a_card) = party("a.onion");
         let (_, mut b_acc, b_inbox, mut b_card) = party("b.onion");
         b_card.inbox_kem = None; // an older app
-        let mut sess = outbound_session(&a_acc, &b_card).unwrap();
+        let mut sess = outbound_session(&a_acc, &b_card, None).unwrap();
         let blob = encrypt(&a_acc, &mut sess, &first(&a_key, "hi", &a_card, &b_card.inbox_pub), &b_card).unwrap();
         let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
         assert_eq!(decrypt(&mut b_acc, None, sender, &msg).unwrap().1.text, "hi");
@@ -748,7 +875,7 @@ mod tests {
         let (_, mut b_acc, b_inbox, b_card) = party("b.onion");
         let (mallory_key, _, _, _) = party("m.onion");
         // Mallory MACs Alice's card with her own key but claims to be Alice.
-        let mut sess = outbound_session(&a_acc, &b_card).unwrap();
+        let mut sess = outbound_session(&a_acc, &b_card, None).unwrap();
         let mut forged = first(&mallory_key, "send money", &a_card, &b_card.inbox_pub);
         forged.from = a_key.verifying_key().to_bytes();
         let blob = encrypt(&a_acc, &mut sess, &forged, &b_card).unwrap();

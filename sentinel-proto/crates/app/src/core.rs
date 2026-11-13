@@ -208,6 +208,22 @@ pub struct DmState {
     /// The card this device published last (handed to a new device).
     #[serde(default)]
     pub last_card: Option<sentinel_core::social::ContactCard>,
+    /// One-time keys I left at my Pillar, by day (see `dm::prekey_signer`).
+    #[serde(default)]
+    pub prekeys: Vec<PrekeyDay>,
+    /// One-time keys Pillars handed me for conversations I haven't started
+    /// yet (peer Olm identity hex -> key).
+    #[serde(default)]
+    pub claimed: std::collections::HashMap<String, [u8; 32]>,
+}
+
+/// One day's one-time keys at my Pillar.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct PrekeyDay {
+    pub day: u64,
+    pub keys: Vec<[u8; 32]>,
+    /// Whether the Pillar has taken them.
+    pub sent: bool,
 }
 
 /// Disappearing messages: days until deletion.
@@ -715,6 +731,11 @@ struct Inner {
     /// Pillar addresses typed in while the first connection was stuck
     /// (tried first; memory only).
     pillar_hints: Vec<String>,
+    /// Pillars that don't keep one-time keys yet (older ones), and when
+    /// that was found out.
+    no_prekeys: std::collections::HashMap<String, std::time::Instant>,
+    /// When a one-time key was last asked for, per device (Olm identity hex).
+    prekey_tries: std::collections::HashMap<String, std::time::Instant>,
 }
 
 pub struct Core {
@@ -1492,9 +1513,10 @@ impl Core {
                 let _ = app.emit("rooms", ());
             }
         }
-        let (_, _, flushed, refreshed, discovered, count, _, rewards) = tokio::join!(
+        let (_, _, _, flushed, refreshed, discovered, count, _, rewards) = tokio::join!(
             self.publish_profile(),
             self.publish_card(),
+            self.publish_prekeys(),
             self.flush_outbox(),
             self.refresh(),
             self.discover(),

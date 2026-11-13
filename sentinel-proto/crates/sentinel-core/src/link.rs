@@ -137,7 +137,7 @@ mod tests {
     use super::*;
 
     fn card() -> ContactCard {
-        ContactCard { olm_identity: [1; 32], one_time_keys: vec![], fallback_key: None, inbox_pub: [2; 32], inbox_ids: vec![], pillar: "x".into(), minute: 0, inbox_kem: None }
+        ContactCard { olm_identity: [1; 32], one_time_keys: vec![], fallback_key: None, inbox_pub: [2; 32], inbox_ids: vec![], pillar: "x".into(), minute: 0, inbox_kem: None, prekey_days: vec![] }
     }
 
     #[test]
