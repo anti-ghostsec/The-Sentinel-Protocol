@@ -56,8 +56,8 @@ struct Args {
     /// Print redacted Tor diagnostics to stderr (never written to disk).
     #[arg(long)]
     debug_log: bool,
-    /// Print this Pillar's credit keys (for the seed list) and exit,
-    /// without starting Tor.
+    /// Print this Pillar's credit keys (for the seed list; made now if it
+    /// has none yet) and exit, without starting Tor.
     #[arg(long)]
     print_keys: bool,
     /// Move the credits this Pillar has earned into a file (to import in
@@ -122,14 +122,11 @@ async fn main() -> Result<()> {
     }
     if args.print_keys {
         let store = sentinel_net::data_root(&args.data)?.join("objects");
-        match std::fs::read(store.join("mint-seed.bin")).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
-            Some(seed) => {
-                let voprf = sentinel_core::credits::Mint::from_seed(&seed).public_key();
-                let pq = sentinel_core::pqcash::key_fingerprint(&sentinel_core::pqcash::mint_signer(&seed).public());
-                println!("{} pq={}", data_encoding::HEXLOWER.encode(&voprf), data_encoding::HEXLOWER.encode(&pq));
-            }
-            None => println!("this Pillar isn't a credit mint (no mint seed)"),
-        }
+        let seed = pillar::mint_seed(&store)?;
+        let voprf = sentinel_core::credits::Mint::from_seed(&seed).public_key();
+        let pq = sentinel_core::pqcash::key_fingerprint(&sentinel_core::pqcash::mint_signer(&seed).public());
+        println!("{} pq={}", data_encoding::HEXLOWER.encode(&voprf), data_encoding::HEXLOWER.encode(&pq));
+        eprintln!("[pillar] for seeds.txt: put this Pillar's onion address in front of that line");
         return Ok(());
     }
     if args.debug_log {

@@ -189,19 +189,27 @@ fn spent_path(store: &Path, epoch: u32) -> PathBuf {
     store.join(format!("nullifiers-{epoch}.bin"))
 }
 
+/// This Pillar's mint seed, made on first use. Every Pillar can make one
+/// (so `--print-keys` can show the keys before it joins the seed list),
+/// but only a Pillar on the mint list uses it.
+pub fn mint_seed(store: &Path) -> Result<[u8; 32]> {
+    let seed_path = store.join("mint-seed.bin");
+    match std::fs::read(&seed_path) {
+        Ok(b) if b.len() == 32 => Ok(b.try_into().unwrap()),
+        _ => {
+            let s = sentinel_core::random_bytes::<32>();
+            std::fs::create_dir_all(store)?;
+            std::fs::write(&seed_path, s)?;
+            Ok(s)
+        }
+    }
+}
+
 impl Econ {
     /// A Pillar on the network's mint list mints; others don't.
     pub fn load(store: &Path, self_onion: &str, mints: Vec<String>) -> Result<Econ> {
         let mint = if mints.iter().any(|m| m == self_onion) {
-            let seed_path = store.join("mint-seed.bin");
-            let seed: [u8; 32] = match std::fs::read(&seed_path) {
-                Ok(b) if b.len() == 32 => b.try_into().unwrap(),
-                _ => {
-                    let s = sentinel_core::random_bytes::<32>();
-                    std::fs::write(&seed_path, s)?;
-                    s
-                }
-            };
+            let seed = mint_seed(store)?;
             let now = credits::current_epoch();
             let mut spent = HashMap::new();
             for e in [now.saturating_sub(1), now] {

@@ -26,7 +26,7 @@ mod seen;
 mod reports;
 mod pqmint;
 mod earning;
-pub use economy::take_rewards;
+pub use economy::{mint_seed, take_rewards};
 pub use reports::{keep as keep_reported, list as list_reports, remove as remove_reported, Report};
 #[cfg(feature = "test-hooks")]
 pub use economy::check_rewards;
