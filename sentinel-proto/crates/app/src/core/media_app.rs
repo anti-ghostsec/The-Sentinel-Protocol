@@ -238,6 +238,36 @@ fn clean_name(s: &str) -> Option<String> {
     (!n.is_empty()).then_some(n)
 }
 
+/// Extensions that run something when opened.
+const RUNS: &[&str] = &[
+    "exe", "scr", "com", "pif", "bat", "cmd", "msi", "msix", "appx", "js", "jse", "vbs", "vbe", "wsf", "wsh", "ps1", "lnk", "hta", "cpl", "jar", "reg", "dll", "sh",
+    "desktop", "appimage", "run", "app", "command", "apk",
+];
+
+/// A save name that can't pass a program off as something else: a sender's
+/// "photo.jpg.exe" becomes "photo_jpg.exe", and media (photos, videos,
+/// sound) keep the extension of what they are.
+fn safe_save_name(name: &str, kind: &str, mime: &str) -> String {
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    let runs = RUNS.contains(&ext.to_ascii_lowercase().as_str());
+    if runs && kind != "file" {
+        return default_name(kind, mime, None);
+    }
+    if runs && stem.contains('.') {
+        return format!("{}.{ext}", stem.replace('.', "_"));
+    }
+    name.to_owned()
+}
+
+/// The Content-Type a sender's media is served with: what it says only for
+/// plain media types (never script-capable ones like SVG or HTML).
+pub(crate) fn served_type(mime: &str) -> &str {
+    let plain = mime.len() <= 64
+        && mime.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'.' | b'+'))
+        && (mime.starts_with("video/") || mime.starts_with("audio/") || (mime.starts_with("image/") && !mime.contains("svg")));
+    if plain { mime } else { "application/octet-stream" }
+}
+
 fn new_id() -> String {
     data_encoding::HEXLOWER.encode(&sentinel_core::random_bytes::<12>())
 }
@@ -1338,7 +1368,7 @@ impl Core {
     /// Display name for a save dialog.
     pub fn media_name(&self, post_id: &str, index: usize) -> Result<String> {
         let (r, _) = self.resolve(post_id, index)?;
-        Ok(r.name.clone().and_then(|n| clean_name(&n)).unwrap_or_else(|| default_name(&r.kind, &r.mime, None)))
+        Ok(r.name.clone().and_then(|n| clean_name(&n)).map(|n| safe_save_name(&n, &r.kind, &r.mime)).unwrap_or_else(|| default_name(&r.kind, &r.mime, None)))
     }
 }
 
@@ -1564,5 +1594,11 @@ mod tests {
         assert_eq!(default_name("video", "video/mp4", Some(p)), "video.mp4");
         assert_eq!(clean_name(r"..\..\evil:name.exe").as_deref(), Some("evilname.exe"));
         assert_eq!(clean_name("  "), None);
+        assert_eq!(safe_save_name("photo.jpg.exe", "file", ""), "photo_jpg.exe");
+        assert_eq!(safe_save_name("photo.exe", "image", "image/png"), "image.png");
+        assert_eq!(safe_save_name("notes.v2.pdf", "file", ""), "notes.v2.pdf");
+        assert_eq!(served_type("video/mp4"), "video/mp4");
+        assert_eq!(served_type("image/svg+xml"), "application/octet-stream");
+        assert_eq!(served_type("text/html"), "application/octet-stream");
     }
 }

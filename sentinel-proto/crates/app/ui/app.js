@@ -387,11 +387,11 @@ async function startConnecting() {
   clearInterval(S.connectTimer);
   S.connectTimer = setInterval(paintConnectDetail, 1000);
   await refreshStatus();
-  show(S.status && S.status.linking ? "linkwait" : "connecting");
+  show(S.status && S.status.linking != null ? "linkwait" : "connecting");
   try {
     await invoke("connect");
     await refreshStatus();
-    if (S.status.linking) return waitForLink();
+    if (S.status.linking != null) return waitForLink();
     enterApp();
   } catch (e) {
     paintNet({ state: "error", frac: 0, text: String(e) });
@@ -3192,28 +3192,49 @@ $("linkdev-form").addEventListener("submit", async (ev) => {
   try {
     const check = await invoke("link_join", { code: $("linkdev-code").value, device: $("linkdev-name").value, pass: $("linkdev-pass").value, mode: S.mode || "tor" });
     $("linkdev-pass").value = "";
-    $("linkwait-code").textContent = check;
+    $("linkwait-code").textContent = check || "····-····";
     show("linkwait");
     startConnecting();
   } catch (e) {
     setError("linkdev-error", String(e));
   }
 });
+function paintLinkWait() {
+  const code = S.status.linking;
+  $("linkwait-code").textContent = code || "····-····";
+  // The code appears once both devices swapped their values; the account
+  // is taken only after "They match" here.
+  $("linkwait-match").hidden = !code || S.status.linkingConfirmed;
+  $("linkwait-state").textContent = !code
+    ? "Waiting for your other device (it needs to be open and connected; this can take a few minutes)…"
+    : S.status.linkingConfirmed
+      ? "Waiting for your other device to allow this one…"
+      : "Does your other device show the same code? If it doesn't, press Cancel.";
+}
 async function waitForLink() {
   show("linkwait");
-  $("linkwait-code").textContent = S.status.linking;
-  $("linkwait-state").textContent = "Waiting for your other device to allow this one…";
+  paintLinkWait();
   for (;;) {
     await new Promise((r) => setTimeout(r, 4000));
     await invoke("refresh_rooms").catch(() => {});
     await refreshStatus();
-    if (!S.status.linking) {
+    if (S.status.linking == null) {
       $("linkwait-state").textContent = "Linked.";
       enterApp();
       return;
     }
+    paintLinkWait();
   }
 }
+$("linkwait-match").addEventListener("click", async () => {
+  try {
+    await invoke("link_join_confirm");
+  } catch (e) {
+    $("linkwait-state").textContent = String(e);
+  }
+  await refreshStatus();
+  paintLinkWait();
+});
 $("linkwait-cancel").addEventListener("click", async () => {
   await invoke("link_join_cancel").catch(() => {});
   await invoke("panic_wipe", { confirm: "DELETE" }).catch(() => {});

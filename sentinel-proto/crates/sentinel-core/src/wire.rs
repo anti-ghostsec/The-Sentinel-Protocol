@@ -137,8 +137,20 @@ pub enum Request {
     /// `social::REPORT_CATEGORIES`; `nonce` is proof of work. Answered
     /// with `Pong` (even when nothing here matches: no oracle).
     /// `token` (`social::report_token`) lets the Pillar count each
-    /// reporter once without learning who they are.
-    Report { address: [u8; 32], chunks: Vec<[u8; 32]>, category: u8, token: [u8; 32], nonce: u64 },
+    /// reporter once without learning who they are. `post`: the post's
+    /// bytes, for an Archive that holds only its media (the media pieces
+    /// that can be removed are taken from the post, never from `chunks`
+    /// alone). Each further report of the same item needs more work
+    /// (answered "more work: N" with the bits needed).
+    Report {
+        address: [u8; 32],
+        chunks: Vec<[u8; 32]>,
+        category: u8,
+        token: [u8; 32],
+        nonce: u64,
+        #[serde(default, with = "bytes")]
+        post: Vec<u8>,
+    },
     /// Like `Fetch`, but when nothing newer than `after` is there yet, the
     /// Pillar holds the request until a deposit lands in the prefix (or up
     /// to `WATCH_HOLD_SECS`, answering with empty `Blobs`). Messages arrive

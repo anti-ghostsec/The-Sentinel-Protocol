@@ -102,7 +102,13 @@ pub enum ModAction {
     Ban { member: [u8; 32] },
     /// A join request was answered (sent to the ask box, so other
     /// moderators drop it from their list).
-    Handled { request: [u8; 32] },
+    Handled {
+        request: [u8; 32],
+        /// Approved: the member key let in (so the admin's rekeys include
+        /// it; nobody else's).
+        #[serde(default)]
+        admitted: Option<[u8; 32]>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

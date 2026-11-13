@@ -633,6 +633,9 @@ fn shard_path(store: &Path, shard: u16) -> PathBuf {
 }
 
 /// Anonymous follow tokens (never identities) for an author.
+/// Most follower tokens kept per account (about 3 MB).
+const MAX_FOLLOW_TOKENS: usize = 50_000;
+
 fn followers_path(store: &Path, author: &[u8; 32]) -> PathBuf {
     store.join("followers").join(format!("{}.tok", social::author_text(author)))
 }
@@ -896,16 +899,20 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             let list = page(read_lines(&shard_path(store, shard)).await, after);
             Response::Index(if hidden.is_empty() { list } else { list.into_iter().filter(|(_, a)| !hidden.contains(&a.to_text())).collect() })
         }
-        Request::Report { address, chunks, category, token, nonce } => {
-            if usize::from(category) >= social::REPORT_CATEGORIES.len()
-                || chunks.len() > 5000
-                || !pow::check(social::REPORT_POW_DOMAIN, &social::report_pow_data(&address, &token, category), nonce, social::REPORT_POW_BITS)
-            {
+        Request::Report { address, chunks, category, token, nonce, post } => {
+            let data = social::report_pow_data(&address, &token, category);
+            if usize::from(category) >= social::REPORT_CATEGORIES.len() || chunks.len() > 5000 || !pow::check(social::REPORT_POW_DOMAIN, &data, nonce, social::REPORT_POW_BITS) {
                 stats.rejected.fetch_add(1, Ordering::Relaxed);
                 return Response::Rejected("invalid report".into());
             }
+            // One person with many made-up tokens: each further report of
+            // the same item costs more.
+            let needed = reports::bits_needed(store, &address);
+            if !pow::check(social::REPORT_POW_DOMAIN, &data, nonce, needed) {
+                return Response::Rejected(format!("more work: {needed}"));
+            }
             let store = store.clone();
-            let _ = tokio::task::spawn_blocking(move || reports::record(&store, &address, &chunks, category, &token)).await;
+            let _ = tokio::task::spawn_blocking(move || reports::record(&store, &address, &chunks, category, &token, &post)).await;
             Response::Pong
         }
         Request::FollowNotice { author, token, follow, nonce } => {
@@ -915,7 +922,10 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
                 return Response::Rejected("insufficient proof of work".into());
             }
             let path = followers_path(store, &author);
-            let _guard = INDEX_LOCK.lock().await;
+            // Its own lock (stores and deposits don't wait on it), and a cap
+            // per account: tokens are cheap to make up.
+            static FOLLOW_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _guard = FOLLOW_LOCK.lock().await;
             let mut tokens: Vec<String> = tokio::fs::read_to_string(&path)
                 .await
                 .map(|t| t.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect())
@@ -923,6 +933,9 @@ async fn handle_request(req: Request, ctx: &Ctx) -> Response {
             let tok = data_encoding::HEXLOWER.encode(&token);
             let present = tokens.contains(&tok);
             if follow && !present {
+                if tokens.len() >= MAX_FOLLOW_TOKENS {
+                    return Response::Count(tokens.len() as u64);
+                }
                 tokens.push(tok);
             } else if !follow && present {
                 tokens.retain(|t| *t != tok);

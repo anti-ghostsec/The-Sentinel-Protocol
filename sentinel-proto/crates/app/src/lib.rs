@@ -617,7 +617,8 @@ async fn stream_response(core: Arc<Core>, req: tauri::http::Request<Vec<u8>>) ->
     match core.stream_range(&parts[1], index, range.as_deref()).await {
         Ok((body, start, end, size, mime)) => Response::builder()
             .status(206)
-            .header("Content-Type", mime)
+            .header("Content-Type", core::media_app::served_type(&mime))
+            .header("X-Content-Type-Options", "nosniff")
             .header("Accept-Ranges", "bytes")
             .header("Content-Range", format!("bytes {start}-{end}/{size}"))
             .header("Cache-Control", "no-store")
@@ -1029,6 +1030,11 @@ fn link_join_cancel(core: State<'_, Arc<Core>>) -> Res<()> {
 }
 
 #[tauri::command]
+fn link_join_confirm(core: State<'_, Arc<Core>>) -> Res<()> {
+    core.link_join_confirm().map_err(err)
+}
+
+#[tauri::command]
 async fn refresh(core: State<'_, Arc<Core>>) -> Res<usize> {
     let core = Arc::clone(&core);
     core.refresh().await.map_err(err)
@@ -1344,6 +1350,7 @@ pub fn run() {
             link_approve,
             link_join,
             link_join_cancel,
+            link_join_confirm,
             release_key_create,
             release_pick_bundle,
             release_sign,

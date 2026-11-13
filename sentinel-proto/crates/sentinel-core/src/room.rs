@@ -100,7 +100,18 @@ pub enum RoomBlob {
     Ask(JoinRequest),
     /// The answer to a request, left in the requester's reply box: the room
     /// secret sealed to the room-only key they sent, or nothing (declined).
-    Answer { room_id: [u8; 32], sealed: Option<Vec<u8>>, epoch: u64 },
+    /// `signed`: by the admin key, or by a moderator's key with `proof`, the
+    /// admin-signed authority entry that names them (see [`answer_genuine`]):
+    /// anyone with the ask link can write to a reply box.
+    Answer {
+        room_id: [u8; 32],
+        sealed: Option<Vec<u8>>,
+        epoch: u64,
+        #[serde(default)]
+        signed: Vec<u8>,
+        #[serde(default)]
+        proof: Vec<u8>,
+    },
     /// A Sentinel App's state, signed by the admin key (see
     /// `apps::Snapshot`): members start from the newest one.
     AppState {
@@ -173,7 +184,7 @@ impl JoinRequest {
     /// (never the reply secret itself: the ask box is readable by anyone
     /// holding the ask link).
     pub fn id(&self) -> [u8; 32] {
-        blake3::derive_key("sentinel/v0/room-request-id", &self.reply)
+        request_id(&self.reply)
     }
 
     pub fn valid(&self) -> bool {
@@ -181,9 +192,54 @@ impl JoinRequest {
     }
 }
 
-/// An approved request: the room secret sealed to the requester.
-pub fn answer(room_id: &[u8; 32], req: &JoinRequest, secret: Option<&[u8; 32]>, epoch: u64) -> RoomBlob {
-    RoomBlob::Answer { room_id: *room_id, sealed: secret.map(|s| seal_secret_to(&req.member_pub, req.member_kem.as_deref(), s, room_id)), epoch }
+/// A request's ID, from its reply box secret.
+pub fn request_id(reply: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("sentinel/v0/room-request-id", reply)
+}
+
+const ANSWER_KIND: &str = "sentinel/room-answer";
+
+/// What an answer's signature covers.
+#[derive(Serialize)]
+struct AnswerBody<'a> {
+    room_id: &'a [u8; 32],
+    request: [u8; 32],
+    member_pub: &'a [u8; 32],
+    sealed: Option<[u8; 32]>,
+    epoch: u64,
+}
+
+fn answer_body(room_id: &[u8; 32], request: [u8; 32], member_pub: &[u8; 32], sealed: &Option<Vec<u8>>, epoch: u64) -> Vec<u8> {
+    cbor(&AnswerBody { room_id, request, member_pub, sealed: sealed.as_deref().map(|b| *blake3::hash(b).as_bytes()), epoch })
+}
+
+/// An answer to a request: the room secret sealed to the requester (or
+/// none: declined), signed with `signer` (the admin seed, or my moderator
+/// seed with `proof`, the admin-signed entry that names me).
+pub fn answer(room_id: &[u8; 32], req: &JoinRequest, secret: Option<&[u8; 32]>, epoch: u64, signer: &[u8; 32], proof: Vec<u8>) -> RoomBlob {
+    let sealed = secret.map(|s| seal_secret_to(&req.member_pub, req.member_kem.as_deref(), s, room_id));
+    let k = ed25519_dalek::SigningKey::from_bytes(signer);
+    let signed = Envelope::sign(&k, ANSWER_KIND, answer_body(room_id, req.id(), &req.member_pub, &sealed, epoch)).encode().expect("answer encodes");
+    RoomBlob::Answer { room_id: *room_id, sealed, epoch, signed, proof }
+}
+
+/// Requester: did this answer come from the room's admin, or from a
+/// moderator the admin named (in an approval room)? `reply` is my reply
+/// box secret and `member_pub` the key I asked with.
+pub fn answer_genuine(room_id: &[u8; 32], reply: &[u8; 32], member_pub: &[u8; 32], sealed: &Option<Vec<u8>>, epoch: u64, signed: &[u8], proof: &[u8]) -> bool {
+    let Ok(env) = Envelope::decode_verified(signed) else { return false };
+    if env.kind != ANSWER_KIND || env.body != answer_body(room_id, request_id(reply), member_pub, sealed, epoch) {
+        return false;
+    }
+    if room_id_for(&env.author) == *room_id {
+        return true;
+    }
+    let Some((e, _)) = crate::room_auth::verify(room_id, proof) else { return false };
+    let mods = match e.action {
+        crate::room_auth::Action::Checkpoint { mods, approval: true, .. } | crate::room_auth::Action::Moderators { mods, approval: true } => mods,
+        _ => return false,
+    };
+    mods.iter().any(|m| m.key == env.author)
 }
 
 /// Requester: the room secret from an answer, if approved.
@@ -479,9 +535,17 @@ pub fn accept_hello(room_id: &[u8; 32], h: &Hello, my_member_secret: &[u8; 32]) 
     let inbound = InboundGroupSession::new(&key, megolm_config());
     let mine = member_pub(my_member_secret);
     let verified = h.macs.iter().find(|(to, _)| *to == mine).is_some_and(|(_, mac)| {
+        // A small-order key gives the same (zero) secret with anyone, so
+        // anyone could make its MAC.
         let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&h.from) else { return false };
+        if vk.is_weak() {
+            return false;
+        }
         let shared = x25519_dalek::StaticSecret::from(*my_member_secret)
             .diffie_hellman(&x25519_dalek::PublicKey::from(vk.to_montgomery().to_bytes()));
+        if !shared.was_contributory() {
+            return false;
+        }
         let k = hello_mac_key(shared.as_bytes(), room_id, &h.from, &mine);
         blake3::keyed_hash(&k, &hello_body(h)) == blake3::Hash::from(*mac)
     });
@@ -674,20 +738,39 @@ mod tests {
 
     #[test]
     fn ask_links_and_answers() {
-        let (room_id, secret) = new_room();
+        let (_, secret) = new_room();
+        let admin = [21u8; 32];
+        let room_id = room_id_for(&ed25519_dalek::SigningKey::from_bytes(&admin).verifying_key().to_bytes());
         let l = AskLink { room_id, pillar: format!("{}.onion", "d".repeat(56)), ask: [5; 32], name: "Quiet Garden".into() };
         assert_eq!(AskLink::parse(&l.to_text()), Some(l.clone()));
         assert!(!l.to_text().contains(&b32(&secret)), "an ask link never holds the room secret");
         let member = crate::random_bytes::<32>();
         let req = JoinRequest { room_id, from: [1; 32], name: "Ana".into(), note: "hi".into(), member_pub: member_pub(&member), reply: [8; 32], member_kem: Some(member_kem_public(&kem(&member))) };
-        let RoomBlob::Answer { sealed: Some(sealed), .. } = answer(&room_id, &req, Some(&secret), 3) else { panic!() };
+        let RoomBlob::Answer { sealed: Some(sealed), signed, proof, .. } = answer(&room_id, &req, Some(&secret), 3, &admin, Vec::new()) else { panic!() };
         assert_eq!(open_answer(&room_id, &sealed, &member, Some(&kem(&member))), Some(secret));
+        let mp = member_pub(&member);
+        assert!(answer_genuine(&room_id, &req.reply, &mp, &Some(sealed.clone()), 3, &signed, &proof));
+        // Anyone else with the ask link (here: a key the admin never named)
+        // can't answer, and a signed answer can't be changed.
+        let RoomBlob::Answer { sealed: s2, signed: forged, proof: p2, .. } = answer(&room_id, &req, Some(&[7; 32]), u64::MAX, &[22; 32], Vec::new()) else { panic!() };
+        assert!(!answer_genuine(&room_id, &req.reply, &mp, &s2, u64::MAX, &forged, &p2));
+        assert!(!answer_genuine(&room_id, &req.reply, &mp, &None, 3, &signed, &proof), "a 'declined' can't be swapped in");
+        assert!(!answer_genuine(&room_id, &req.reply, &mp, &Some(sealed.clone()), 9, &signed, &proof));
+        // A moderator named by the admin can, with the admin's entry.
+        let mod_seed = [23u8; 32];
+        let mut m = crate::room_auth::new_moderator(&room_id, &[0; 32], None, None);
+        m.key = ed25519_dalek::SigningKey::from_bytes(&mod_seed).verifying_key().to_bytes();
+        let entry = crate::room_auth::Entry { room_id, seq: 1, prev: [0; 32], action: crate::room_auth::Action::Moderators { mods: vec![m], approval: true } };
+        let (named, _) = crate::room_auth::sign(&admin, &entry);
+        let RoomBlob::Answer { sealed: s3, signed: by_mod, proof: p3, .. } = answer(&room_id, &req, Some(&secret), 3, &mod_seed, named) else { panic!() };
+        assert!(answer_genuine(&room_id, &req.reply, &mp, &s3, 3, &by_mod, &p3));
+        assert!(!answer_genuine(&room_id, &req.reply, &mp, &s3, 3, &by_mod, &[]));
         assert!(open_answer(&room_id, &sealed, &crate::random_bytes::<32>(), None).is_none());
         assert_ne!(req.id(), req.reply);
         assert!(sealed.len() > CLASSICAL_SEALED, "sealed post-quantum");
         // An older requester without an ML-KEM key still gets a classical answer.
         let old = JoinRequest { member_kem: None, ..req };
-        let RoomBlob::Answer { sealed: Some(c), .. } = answer(&room_id, &old, Some(&secret), 3) else { panic!() };
+        let RoomBlob::Answer { sealed: Some(c), .. } = answer(&room_id, &old, Some(&secret), 3, &admin, Vec::new()) else { panic!() };
         assert_eq!(c.len(), CLASSICAL_SEALED);
         assert_eq!(open_answer(&room_id, &c, &member, None), Some(secret));
     }

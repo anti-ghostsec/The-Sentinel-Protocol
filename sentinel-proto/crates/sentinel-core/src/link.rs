@@ -6,12 +6,19 @@
 //! 2. The new device leaves a **request** (its own messaging card and a key
 //!    for the answer) in a mailbox only holders of the code can find, sealed
 //!    with the code's secret.
-//! 3. Both devices show a short **check code** computed from the code and the
-//!    request. The person confirms they match on the existing device; anyone
-//!    who glimpsed the link code and raced to use it would produce a
-//!    different check code.
-//! 4. The existing device answers with the account (its identity, follows,
-//!    rooms, settings), sealed to the key in the request.
+//! 3. Both devices show a short **check code**. Anyone who glimpsed the link
+//!    code can read and write this mailbox, so the code mixes a random value
+//!    from each side, fixed in turn so neither can be chosen to match:
+//!    the request carries a *commitment* to the new device's value; the
+//!    existing device answers with its own value ([`LinkBlob::Challenge`]);
+//!    only then does the new device reveal its value ([`LinkBlob::Reveal`]).
+//!    Someone in the middle has to fix their values before seeing the
+//!    others', so their codes match by chance only (1 in 10^8).
+//! 4. The person confirms the codes match on both devices. The existing
+//!    device then answers with the account (its identity, follows, rooms,
+//!    settings), sealed to the key in the request and tagged with a key from
+//!    both values; the new device takes it only after the person confirmed
+//!    there too, and only with that tag.
 //!
 //! Each device keeps its own messaging keys; contacts send to every device.
 
@@ -69,13 +76,47 @@ pub struct LinkRequest {
     pub answer_kem: Vec<u8>,
     /// A name for the device (shown when confirming), e.g. "Phone".
     pub device: String,
+    /// Commitment to the new device's value ([`commit`]).
+    #[serde(default)]
+    pub commit: [u8; 32],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum LinkBlob {
     Request(LinkRequest),
-    /// The account, sealed to the request's keys (opaque to this module).
-    Answer { to: [u8; 32], sealed: Vec<u8> },
+    /// The account, sealed to the request's keys (opaque to this module),
+    /// tagged with [`answer_tag`].
+    Answer {
+        to: [u8; 32],
+        sealed: Vec<u8>,
+        #[serde(default)]
+        tag: [u8; 32],
+    },
+    /// Existing device -> new device: my value for this request (by
+    /// [`request_id`]).
+    Challenge { request: [u8; 32], nonce: [u8; 32] },
+    /// New device -> existing device: the value the request committed to.
+    Reveal { request: [u8; 32], nonce: [u8; 32] },
+}
+
+/// A request's ID (what challenges and reveals refer to).
+pub fn request_id(req: &LinkRequest) -> [u8; 32] {
+    let mut r = Vec::new();
+    ciborium::into_writer(req, &mut r).expect("encode");
+    blake3::derive_key("sentinel/v1/link-request-id", &r)
+}
+
+/// The commitment a request carries to the new device's value.
+pub fn commit(nonce: &[u8; 32]) -> [u8; 32] {
+    blake3::derive_key("sentinel/v1/link-commit", nonce)
+}
+
+fn mixed(context: &str, code: &LinkCode, req: &LinkRequest, mine: &[u8; 32], theirs: &[u8; 32]) -> [u8; 32] {
+    let mut m = code.secret.to_vec();
+    m.extend_from_slice(&request_id(req));
+    m.extend_from_slice(mine);
+    m.extend_from_slice(theirs);
+    blake3::derive_key(context, &m)
 }
 
 const PAD: usize = 1024;
@@ -104,16 +145,23 @@ pub fn open(code: &LinkCode, b: &[u8]) -> Option<LinkBlob> {
     ciborium::from_reader(plain.get(..len)?).ok()
 }
 
-/// The check code both devices show: 8 digits from the link secret and the
-/// request (so a different request gives a different code).
-pub fn check_code(code: &LinkCode, req: &LinkRequest) -> String {
-    let mut m = code.secret.to_vec();
-    let mut r = Vec::new();
-    ciborium::into_writer(req, &mut r).expect("encode");
-    m.extend_from_slice(&r);
-    let h = blake3::derive_key("sentinel/v0/link-check", &m);
+/// The check code both devices show: 8 digits from the link secret, the
+/// request and both devices' values. `None` if `new_value` isn't the one
+/// the request committed to.
+pub fn check_code(code: &LinkCode, req: &LinkRequest, new_value: &[u8; 32], existing_value: &[u8; 32]) -> Option<String> {
+    if commit(new_value) != req.commit {
+        return None;
+    }
+    let h = mixed("sentinel/v1/link-check", code, req, new_value, existing_value);
     let n = u64::from_le_bytes(h[..8].try_into().unwrap()) % 100_000_000;
-    format!("{:04}-{:04}", n / 10_000, n % 10_000)
+    Some(format!("{:04}-{:04}", n / 10_000, n % 10_000))
+}
+
+/// The tag on the account handed over: only someone holding both values of
+/// the exchange the person checked can make it.
+pub fn answer_tag(code: &LinkCode, req: &LinkRequest, new_value: &[u8; 32], existing_value: &[u8; 32], sealed: &[u8]) -> [u8; 32] {
+    let k = mixed("sentinel/v1/link-answer-tag", code, req, new_value, existing_value);
+    *blake3::keyed_hash(&k, sealed).as_bytes()
 }
 
 /// Seal the account for the new device (hybrid: X25519 + ML-KEM-768).
@@ -151,17 +199,24 @@ mod tests {
             answer_to: *x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(answer_secret)).as_bytes(),
             answer_kem: crate::pq::kem_public(&kem),
             device: "Phone".into(),
+            commit: commit(&[1; 32]),
         };
         let sealed = seal(&code, &LinkBlob::Request(req.clone()));
         let Some(LinkBlob::Request(got)) = open(&code, &sealed) else { panic!() };
         assert_eq!(got, req);
         // Someone without the code can't open it.
         assert!(open(&LinkCode::new("b"), &sealed).is_none());
-        // Same check code on both sides; another request gives another one.
-        assert_eq!(check_code(&code, &got), check_code(&code, &req));
+        // Same check code on both sides; another request or value gives
+        // another one; a value the request didn't commit to gives none.
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        assert!(check_code(&code, &got, &a, &b).is_some());
+        assert_eq!(check_code(&code, &got, &a, &b), check_code(&code, &req, &a, &b));
         let mut other = req.clone();
         other.device = "Laptop".into();
-        assert_ne!(check_code(&code, &other), check_code(&code, &req));
+        assert_ne!(check_code(&code, &other, &a, &b), check_code(&code, &req, &a, &b));
+        assert_ne!(check_code(&code, &req, &a, &[3; 32]), check_code(&code, &req, &a, &b));
+        assert!(check_code(&code, &req, &[9; 32], &b).is_none());
+        assert_ne!(answer_tag(&code, &req, &a, &b, b"x"), answer_tag(&code, &req, &a, &[3; 32], b"x"));
         // The account reaches only the requesting device.
         let s = seal_answer(&req, b"the account").unwrap();
         assert_eq!(&**open_answer(&answer_secret, &kem, &s).unwrap(), b"the account");

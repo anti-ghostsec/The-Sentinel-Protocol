@@ -238,6 +238,25 @@ pub struct RoomState {
     /// Reports from members (admin and moderators only): (report, day).
     #[serde(default)]
     pub reports: Vec<(room::RoomReport, u64)>,
+    /// Admin of an approval room: member keys let in (by me or a
+    /// moderator). Rekeys go to these only: anyone holding the room secret
+    /// can announce a second identity. None: from before this list, filled
+    /// with the members known at the time on first use.
+    #[serde(default)]
+    pub admitted: Option<Vec<[u8; 32]>>,
+    /// Moderator: the admin-signed entry that names me (goes with my
+    /// answers to join requests, so requesters can check them).
+    #[serde(default)]
+    pub mod_proof: Vec<u8>,
+}
+
+/// Admin: note a member key let in (see `RoomState::admitted`).
+fn admit(x: &mut RoomState, key: [u8; 32]) {
+    let members: Vec<[u8; 32]> = x.members.iter().filter(|(_, m)| m.verified).filter_map(|(k, _)| member_key(k)).collect();
+    let list = x.admitted.get_or_insert(members);
+    if !list.contains(&key) {
+        list.push(key);
+    }
 }
 
 /// Most reports kept per room.
@@ -385,6 +404,8 @@ fn new_state(room_id: [u8; 32], secret: [u8; 32], pillar: String, name: String, 
         apps: Default::default(),
         admin_member: None,
         reports: Vec::new(),
+        admitted: None,
+        mod_proof: Vec::new(),
     }
 }
 
@@ -599,10 +620,14 @@ impl Core {
         let signer = r.admin.or(r.my_mod).context("Only the room's admin and moderators can answer requests.")?;
         let ask = r.ask.context("This room doesn't take requests.")?;
         let req = r.requests.iter().find(|q| hex(&q.id()) == request).cloned().context("That request was already answered.")?;
-        let ans = room::answer(&r.room_id, &req, approve.then_some(&r.secret), r.epoch);
-        let handled = mod_blob(&ask, &signer, &r.room_id, ModAction::Handled { request: req.id() });
+        let proof = if r.admin.is_some() { Vec::new() } else { r.mod_proof.clone() };
+        let ans = room::answer(&r.room_id, &req, approve.then_some(&r.secret), r.epoch, &signer, proof);
+        let handled = mod_blob(&ask, &signer, &r.room_id, ModAction::Handled { request: req.id(), admitted: approve.then_some(req.member_pub) });
         self.update(|s| {
             if let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == r.room_id) {
+                if approve && x.admin.is_some() {
+                    admit(x, req.member_pub);
+                }
                 x.requests.retain(|q| q.reply != req.reply);
                 x.queue.push(Queued { sealed: room::seal_blob(&req.reply, &ans), nonce: 0, secret: Some(req.reply) });
                 x.queue.push(Queued { sealed: handled, nonce: 0, secret: Some(ask) });
@@ -1053,8 +1078,16 @@ impl Core {
             // post a hello *claiming* to be a paid member.
             .filter(|(_, m)| m.verified)
             .filter(|(_, m)| !r.removed.contains(&m.author))
-            .filter(|(_, m)| r.access != "membership" || r.paid.get(&m.author).is_some_and(|u| *u > now))
+            // Paid rooms: only accounts that paid (a pass holder's second
+            // identity hasn't).
+            .filter(|(_, m)| match r.access.as_str() {
+                "membership" => r.paid.get(&m.author).is_some_and(|u| *u > now),
+                "pass" => r.paid.contains_key(&m.author),
+                _ => true,
+            })
             .filter_map(|(k, m)| member_key(k).map(|k| (k, m.kem.clone())))
+            // Approval rooms: only keys that were let in (or moderators').
+            .filter(|(k, _)| !r.approval || r.admitted.as_ref().is_none_or(|a| a.contains(k)) || r.mods.iter().any(|m| m.member == *k))
             .collect();
         let _ = admin;
         let new_secret = sentinel_core::random_bytes::<32>();
@@ -1430,11 +1463,22 @@ impl Core {
                 let mut rescan = None;
                 self.update(|s| {
                     let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == *room_id) else { return };
+                    let this_seq = room_auth::verify(room_id, &signed).map(|(e, _)| e.seq);
                     for e in x.auth.offer(room_id, &signed) {
+                        // Keep the entry that names me a moderator, as proof
+                        // for my answers to join requests.
+                        let names_me = |x: &RoomState| x.my_mod.is_some_and(|seed| {
+                            let key = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+                            x.mods.iter().any(|m| m.key == key)
+                        });
+                        let from_this = this_seq == Some(e.seq);
                         match e.action {
                             Action::Moderators { mods, approval } => {
                                 if x.admin.is_none() {
                                     apply_mods(x, mods, approval);
+                                    if from_this && names_me(x) {
+                                        x.mod_proof = signed.clone();
+                                    }
                                 }
                             }
                             Action::Checkpoint { name, visibility, access, banned, redacted, mods, approval, apps, admin_member, .. } => {
@@ -1449,6 +1493,9 @@ impl Core {
                                 if x.admin.is_none() {
                                     x.apps.set_list(apps);
                                     apply_mods(x, mods, approval);
+                                    if from_this && names_me(x) {
+                                        x.mod_proof = signed.clone();
+                                    }
                                     x.banned = banned;
                                     for r in redacted {
                                         if !x.redacted.contains(&r) {
@@ -1543,7 +1590,12 @@ impl Core {
                                 x.banned.push(member);
                             }
                         }
-                        ModAction::Handled { request } if Some(*secret) == x.ask => x.requests.retain(|q| q.id() != request),
+                        ModAction::Handled { request, admitted } if Some(*secret) == x.ask => {
+                            x.requests.retain(|q| q.id() != request);
+                            if let (Some(k), true) = (admitted, x.admin.is_some()) {
+                                admit(x, k);
+                            }
+                        }
                         _ => {}
                     }
                 })?;
@@ -1563,11 +1615,18 @@ impl Core {
                 })?;
                 Ok(false)
             }
-            RoomBlob::Answer { room_id: rid, sealed, epoch } => {
+            RoomBlob::Answer { room_id: rid, sealed, epoch, signed, proof } => {
                 let mut rescan = None;
                 self.update(|s| {
                     let Some(x) = s.rooms.iter_mut().find(|x| x.room_id == *room_id) else { return };
                     if !x.waiting || *secret != x.secret || rid != *room_id {
+                        return;
+                    }
+                    // Anyone with the ask link can leave something in my
+                    // reply box: only the admin's or a named moderator's
+                    // signed answer counts.
+                    let mine = room::member_pub(&x.member_secret.unwrap_or_default());
+                    if !room::answer_genuine(room_id, &x.secret, &mine, &sealed, epoch, &signed, &proof) {
                         return;
                     }
                     match sealed {
@@ -1663,13 +1722,21 @@ impl Core {
                         }
                         // A session belongs to the first identity that claimed
                         // it; a later valid MAC from that identity verifies it.
-                        let e = x.inbound.entry(sid).or_insert(InboundEntry { pickle, author: author.clone(), name: name.clone(), verified, member: Some(h.member_pub) });
-                        if e.author == author {
-                            e.name = name.clone();
+                        // Until a MAC proves the identity, only the handle is
+                        // shown, never a chosen name.
+                        let shown = if verified { name.clone() } else { handle_of(&author) };
+                        let e = x.inbound.entry(sid.clone()).or_insert(InboundEntry { pickle, author: author.clone(), name: shown.clone(), verified, member: Some(h.member_pub) });
+                        let same = e.author == author && e.member == Some(h.member_pub);
+                        if same && (verified || !e.verified) {
+                            e.name = shown;
                             e.verified |= verified;
                         }
-                        if verified {
-                            for m in x.messages.iter_mut().filter(|m| m.author == author) {
+                        // Only messages on this very session become verified:
+                        // anyone can open a session claiming to be someone
+                        // else, and it must not turn verified when the real
+                        // person's hello arrives.
+                        if verified && same {
+                            for m in x.messages.iter_mut().filter(|m| m.session == sid && m.author == author) {
                                 m.verified = true;
                                 m.name = name.clone();
                             }

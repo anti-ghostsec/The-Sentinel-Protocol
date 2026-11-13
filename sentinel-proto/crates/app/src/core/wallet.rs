@@ -346,6 +346,21 @@ impl Core {
                         Fate::Unknown
                     }
                 };
+                // One bad part refuses the whole batch: try the rest one by
+                // one, so a planted fake can't sink real parts with it.
+                if f == Fate::Spent && chunk.len() > 1 {
+                    for &i in chunk {
+                        fate[i] = match self.swap_at(m, vec![parts[i].1.clone()]).await {
+                            Ok(fresh) => {
+                                let _ = self.add_parts(m, fresh);
+                                Fate::Swapped
+                            }
+                            Err(e) if e.to_string().starts_with("payment rejected") => Fate::Spent,
+                            Err(_) => Fate::Unknown,
+                        };
+                    }
+                    continue;
+                }
                 for &i in chunk {
                     fate[i] = f;
                 }

@@ -43,6 +43,9 @@ use super::{exchange, Ctx};
 const FILLER_TARGET: u64 = 32;
 /// Most credits one Archive earns per day.
 const MAX_DAILY_REWARD: u32 = 3;
+/// The last key period in which old (blind, not quantum-safe) tokens were
+/// issued (October 2026). Only those can still be traded in.
+const LAST_V1_EPOCH: u32 = 115;
 
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct FillerState {
@@ -89,7 +92,7 @@ impl RewardState {
 }
 
 /// Reward requests (they need per-stream state); None for anything else.
-pub async fn handle_reward(req: &Request, ctx: &Ctx, st: &mut RewardState) -> Option<Response> {
+pub async fn handle_reward(req: &Request, ctx: &std::sync::Arc<Ctx>, st: &mut RewardState) -> Option<Response> {
     Some(match req {
         Request::RewardOfferPq { count, mint } => {
             // Only listed mints can pay; anyone else's offer is refused.
@@ -107,9 +110,23 @@ pub async fn handle_reward(req: &Request, ctx: &Ctx, st: &mut RewardState) -> Op
             if m != *mint || !credits::issue_epoch_ok_now(*epoch) {
                 return Some(Response::Rejected("no offer".into()));
             }
-            // Positions are only a hint: spending finds the notes in the
-            // mint's signed list (and fails if they aren't there).
-            add_rewards(&ctx.store, mint, notes.iter().enumerate().map(|(i, n)| Token::from_note(n, *epoch, first + i as u64)).collect());
+            // Anyone can connect and claim to be paying: a note is kept
+            // only once the mint's own list shows it at the stated place
+            // (asked over a separate circuit, a few times a day at most).
+            if !reward_check_allowed(mint) {
+                return Some(Response::Rejected("too many rewards today".into()));
+            }
+            let (ctx, mint, epoch, first) = (std::sync::Arc::clone(ctx), mint.clone(), *epoch, *first);
+            tokio::spawn(async move {
+                // The mint may still be finishing its side of the exchange.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let want: Vec<[u8; 32]> = notes.iter().map(|n| pqcash::digest_bytes(&n.commitment())).collect();
+                let listed = matches!(ask_mint(&ctx, &mint, Request::PqLeaves { epoch, from: first }).await,
+                    Ok(Response::PqLeaves { leaves, .. }) if leaves.len() >= want.len() && leaves[..want.len()] == want[..]);
+                if listed {
+                    add_rewards(&ctx.store, &mint, notes.iter().enumerate().map(|(i, n)| Token::from_note(n, epoch, first + i as u64)).collect());
+                }
+            });
             Response::Pong
         }
         _ => return None,
@@ -176,9 +193,34 @@ pub fn take_rewards(store: &Path) -> Vec<(String, Token)> {
     t
 }
 
+/// Reward checks allowed per mint per day: a mint pays a node about once a
+/// day, so this only stops someone making this node call mints all day.
+const REWARD_CHECKS_PER_DAY: u32 = 8;
+/// Most unclaimed reward parts kept (the app collects them every sync).
+const MAX_PENDING_REWARDS: usize = 2_000;
+
+fn reward_check_allowed(mint: &str) -> bool {
+    static SEEN: std::sync::Mutex<Option<(u64, HashMap<String, u32>)>> = std::sync::Mutex::new(None);
+    let mut g = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let today = day();
+    let (d, counts) = g.get_or_insert_with(|| (today, HashMap::new()));
+    if *d != today {
+        *d = today;
+        counts.clear();
+    }
+    let n = counts.entry(mint.to_owned()).or_insert(0);
+    *n += 1;
+    *n <= REWARD_CHECKS_PER_DAY
+}
+
 fn add_rewards(store: &Path, mint: &str, new: Vec<Token>) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let path = rewards_path(store);
     let mut all: Vec<(String, Token)> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    if all.len() >= MAX_PENDING_REWARDS {
+        return;
+    }
     all.extend(new.into_iter().map(|t| (mint.to_owned(), t)));
     if let Ok(b) = serde_json::to_vec(&all) {
         let _ = std::fs::write(path, b);
@@ -425,6 +467,11 @@ pub fn handle_pq(req: &Request, ctx: &Ctx) -> Option<Response> {
             let Some(m) = &econ.mint else { return Some(Response::NotFound) };
             if tokens.is_empty() || tokens.len() != commitments.len() || tokens.len() > credits::MAX_BATCH || tokens.iter().any(Token::is_pq) {
                 return Some(Response::Rejected("bad upgrade".into()));
+            }
+            // Old tokens were last issued before this epoch ended: a
+            // quantum computer could forge them for any later one.
+            if tokens.iter().any(|t| t.epoch > LAST_V1_EPOCH) {
+                return Some(Response::Rejected("invalid or already spent".into()));
             }
             if !m.spend(store, tokens) {
                 return Some(Response::Rejected("invalid or already spent".into()));

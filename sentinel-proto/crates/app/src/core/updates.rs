@@ -81,6 +81,9 @@ pub struct ReadyView {
     pub sources: usize,
     /// Handed over as a file (not checked against the network).
     pub handed: bool,
+    /// A built-in seed Pillar carries it too (two Pillars anyone can list
+    /// aren't enough: one person could run both).
+    pub seed: bool,
 }
 
 /// What I know about a release I've seen: when first, which Pillars carry
@@ -92,6 +95,8 @@ struct Seen {
     sources: Vec<[u8; 8]>,
     #[serde(default)]
     handed: bool,
+    #[serde(default)]
+    seed: bool,
 }
 
 fn seen_path() -> Option<PathBuf> {
@@ -113,6 +118,7 @@ fn note_seen(id: &[u8; 32], pillar: Option<&str>, handed: bool) -> Seen {
     let mut m = load_seen();
     let e = m.entry(data_encoding::HEXLOWER.encode(id)).or_insert_with(|| Seen { first: super::unix_now(), ..Default::default() });
     if let Some(p) = pillar {
+        e.seed |= sentinel_net::seed_pillars().iter().any(|s| s == p);
         let h: [u8; 8] = blake3::derive_key("sentinel/v0/update-source", p.as_bytes())[..8].try_into().unwrap();
         if !e.sources.contains(&h) && e.sources.len() < 32 {
             e.sources.push(h);
@@ -218,6 +224,7 @@ pub fn ready() -> Option<ReadyView> {
         installable_at: if seen.handed { seen.first } else { seen.first + update::WAIT_SECS },
         sources: seen.sources.len(),
         handed: seen.handed,
+        seed: seen.seed,
     })
 }
 
@@ -464,8 +471,9 @@ impl Core {
         // The newest release carried by enough Pillars.
         let mut best: Option<([u8; 32], (String, Vec<u8>, u64, Vec<String>))> = None;
         let mut lonely: Option<String> = None;
+        let seeds = sentinel_net::seed_pillars();
         for (id, o) in offers {
-            if o.3.len() < update::MIN_SOURCES {
+            if o.3.len() < update::MIN_SOURCES || !o.3.iter().any(|p| seeds.contains(p)) {
                 lonely = Some(o.0.clone());
                 continue;
             }
@@ -495,7 +503,7 @@ impl Core {
             } else if let Some(e) = &err {
                 Some(format!("Couldn't download the update right now ({e})."))
             } else if let Some(v) = &lonely {
-                Some(format!("Version {v} is on only one Pillar so far. Sentinel waits until several carry the very same update, so everyone gets the same one."))
+                Some(format!("Version {v} isn't on enough Pillars yet. Sentinel waits until several, including one of its own, carry the very same update, so everyone gets the same one."))
             } else if reached == 0 {
                 Some("Couldn't reach any Pillar right now.".into())
             } else {
@@ -607,15 +615,15 @@ impl Core {
             std::fs::rename(&tmp, &dest)?;
         }
         let size: u64 = m.files.iter().map(|f| f.size).sum();
-        Ok(ReadyView { version: m.version, notes: m.notes, size_mb: size.div_ceil(1_000_000), installable_at: seen.first, sources: seen.sources.len(), handed: true })
+        Ok(ReadyView { version: m.version, notes: m.notes, size_mb: size.div_ceil(1_000_000), installable_at: seen.first, sources: seen.sources.len(), handed: true, seed: seen.seed })
     }
 
     /// Install the waiting update and restart.
     pub fn install_update(&self, app: &AppHandle) -> Result<()> {
         let path = ready_path().context("no update folder")?;
         let r = ready().context("No update is waiting.")?;
-        if !r.handed && r.sources < update::MIN_SOURCES {
-            bail!("Waiting until several Pillars carry this same update.");
+        if !r.handed && (r.sources < update::MIN_SOURCES || !r.seed) {
+            bail!("Waiting until several Pillars, including one of Sentinel's own, carry this same update.");
         }
         if super::unix_now() < r.installable_at {
             bail!("This update can be installed after its waiting period (three days after it first appeared), so a bad release can be caught first.");

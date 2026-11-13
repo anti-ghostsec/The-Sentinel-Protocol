@@ -783,8 +783,11 @@ pub struct StatusView {
     pub keyfile: bool,
     /// Name of the key file chosen for the next unlock (if any).
     pub keyfile_chosen: Option<String>,
-    /// This new device waits to be linked: the check code to compare.
+    /// This new device waits to be linked: the check code to compare
+    /// (empty until the other device answered).
     pub linking: Option<String>,
+    /// The person confirmed the codes match on this device.
+    pub linking_confirmed: bool,
     /// windows | linux | android | …
     pub platform: String,
 }
@@ -1013,6 +1016,7 @@ impl Core {
                 keyfile: i.keyfile.is_some(),
                 keyfile_chosen: i.chosen_keyfile.as_ref().map(|(_, n)| n.clone()),
                 linking: store.and_then(|s| s.link_join.as_ref().map(|j| j.check.clone())),
+                linking_confirmed: store.is_some_and(|s| s.link_join.as_ref().is_some_and(|j| j.confirmed)),
                 platform: std::env::consts::OS.into(),
             }
         })
@@ -1490,6 +1494,8 @@ impl Core {
         if self.unlocked().is_ok_and(|(_, s)| s.link_join.is_some()) {
             let _ = self.link_send_request().await;
             let _ = self.poll_mail().await;
+            // The other device's value may have just arrived: reveal mine now.
+            let _ = self.link_send_request().await;
             if self.unlocked().is_ok_and(|(_, s)| s.link_join.is_none()) {
                 // Linked: work from the account's home Pillar from now on.
                 self.start_pool();
@@ -1515,6 +1521,8 @@ impl Core {
             let _ = app.emit("rooms", ());
             let _ = app.emit("status", ());
         }
+        // A device asking to be linked: my value for its check code.
+        let _ = self.link_send_challenges().await;
         // One pass over my mailbox prefixes serves DMs and rooms alike.
         if let Ok((dms, rooms)) = mail {
             if dms > 0 {

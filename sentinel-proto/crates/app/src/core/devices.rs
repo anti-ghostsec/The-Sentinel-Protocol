@@ -1,9 +1,11 @@
 //! Several devices on one account (spec section 6).
 //!
 //! - **Linking:** this device shows a link code; the new device leaves a
-//!   request (its own messaging card) in a mailbox only the code opens; both
-//!   show the same check code; once the person allows it here, this device
-//!   sends the account over (sealed post-quantum to the new device): the
+//!   request (its own messaging card) in a mailbox only the code opens; the
+//!   two swap values so both show the same check code (see
+//!   `sentinel_core::link`); once the person confirms it on both devices,
+//!   this device sends the account over (sealed post-quantum to the new
+//!   device): the
 //!   identity, feed key, recovery pin, profile, follows, rooms, approved
 //!   followers, hidden people, topics and settings. Never credits (they could
 //!   be spent twice) and never message history.
@@ -33,8 +35,21 @@ const OFFER_SECS: u64 = 30 * 60;
 pub struct LinkOffer {
     pub code: String,
     pub created: u64,
-    /// Requests that arrived: (request, check code).
-    pub requests: Vec<(LinkRequest, String)>,
+    /// Requests that arrived.
+    #[serde(default)]
+    pub asks: Vec<LinkAsk>,
+}
+
+/// A request at the existing device.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LinkAsk {
+    pub request: LinkRequest,
+    /// My value for it (sent as a challenge).
+    pub mine: [u8; 32],
+    pub challenged: bool,
+    /// The new device's value, once revealed (and matching its commitment).
+    pub theirs: Option<[u8; 32]>,
+    pub check: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -43,9 +58,24 @@ pub struct LinkJoin {
     pub answer_secret: [u8; 32],
     pub kem_seed: Vec<u8>,
     pub request: LinkRequest,
+    /// Empty until the other device's value arrives.
     pub check: String,
     /// The request reached the mailbox.
     pub sent: bool,
+    /// My value (the request commits to it).
+    #[serde(default)]
+    pub mine: [u8; 32],
+    /// The existing device's value (the first challenge for my request).
+    #[serde(default)]
+    pub theirs: Option<[u8; 32]>,
+    #[serde(default)]
+    pub revealed: bool,
+    /// The person said the codes match on this device too.
+    #[serde(default)]
+    pub confirmed: bool,
+    /// The account, arrived before the person confirmed (tag checked).
+    #[serde(default)]
+    pub pending_answer: Option<Vec<u8>>,
 }
 
 /// The account, as handed to a new device.
@@ -88,7 +118,8 @@ pub struct LinkView {
     pub code: Option<String>,
     /// Requests waiting: (index, device name, check code).
     pub requests: Vec<(usize, String, String)>,
-    /// This (new) device is waiting to be let in: its check code.
+    /// This (new) device is waiting to be let in: its check code (empty
+    /// until the other device answered).
     pub joining: Option<String>,
 }
 
@@ -126,7 +157,7 @@ impl Core {
         let offer = store.link_offer.filter(|o| super::unix_now() < o.created + OFFER_SECS);
         Ok(LinkView {
             code: offer.as_ref().map(|o| o.code.clone()),
-            requests: offer.map(|o| o.requests.iter().enumerate().map(|(i, (r, c))| (i, r.device.clone(), c.clone())).collect()).unwrap_or_default(),
+            requests: offer.map(|o| o.asks.iter().enumerate().filter_map(|(i, a)| Some((i, a.request.device.clone(), a.check.clone()?))).collect()).unwrap_or_default(),
             joining: store.link_join.map(|j| j.check),
         })
     }
@@ -136,7 +167,7 @@ impl Core {
         let (_, store) = self.unlocked()?;
         let pillar = store.pillar.context("Connect first.")?;
         let code = LinkCode::new(&pillar).to_text();
-        self.update(|s| s.link_offer = Some(LinkOffer { code: code.clone(), created: super::unix_now(), requests: Vec::new() }))?;
+        self.update(|s| s.link_offer = Some(LinkOffer { code: code.clone(), created: super::unix_now(), asks: Vec::new() }))?;
         Ok(code)
     }
 
@@ -151,7 +182,9 @@ impl Core {
         if super::unix_now() >= offer.created + OFFER_SECS {
             bail!("The link code expired. Start again.");
         }
-        let (req, _) = offer.requests.get(index).cloned().context("That request is gone.")?;
+        let ask = offer.asks.get(index).cloned().context("That request is gone.")?;
+        let theirs = ask.theirs.filter(|_| ask.check.is_some()).context("That device hasn't shown its code yet.")?;
+        let req = ask.request;
         let code = LinkCode::parse(&offer.code).context("bad link code")?;
         let my_card = store.dm.as_ref().and_then(|d| d.last_card.clone());
         let mut devices = store.my_devices.clone();
@@ -216,7 +249,8 @@ impl Core {
         };
         let json = zeroize::Zeroizing::new(serde_json::to_vec(&h)?);
         let sealed = link::seal_answer(&req, &json).context("couldn't seal the account")?;
-        let blob = link::seal(&code, &LinkBlob::Answer { to: req.answer_to, sealed });
+        let tag = link::answer_tag(&code, &req, &theirs, &ask.mine, &sealed);
+        let blob = link::seal(&code, &LinkBlob::Answer { to: req.answer_to, sealed, tag });
         self.deposit_sealed(&code.pillar, &code.box_secret(), blob).await?;
         self.update(|s| {
             super::merge_card(&mut s.my_devices, req.card.clone());
@@ -241,13 +275,14 @@ impl Core {
         let card = sentinel_core::dm::make_card(&mut account, sentinel_core::dm::inbox_public(&st.inbox_secret), Some(sentinel_core::dm::inbox_kem_public(&st.fetch_secret)), st.fetch_secret, code.pillar.clone());
         let answer_secret = sentinel_core::random_bytes::<32>();
         let kem = sentinel_core::pq::kem_seed();
+        let mine = sentinel_core::random_bytes::<32>();
         let request = LinkRequest {
             card,
             answer_to: link::answer_public(&answer_secret),
             answer_kem: sentinel_core::pq::kem_public(&kem),
             device: device.to_owned(),
+            commit: link::commit(&mine),
         };
-        let check = link::check_code(&code, &request);
         let pickled = account.pickle().encrypt(&super::pickle_key(&key));
         self.update(|s| {
             if let Some(d) = s.dm.as_mut() {
@@ -257,9 +292,47 @@ impl Core {
             s.recovery_pending = None;
             // Work from the account's home Pillar (named in the code) at once.
             s.pillar = Some(code.pillar.clone());
-            s.link_join = Some(LinkJoin { code: code.to_text(), answer_secret, kem_seed: kem.to_vec(), request, check: check.clone(), sent: false });
+            s.link_join = Some(LinkJoin {
+                code: code.to_text(),
+                answer_secret,
+                kem_seed: kem.to_vec(),
+                request,
+                check: String::new(),
+                sent: false,
+                mine,
+                theirs: None,
+                revealed: false,
+                confirmed: false,
+                pending_answer: None,
+            });
         })?;
-        Ok(check)
+        Ok(String::new())
+    }
+
+    /// New device: the person saw the same code on both devices. The
+    /// account is taken only after this.
+    pub fn link_join_confirm(&self) -> Result<()> {
+        let (key, store) = self.unlocked()?;
+        let j = store.link_join.context("Not linking.")?;
+        if j.check.is_empty() {
+            bail!("Wait for the code first.");
+        }
+        self.update(|s| {
+            if let Some(x) = s.link_join.as_mut() {
+                x.confirmed = true;
+            }
+        })?;
+        if let Some(sealed) = &j.pending_answer {
+            self.take_handover(&key, &j, &sealed)?;
+        }
+        Ok(())
+    }
+
+    fn take_handover(&self, key: &super::Keys, j: &LinkJoin, sealed: &[u8]) -> Result<()> {
+        let kem: [u8; 64] = j.kem_seed.as_slice().try_into().context("bad key")?;
+        let plain = link::open_answer(&j.answer_secret, &kem, sealed).context("couldn't open the account")?;
+        let h: Handover = serde_json::from_slice(&plain)?;
+        self.apply_handover(key, h)
     }
 
     /// New device: give up waiting.
@@ -267,18 +340,49 @@ impl Core {
         self.update(|s| s.link_join = None)
     }
 
-    /// New device, while waiting: leave the request (once).
+    /// New device, while waiting: leave the request (once), then reveal my
+    /// value once the other device sent its own.
     pub(super) async fn link_send_request(&self) -> Result<()> {
         let (_, store) = self.unlocked()?;
-        let Some(j) = store.link_join.filter(|j| !j.sent) else { return Ok(()) };
+        let Some(j) = store.link_join else { return Ok(()) };
         let code = LinkCode::parse(&j.code).context("bad link code")?;
-        let blob = link::seal(&code, &LinkBlob::Request(j.request.clone()));
-        self.deposit_sealed(&code.pillar, &code.box_secret(), blob).await?;
-        self.update(|s| {
-            if let Some(x) = s.link_join.as_mut() {
-                x.sent = true;
-            }
-        })
+        if !j.sent {
+            let blob = link::seal(&code, &LinkBlob::Request(j.request.clone()));
+            self.deposit_sealed(&code.pillar, &code.box_secret(), blob).await?;
+            self.update(|s| {
+                if let Some(x) = s.link_join.as_mut() {
+                    x.sent = true;
+                }
+            })?;
+        }
+        if j.theirs.is_some() && !j.revealed {
+            let blob = link::seal(&code, &LinkBlob::Reveal { request: link::request_id(&j.request), nonce: j.mine });
+            self.deposit_sealed(&code.pillar, &code.box_secret(), blob).await?;
+            self.update(|s| {
+                if let Some(x) = s.link_join.as_mut() {
+                    x.revealed = true;
+                }
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Existing device: send my value for each request that arrived.
+    pub(super) async fn link_send_challenges(&self) -> Result<()> {
+        let (_, store) = self.unlocked()?;
+        let Some(o) = store.link_offer.filter(|o| super::unix_now() < o.created + OFFER_SECS) else { return Ok(()) };
+        let code = LinkCode::parse(&o.code).context("bad link code")?;
+        for a in o.asks.iter().filter(|a| !a.challenged) {
+            let request = link::request_id(&a.request);
+            let blob = link::seal(&code, &LinkBlob::Challenge { request, nonce: a.mine });
+            self.deposit_sealed(&code.pillar, &code.box_secret(), blob).await?;
+            self.update(|s| {
+                if let Some(x) = s.link_offer.as_mut().and_then(|o| o.asks.iter_mut().find(|x| link::request_id(&x.request) == request)) {
+                    x.challenged = true;
+                }
+            })?;
+        }
+        Ok(())
     }
 
     /// Link mailboxes to read: (pillar, box secret).
@@ -300,30 +404,75 @@ impl Core {
         let (key, store) = self.unlocked()?;
         if let Some(o) = store.link_offer.clone() {
             if let Some(code) = LinkCode::parse(&o.code) {
-                if let Some(LinkBlob::Request(req)) = link::open(&code, bytes) {
-                    let check = link::check_code(&code, &req);
-                    self.update(|s| {
-                        if let Some(x) = s.link_offer.as_mut() {
-                            if !x.requests.iter().any(|(r, _)| *r == req) && x.requests.len() < 5 {
-                                x.requests.push((req, check));
+                match link::open(&code, bytes) {
+                    Some(LinkBlob::Request(req)) => {
+                        self.update(|s| {
+                            if let Some(x) = s.link_offer.as_mut() {
+                                if !x.asks.iter().any(|a| a.request == req) && x.asks.len() < 5 {
+                                    x.asks.push(LinkAsk { request: req, mine: sentinel_core::random_bytes::<32>(), challenged: false, theirs: None, check: None });
+                                }
                             }
-                        }
-                    })?;
-                    return Ok(true);
+                        })?;
+                        return Ok(true);
+                    }
+                    Some(LinkBlob::Reveal { request, nonce }) => {
+                        self.update(|s| {
+                            let Some(a) = s.link_offer.as_mut().and_then(|o| o.asks.iter_mut().find(|a| link::request_id(&a.request) == request)) else { return };
+                            // Only after my value went out, and only once.
+                            if a.challenged && a.theirs.is_none() {
+                                if let Some(check) = link::check_code(&code, &a.request, &nonce, &a.mine) {
+                                    a.theirs = Some(nonce);
+                                    a.check = Some(check);
+                                }
+                            }
+                        })?;
+                        return Ok(true);
+                    }
+                    _ => {}
                 }
             }
         }
         if let Some(j) = store.link_join.clone() {
             if let Some(code) = LinkCode::parse(&j.code) {
-                if let Some(LinkBlob::Answer { to, sealed }) = link::open(&code, bytes) {
-                    if to != j.request.answer_to {
-                        return Ok(true); // someone else's answer
+                match link::open(&code, bytes) {
+                    Some(LinkBlob::Challenge { request, nonce }) => {
+                        // The first value for my request counts (a second
+                        // one, from someone in the middle, would only change
+                        // my code: the person then sees them differ).
+                        if request == link::request_id(&j.request) && j.theirs.is_none() {
+                            if let Some(check) = link::check_code(&code, &j.request, &j.mine, &nonce) {
+                                self.update(|s| {
+                                    if let Some(x) = s.link_join.as_mut() {
+                                        x.theirs = Some(nonce);
+                                        x.check = check;
+                                    }
+                                })?;
+                            }
+                        }
+                        return Ok(true);
                     }
-                    let kem: [u8; 64] = j.kem_seed.as_slice().try_into().context("bad key")?;
-                    let plain = link::open_answer(&j.answer_secret, &kem, &sealed).context("couldn't open the account")?;
-                    let h: Handover = serde_json::from_slice(&plain)?;
-                    self.apply_handover(&key, h)?;
-                    return Ok(true);
+                    Some(LinkBlob::Answer { to, sealed, tag }) => {
+                        if to != j.request.answer_to {
+                            return Ok(true); // someone else's answer
+                        }
+                        // Only from whoever holds the other value of the
+                        // exchange the person is checking.
+                        let Some(theirs) = j.theirs else { return Ok(true) };
+                        if link::answer_tag(&code, &j.request, &j.mine, &theirs, &sealed) != tag {
+                            return Ok(true);
+                        }
+                        if j.confirmed {
+                            self.take_handover(&key, &j, &sealed)?;
+                        } else {
+                            self.update(|s| {
+                                if let Some(x) = s.link_join.as_mut() {
+                                    x.pending_answer = Some(sealed);
+                                }
+                            })?;
+                        }
+                        return Ok(true);
+                    }
+                    _ => {}
                 }
             }
         }

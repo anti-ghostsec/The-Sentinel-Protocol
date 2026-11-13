@@ -347,9 +347,16 @@ pub fn card_mac(author: &ed25519_dalek::SigningKey, recipient_inbox: &[u8; 32], 
 /// Recipient side of `card_mac`.
 pub fn check_card_mac(inbox_secret: &[u8; 32], sender: &[u8; 32], card: &ContactCard, mac: &[u8; 32]) -> bool {
     let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(sender) else { return false };
+    // A small-order key gives the same (zero) secret with anyone.
+    if vk.is_weak() {
+        return false;
+    }
     let secret = StaticSecret::from(*inbox_secret);
     let my_pub = PublicKey::from(&secret);
     let shared = secret.diffie_hellman(&PublicKey::from(vk.to_montgomery().to_bytes()));
+    if !shared.was_contributory() {
+        return false;
+    }
     let key = card_mac_key(shared.as_bytes(), sender, my_pub.as_bytes());
     let want = blake3::keyed_hash(&key, &cbor(card));
     // Constant time (blake3::Hash implements it).

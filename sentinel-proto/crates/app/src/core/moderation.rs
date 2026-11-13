@@ -125,13 +125,49 @@ impl Core {
         let Ok((key, _)) = self.unlocked() else { return 0 };
         let token = social::report_token(&key, &address);
         let data = social::report_pow_data(&address, &token, category);
-        let Ok(nonce) = tokio::task::spawn_blocking(move || sentinel_core::pow::stamp(social::REPORT_POW_DOMAIN, &data, social::REPORT_POW_BITS)).await else { return 0 };
-        let sends = pillars.iter().filter(|p| !p.is_empty()).map(|p| {
-            let (net, chunks) = (net.clone(), chunks.clone());
-            async move {
-                let r = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        let d = data.clone();
+        let Ok(nonce) = tokio::task::spawn_blocking(move || sentinel_core::pow::stamp(social::REPORT_POW_DOMAIN, &d, social::REPORT_POW_BITS)).await else { return 0 };
+        // Archives hold only the media: they take the pieces that can be
+        // removed from the post itself, so it goes along (public posts only;
+        // fetched from the first Pillar that has it).
+        let mut post = Vec::new();
+        if !chunks.is_empty() {
+            for p in pillars.iter().filter(|p| !p.is_empty()) {
+                let got = tokio::time::timeout(std::time::Duration::from_secs(60), async {
                     let mut s = net.connect_hedged(p).await?;
-                    anyhow::Ok(matches!(request(&mut s, &Request::Report { address, chunks, category, token, nonce }).await?, Response::Pong))
+                    anyhow::Ok(request(&mut s, &Request::Get(Address(address))).await?)
+                })
+                .await;
+                if let Ok(Ok(Response::Object(b))) = got {
+                    if Address::of(&b).0 == address {
+                        post = b;
+                        break;
+                    }
+                }
+            }
+        }
+        let sends = pillars.iter().filter(|p| !p.is_empty()).map(|p| {
+            let (net, chunks, post, data) = (net.clone(), chunks.clone(), post.clone(), data.clone());
+            async move {
+                let r = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+                    let mut nonce = nonce;
+                    // An item reported before needs more work (once more at
+                    // most, with what the Pillar asks for; a new connection,
+                    // since the work can take a while).
+                    for _ in 0..2 {
+                        let mut s = net.connect_hedged(p).await?;
+                        let req = Request::Report { address, chunks: chunks.clone(), category, token, nonce, post: post.clone() };
+                        match request(&mut s, &req).await? {
+                            Response::Pong => return anyhow::Ok(true),
+                            Response::Rejected(r) => {
+                                let Some(bits) = r.strip_prefix("more work: ").and_then(|b| b.parse::<u32>().ok()).filter(|b| *b <= 30) else { return Ok(false) };
+                                let d = data.clone();
+                                nonce = tokio::task::spawn_blocking(move || sentinel_core::pow::stamp_parallel(social::REPORT_POW_DOMAIN, &d, bits)).await?;
+                            }
+                            _ => return Ok(false),
+                        }
+                    }
+                    Ok(false)
                 })
                 .await;
                 matches!(r, Ok(Ok(true)))
