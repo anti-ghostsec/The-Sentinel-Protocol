@@ -50,9 +50,14 @@ fn padded_len(len: usize) -> usize {
     PAD_BUCKETS.iter().copied().find(|b| *b >= len).unwrap_or(len.div_ceil(PAD) * PAD)
 }
 
+/// New sessions use version 2: full 32-byte message MACs (version 1
+/// truncates them to 8 bytes, for libolm, which nothing here talks to).
 pub fn session_config() -> SessionConfig {
-    SessionConfig::version_1()
+    SessionConfig::version_2()
 }
+
+/// Version 3 messages are version 1 sessions (older apps): still accepted.
+const MAC_TRUNCATED_VERSION: u8 = 3;
 
 /// Day number for inbox rotation.
 pub fn today() -> u64 {
@@ -384,14 +389,23 @@ pub fn make_card(account: &mut Account, inbox_pub: [u8; 32], inbox_kem: Option<V
     card
 }
 
-/// Start a session to `card` using a random one-time key (or the fallback).
+/// Start a session to `card` using its fallback key (or a random one-time
+/// key from a card without one).
+///
+/// A card is given to many people, and a one-time key works only for the
+/// first of them: two senders picking the same one meant the second one's
+/// messages could never be opened, all of them, until a reply that never
+/// came. The fallback key works for everyone. The cost is that the first
+/// messages, until a reply, rest on a key that isn't deleted after use.
 pub fn outbound_session(account: &Account, card: &ContactCard) -> Option<Session> {
     let identity = Curve25519PublicKey::from_bytes(card.olm_identity);
-    let otk = if card.one_time_keys.is_empty() {
-        card.fallback_key?
-    } else {
-        let i = (u32::from_le_bytes(crate::random_bytes::<4>()) as usize) % card.one_time_keys.len();
-        card.one_time_keys[i]
+    let otk = match card.fallback_key {
+        Some(k) => k,
+        None if !card.one_time_keys.is_empty() => {
+            let i = (u32::from_le_bytes(crate::random_bytes::<4>()) as usize) % card.one_time_keys.len();
+            card.one_time_keys[i]
+        }
+        None => return None,
     };
     account.create_outbound_session(session_config(), identity, Curve25519PublicKey::from_bytes(otk)).ok()
 }
@@ -504,7 +518,8 @@ pub fn decrypt(
     }
     match msg {
         OlmMessage::PreKey(pk) => {
-            let r = account.create_inbound_session(session_config(), sender, pk).ok()?;
+            let config = if pk.message().version() == MAC_TRUNCATED_VERSION { SessionConfig::version_1() } else { session_config() };
+            let r = account.create_inbound_session(config, sender, pk).ok()?;
             Some((r.session, ciborium::from_reader(r.plaintext.as_slice()).ok()?))
         }
         OlmMessage::Normal(_) => None,
@@ -614,6 +629,34 @@ mod tests {
         let blob2 = encrypt(&b_acc, &mut b_sess, &reply, &a_card_seen).unwrap();
         // Alice can't unseal with the wrong inbox secret...
         assert!(unseal(&b_inbox, &fetch_of(&b_inbox), &blob2).is_none());
+    }
+
+    #[test]
+    fn two_senders_with_the_same_card_both_get_through() {
+        let (_, mut b_acc, b_inbox, b_card) = party("b.onion");
+        for name in ["one", "two", "three"] {
+            let (key, acc, _, card) = party("a.onion");
+            let mut sess = outbound_session(&acc, &b_card).unwrap();
+            for n in 0..2 {
+                let text = format!("{name} {n}");
+                let blob = encrypt(&acc, &mut sess, &first(&key, &text, &card, &b_card.inbox_pub), &b_card).unwrap();
+                let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
+                assert_eq!(decrypt(&mut b_acc, None, sender, &msg).unwrap().1.text, text);
+            }
+        }
+    }
+
+    #[test]
+    fn version_1_sessions_from_older_apps_still_open() {
+        let (a_key, a_acc, _, a_card) = party("a.onion");
+        let (_, mut b_acc, b_inbox, b_card) = party("b.onion");
+        let otk = Curve25519PublicKey::from_bytes(b_card.fallback_key.unwrap());
+        let mut old = a_acc.create_outbound_session(SessionConfig::version_1(), Curve25519PublicKey::from_bytes(b_card.olm_identity), otk).unwrap();
+        let blob = encrypt(&a_acc, &mut old, &first(&a_key, "from v1", &a_card, &b_card.inbox_pub), &b_card).unwrap();
+        let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), &blob).unwrap();
+        let (sess, got) = decrypt(&mut b_acc, None, sender, &msg).unwrap();
+        assert_eq!(got.text, "from v1");
+        assert_eq!(sess.session_config(), SessionConfig::version_1());
     }
 
     #[test]
