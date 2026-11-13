@@ -381,7 +381,7 @@ You share a **follow link**. It carries the key that unlocks your posts. Anyone 
 
 **Public or private, asked once.** Making an account asks who can find you. A **public account** starts every post as Discoverable: it appears in Discover with a Follow button, like any microblog. A **private account** starts every post as "People with your link". It's only the starting point; each post can still be set either way, and High-risk mode keeps posts out of Discover whatever was chosen.
 
-**Passing your link on.** Your profile has *Copy follow link* and *Show code*, which draws the link as a QR code (made inside the app). On Android, a `sentinel://follow/…` link that is tapped, or scanned with the camera, opens Sentinel, which shows the link and asks before following; other kinds of link are shown but not acted on. On a computer, links are pasted: registering Sentinel as a link handler would list it in the system's settings, which the disguise is there to avoid.
+**Passing your link on.** Your profile has *Copy follow link* and *Show code*, which draws the link as a QR code (made inside the app). On Android, a `sentinel://follow/…` link that is tapped, or scanned with the camera, opens Sentinel, which shows the link and asks before following; other kinds of link are shown but not acted on. On a computer (Windows and Linux), Settings → Privacy → *Open sentinel:// links with Sentinel* does the same for clicked links. It is off unless you switch it on, because it adds an entry naming Sentinel to the computer's settings, which someone searching the computer could find even with the disguise on; switching it off removes the entry. A link clicked while Sentinel is already open is handed to the open window.
 
 ### Approved followers *(Built)*
 

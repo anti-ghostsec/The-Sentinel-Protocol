@@ -7,6 +7,8 @@ mod android;
 mod core;
 mod dialog;
 mod disguise;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+mod linkhandler;
 mod hostproc;
 mod torproc;
 mod oshardening;
@@ -87,9 +89,32 @@ mod qr_tests {
 async fn opened_link() -> Option<String> {
     #[cfg(target_os = "android")]
     let link = tokio::task::spawn_blocking(android::opened_link).await.ok().flatten();
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
     let link: Option<String> = None;
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let link = linkhandler::take();
     link.filter(|l| l.starts_with("sentinel://") && l.len() < 1024 && !l.chars().any(char::is_control))
+}
+
+/// Whether this computer opens `sentinel://` links with Sentinel (None:
+/// not something this device has a setting for).
+#[tauri::command]
+fn link_handler() -> Option<bool> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    return Some(linkhandler::registered());
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    None
+}
+
+#[tauri::command]
+fn set_link_handler(on: bool) -> Res<()> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    return if on { linkhandler::register() } else { linkhandler::unregister() };
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    {
+        let _ = on;
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -1097,6 +1122,10 @@ pub fn run() {
     if std::env::args().nth(1).as_deref() == Some(torproc::TOR_ARG) {
         torproc::child_main();
     }
+    // A sentinel:// link this was started with (and nothing more to do if
+    // Sentinel is already open).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    linkhandler::at_start();
     // The connection log (memory only), for "why won't it connect?".
     sentinel_net::enable_memory_log();
     // The browser engine reads settings from these environment variables:
@@ -1207,6 +1236,8 @@ pub fn run() {
             set_discover_default,
             follow_qr,
             opened_link,
+            link_handler,
+            set_link_handler,
             refresh,
             set_pillar,
             app_catalog,

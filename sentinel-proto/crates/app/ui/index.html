@@ -521,6 +521,10 @@
           <button type="button" class="seg-btn" data-settings="credits" role="tab">Credits</button>
         </div>
         <div data-group="privacy" id="privacy-list"></div>
+        <div data-group="privacy" class="row-setting desktop-only" id="link-handler-row" hidden>
+          <div class="stack-4"><span class="setting-title">Open sentinel:// links with Sentinel</span><span class="muted small">Clicking a follow link anywhere on this computer opens Sentinel, which asks before following. This adds an entry naming Sentinel to this computer's settings, which someone searching it could find, even with the calculator disguise on. <span id="link-handler-msg"></span></span></div>
+          <button type="button" id="link-handler" class="toggle" role="switch" aria-label="Open sentinel:// links with Sentinel" aria-checked="false"></button>
+        </div>
         <div data-group="privacy" class="row-setting">
           <div class="stack-4"><span class="setting-title">Delete all messages</span><span class="muted small">Every private message and room message on this device and your other linked devices. Posts, follows and rooms stay. Other people's copies stay too (in a conversation, "Select" can ask their app to delete them).</span></div>
           <button type="button" id="delete-all-msgs" class="btn outline small-btn">Delete all messages</button>

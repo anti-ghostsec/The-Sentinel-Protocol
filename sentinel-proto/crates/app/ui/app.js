@@ -2716,6 +2716,29 @@ async function checkOpenedLink() {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) checkOpenedLink();
 });
+window.addEventListener("focus", checkOpenedLink);
+// A link clicked while Sentinel is open in the background.
+setInterval(() => {
+  if (S.status && S.status.unlocked) checkOpenedLink();
+}, 4000);
+
+/* computers: being the handler for sentinel:// links (off unless chosen) */
+async function paintLinkHandler() {
+  const on = await invoke("link_handler").catch(() => null);
+  $("link-handler-row").hidden = on === null;
+  $("link-handler").setAttribute("aria-checked", String(!!on));
+}
+$("link-handler").addEventListener("click", async () => {
+  const on = $("link-handler").getAttribute("aria-checked") !== "true";
+  try {
+    await invoke("set_link_handler", { on });
+    $("link-handler-msg").textContent = "";
+  } catch (e) {
+    $("link-handler-msg").textContent = String(e);
+  }
+  paintLinkHandler();
+});
+paintLinkHandler();
 
 /* privacy */
 const PRIVACY = [
