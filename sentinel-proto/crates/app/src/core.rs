@@ -198,6 +198,9 @@ pub struct DmState {
     pub cursors: std::collections::HashMap<String, u64>,
     pub card_minute: u64,
     pub card_pillar: Option<String>,
+    /// Day the Olm fallback key was last replaced (0: before rotation).
+    #[serde(default)]
+    pub fallback_day: u64,
     /// Which Sentinel account owns each Olm session (peer Olm identity hex
     /// -> author), learned when a session is authenticated.
     #[serde(default)]

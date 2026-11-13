@@ -389,6 +389,23 @@ pub fn make_card(account: &mut Account, inbox_pub: [u8; 32], inbox_kem: Option<V
     card
 }
 
+/// Days between fallback key changes. The account keeps the previous key
+/// until the next change, so a card stays openable for this long after the
+/// key it carries is replaced: a card's inbox IDs last 31 days and a
+/// deposit waits 7 more, so 40 covers every message sent to a card.
+pub const FALLBACK_ROTATE_DAYS: u64 = 40;
+
+/// Replace the fallback key if it is `FALLBACK_ROTATE_DAYS` old (made on
+/// `made_day`; 0 = before rotation existed). Returns whether it changed;
+/// the caller then publishes a new card.
+pub fn rotate_fallback_if_due(account: &mut Account, made_day: u64, today: u64) -> bool {
+    if today.saturating_sub(made_day) < FALLBACK_ROTATE_DAYS {
+        return false;
+    }
+    account.generate_fallback_key();
+    true
+}
+
 /// Start a session to `card` using its fallback key (or a random one-time
 /// key from a card without one).
 ///
@@ -629,6 +646,31 @@ mod tests {
         let blob2 = encrypt(&b_acc, &mut b_sess, &reply, &a_card_seen).unwrap();
         // Alice can't unseal with the wrong inbox secret...
         assert!(unseal(&b_inbox, &fetch_of(&b_inbox), &blob2).is_none());
+    }
+
+    #[test]
+    fn a_card_opens_until_its_fallback_key_is_replaced_twice() {
+        let (a_key, a_acc, _, a_card) = party("a.onion");
+        let (_, mut b_acc, b_inbox, old_card) = party("b.onion");
+        let send = |acc: &Account, card: &ContactCard, text: &str| {
+            let mut sess = outbound_session(acc, card).unwrap();
+            encrypt(acc, &mut sess, &first(&a_key, text, &a_card, &card.inbox_pub), card).unwrap()
+        };
+        let open = |acc: &mut Account, blob: &[u8]| {
+            let (sender, msg) = unseal(&b_inbox, &fetch_of(&b_inbox), blob).unwrap();
+            decrypt(acc, None, sender, &msg).map(|(_, p)| p.text)
+        };
+        assert!(!rotate_fallback_if_due(&mut Account::new(), 100, 100 + FALLBACK_ROTATE_DAYS - 1));
+        let mut acc = Account::new();
+        assert!(rotate_fallback_if_due(&mut acc, 0, 100));
+        // Once replaced, the old card still works.
+        let blob = send(&a_acc, &old_card, "after one change");
+        assert!(rotate_fallback_if_due(&mut b_acc, 100, 100 + FALLBACK_ROTATE_DAYS));
+        assert_eq!(open(&mut b_acc, &blob).as_deref(), Some("after one change"));
+        // Replaced again: the key that card carries is gone.
+        let blob = send(&a_acc, &old_card, "after two changes");
+        assert!(rotate_fallback_if_due(&mut b_acc, 140, 140 + FALLBACK_ROTATE_DAYS));
+        assert_eq!(open(&mut b_acc, &blob), None);
     }
 
     #[test]

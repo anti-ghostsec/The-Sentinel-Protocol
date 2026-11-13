@@ -95,10 +95,14 @@ impl Core {
         let st = store.dm.clone().context("no messaging keys")?;
         let fresh = st.card_pillar.as_deref() == Some(pillar.as_str())
             && social::coarse_minute().saturating_sub(st.card_minute) < 24 * 60;
-        if fresh {
+        let mut account = load_account(&key, &st)?;
+        // First messages use the fallback key: replace it now and then (the
+        // previous one keeps working for cards already handed out).
+        let today = dm::today();
+        let rotated = dm::rotate_fallback_if_due(&mut account, st.fallback_day, today);
+        if fresh && !rotated {
             return Ok(());
         }
-        let mut account = load_account(&key, &st)?;
         let card = dm::make_card(&mut account, dm::inbox_public(&st.inbox_secret), Some(dm::inbox_kem_public(&st.fetch_secret)), st.fetch_secret, pillar.clone());
         let feed_key = store.feed_key.context("no feed key")?;
         let env = social::card_envelope(&key, &feed_key, &card).map_err(|e| anyhow!(e))?;
@@ -106,6 +110,9 @@ impl Core {
         self.update(|s| {
             if let Some(d) = s.dm.as_mut() {
                 d.account = pickled;
+                if rotated {
+                    d.fallback_day = today;
+                }
             }
         })?;
         self.put(env.encode()?).await?;
