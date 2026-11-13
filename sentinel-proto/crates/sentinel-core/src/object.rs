@@ -101,11 +101,22 @@ impl Envelope {
     }
 
     /// Decode and verify. Never returns an unverified envelope.
+    ///
+    /// Only the one encoding `encode` produces is accepted. CBOR can write
+    /// the same envelope in many ways (fields in another order, an extra
+    /// field, longer number forms), and the version isn't signed: each
+    /// variant would verify but hash differently, so anyone holding a
+    /// signed object could make "another" one with the same signature. A
+    /// room member could turn one admin entry into two and set off the
+    /// warning that the admin key signed conflicting histories.
     pub fn decode_verified(bytes: &[u8]) -> Result<Self, ObjectError> {
         if bytes.len() > MAX_OBJECT_LEN {
             return Err(ObjectError::TooLarge);
         }
         let env: Envelope = ciborium::from_reader(bytes).map_err(|_| ObjectError::Encoding)?;
+        if env.v != 0 || env.encode()? != bytes {
+            return Err(ObjectError::Encoding);
+        }
         env.verify()?;
         Ok(env)
     }
@@ -145,6 +156,36 @@ mod tests {
         let mut bad_kind = env;
         bad_kind.kind = "profile".into();
         assert!(Envelope::decode_verified(&bad_kind.encode().unwrap()).is_err());
+    }
+
+    #[test]
+    fn only_the_one_encoding_is_accepted() {
+        use ciborium::value::Value;
+        let key = SigningKey::from_bytes(&crate::random_bytes::<32>());
+        let env = Envelope::sign(&key, "post", b"hello".to_vec());
+        let bytes = env.encode().unwrap();
+        let Value::Map(fields) = ciborium::from_reader::<Value, _>(bytes.as_slice()).unwrap() else { panic!() };
+        let write = |fields: &Vec<(Value, Value)>| {
+            let mut out = Vec::new();
+            ciborium::into_writer(&Value::Map(fields.clone()), &mut out).unwrap();
+            out
+        };
+        assert_eq!(write(&fields), bytes);
+        // The same signed content, written differently: each would hash
+        // differently, so none is accepted.
+        let mut extra = fields.clone();
+        extra.push((Value::Text("x".into()), Value::Integer(1.into())));
+        let mut reordered = fields.clone();
+        reordered.reverse();
+        let mut version = fields.clone();
+        version[0].1 = Value::Integer(1.into());
+        for other in [write(&extra), write(&reordered), write(&version)] {
+            assert_ne!(other, bytes);
+            assert!(Envelope::decode_verified(&other).is_err());
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(Envelope::decode_verified(&trailing).is_err());
     }
 
     #[test]

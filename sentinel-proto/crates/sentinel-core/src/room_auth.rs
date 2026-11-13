@@ -387,6 +387,23 @@ mod tests {
         assert_eq!(log.offer(&room, &a2).len(), 1);
         assert!(log.offer(&room, &b2).is_empty());
         assert!(log.fork);
+        // The same entry written another way isn't a second history: a
+        // member can't set off the warning with something the admin signed.
+        {
+            use ciborium::value::Value;
+            let mut clean = Log::default();
+            let (s1, h1) = sign(&admin, &entry(room, 1, [0; 32], details("a")));
+            let (s2, _) = sign(&admin, &entry(room, 2, h1, details("b")));
+            clean.offer(&room, &s1);
+            clean.offer(&room, &s2);
+            let Value::Map(mut fields) = ciborium::from_reader::<Value, _>(s2.as_slice()).unwrap() else { panic!() };
+            fields.push((Value::Text("x".into()), Value::Integer(1.into())));
+            let mut again = Vec::new();
+            ciborium::into_writer(&Value::Map(fields), &mut again).unwrap();
+            assert_ne!(again, s2);
+            assert!(clean.offer(&room, &again).is_empty());
+            assert!(!clean.fork);
+        }
         // A checkpoint with the next number but another parent is a fork too.
         let mut log2 = Log::default();
         log2.offer(&room, &s1);
