@@ -74,3 +74,11 @@ wry = { path = "patches/wry" }
 # remote kill switch for a Pillar and a silent crash for the app. Unwinding
 # also runs Drop, so secret keys are zeroized. Crash reporting stays off.
 panic = "unwind"
+
+# Debug info: file and line numbers for our code, none for dependencies,
+# or the build folder grows by tens of gigabytes.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
