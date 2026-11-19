@@ -136,7 +136,9 @@ jobs:
           # Signed with the release key, the one in
           # crates/app/gen/android/release-cert.sha256, not some other one.
           apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
-          got=$("$apksigner" verify --print-certs dist/sentinel-android.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          certs=$("$apksigner" verify --print-certs dist/sentinel-android.apk)
+          printf '%s\n' "$certs"
+          got=$(printf '%s\n' "$certs" | sed -n 's/^Signer[^:]*certificate SHA-256 digest: //p' | head -1)
           echo "signing certificate SHA-256: $got"
           [ "$got" = "$(tr -d '[:space:]' < crates/app/gen/android/release-cert.sha256)" ] || { echo "signed with $got, not the release key" >&2; exit 1; }
           echo "clean: dist/sentinel-android.apk ($(du -h dist/sentinel-android.apk | cut -f1))"
@@ -174,7 +176,9 @@ jobs:
           cp art/sentinel-android/sentinel-android.apk out/
           # Only an APK signed with the release key is published.
           apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
-          got=$("$apksigner" verify --print-certs out/sentinel-android.apk | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          certs=$("$apksigner" verify --print-certs out/sentinel-android.apk)
+          printf '%s\n' "$certs"
+          got=$(printf '%s\n' "$certs" | sed -n 's/^Signer[^:]*certificate SHA-256 digest: //p' | head -1)
           [ "$got" = "$(tr -d '[:space:]' < sentinel-proto/crates/app/gen/android/release-cert.sha256)" ] || { echo "::error::The APK is signed with $got, not the release key" >&2; exit 1; }
           ( cd out && sha256sum * > SHA256SUMS.txt )
           pre=""
