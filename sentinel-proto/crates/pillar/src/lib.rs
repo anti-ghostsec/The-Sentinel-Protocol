@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 use arti_client::TorClient;
 use futures::StreamExt;
 use safelog::DisplayRedacted;
-use sentinel_core::cell::{read_message, write_message};
+use sentinel_core::cell::{read_message, read_message_budgeted, write_message};
 use sentinel_core::object::{Address, Envelope};
 use sentinel_core::wire::{self, Request, Response};
 use sentinel_core::{dm, media, pow, seal, social};
@@ -59,6 +59,15 @@ const MAX_REQUESTS_PER_STREAM: usize = 256;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Streams one rendezvous circuit may open before it is torn down.
 const MAX_STREAMS_PER_CIRCUIT: u32 = 8;
+/// Streams open at once, from everyone. Circuits cost an attacker nothing
+/// but time, so without this they could open streams until memory ran out;
+/// past it, new circuits are turned away until streams close.
+const MAX_OPEN_STREAMS: usize = 4096;
+/// Memory, in KiB, for requests being read, from every stream together
+/// (256 MiB): a message takes its share as its bytes arrive, so streams that
+/// announce big messages and stall hold only what they sent. A request that
+/// doesn't fit is turned away, and the client tries again.
+const MESSAGE_MEMORY_KIB: usize = 256 * 1024;
 /// Most data in one inbox, room-box or author-bucket reply. These replies
 /// encode each byte as a CBOR number (up to 2 bytes on the wire), so the
 /// data is kept under half the 2 MiB message limit: a bigger reply can't be
@@ -148,6 +157,10 @@ struct Ctx {
     watching: AtomicU64,
     /// One-time key claims seen lately (a proof of work counts once).
     prekey_claims: prekeys::Claims,
+    /// One permit per open stream (`MAX_OPEN_STREAMS`).
+    open_streams: Arc<tokio::sync::Semaphore>,
+    /// One permit per KiB of requests being read (`MESSAGE_MEMORY_KIB`).
+    message_memory: Arc<tokio::sync::Semaphore>,
 }
 
 /// Most mixed packets held at once.
@@ -231,6 +244,8 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         deposits: tokio::sync::broadcast::channel(1024).0,
         watching: AtomicU64::new(0),
         prekey_claims: prekeys::Claims::default(),
+        open_streams: Arc::new(tokio::sync::Semaphore::new(MAX_OPEN_STREAMS)),
+        message_memory: Arc::new(tokio::sync::Semaphore::new(MESSAGE_MEMORY_KIB)),
     });
     let (max_seq, count) = mailbox_scan(&cfg.store);
     // The counter survives restarts even after every deposit expired (a
@@ -253,10 +268,16 @@ pub async fn start(tor: Arc<TorClient<PreferredRuntime>>, cfg: PillarConfig) -> 
         tasks.push(tokio::spawn(async move {
             let mut streams = Box::pin(tor_hsservice::handle_rend_requests(rend_requests));
             while let Some(req) = streams.next().await {
+                let Ok(open) = Arc::clone(&ctx.open_streams).try_acquire_owned() else {
+                    ctx.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    let _ = req.shutdown_circuit();
+                    continue;
+                };
                 let ctx = Arc::clone(&ctx);
                 tokio::spawn(async move {
                     // Errors are not printed: they could carry per-connection detail.
                     let _ = handle_stream(req, ctx).await;
+                    drop(open);
                 });
             }
         }));
@@ -534,7 +555,8 @@ async fn handle_stream(req: StreamRequest, ctx: Arc<Ctx>) -> Result<()> {
     ctx.stats.streams.fetch_add(1, Ordering::Relaxed);
     let mut reward = economy::RewardState::new();
     for _ in 0..MAX_REQUESTS_PER_STREAM {
-        let msg = match tokio::time::timeout(IDLE_TIMEOUT, read_message(&mut stream)).await {
+        // `_held` keeps the request's memory counted until it's answered.
+        let (msg, _held) = match tokio::time::timeout(IDLE_TIMEOUT, read_message_budgeted(&mut stream, &ctx.message_memory)).await {
             Ok(Ok(m)) => m,
             _ => break,
         };

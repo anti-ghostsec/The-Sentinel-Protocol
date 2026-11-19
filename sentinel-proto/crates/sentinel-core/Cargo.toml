@@ -16,7 +16,7 @@ zeroize.workspace = true
 getrandom.workspace = true
 data-encoding.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 vodozemac.workspace = true
 x25519-dalek.workspace = true
 image.workspace = true
