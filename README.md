@@ -79,6 +79,8 @@ Download from the **Releases** section of this page. Everything is inside: Tor, 
 | **Linux** (Ubuntu 22.04+, Debian 12+) | `sentinel-linux.AppImage` (runs as is: `chmod +x`, then open it) or `sentinel-linux.deb` |
 | **A computer that stays on** | `sentinel-pillar-windows.exe`, `sentinel-pillar-linux-x86_64`, or `sentinel-pillar-linux-arm64` (Raspberry Pi) |
 
+A Pillar opened by double-clicking it shows itself in a terminal window; close the window to stop it. On a server, run it from a terminal or a service as usual (`--headless` never opens a window).
+
 Check your download against `SHA256SUMS.txt` in the same release. The [tester guide](TESTER_GUIDE.md) walks you through the first ten minutes.
 
 ## Where it's going

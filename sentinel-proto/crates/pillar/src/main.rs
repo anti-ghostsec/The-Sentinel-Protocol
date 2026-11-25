@@ -56,6 +56,10 @@ struct Args {
     /// Print redacted Tor diagnostics to stderr (never written to disk).
     #[arg(long)]
     debug_log: bool,
+    /// Never open a terminal window (started without one, from a file
+    /// manager say, the Pillar otherwise opens one to show what it's doing).
+    #[arg(long)]
+    headless: bool,
     /// Print this Pillar's credit keys (for the seed list; made now if it
     /// has none yet) and exit, without starting Tor.
     #[arg(long)]
@@ -86,6 +90,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(target_os = "linux")]
+    if !args.headless && window::open() {
+        return Ok(());
+    }
     #[cfg(feature = "test-hooks")]
     if let Some(file) = &args.check_credits {
         let parts: Vec<(String, sentinel_core::credits::Token)> = serde_json::from_slice(&std::fs::read(file)?)?;
@@ -185,4 +193,68 @@ async fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Started by a double-click there is nowhere to see the Pillar running (or
+/// to stop it): open a terminal window and run in that instead.
+#[cfg(target_os = "linux")]
+mod window {
+    use std::io::IsTerminal;
+    use std::process::{Command, Stdio};
+
+    const MARK: &str = "SENTINEL_PILLAR_IN_TERMINAL";
+
+    fn quote(a: &str) -> String {
+        format!("'{}'", a.replace('\'', r"'\''"))
+    }
+
+    /// True if the Pillar now runs in a new terminal window (this process
+    /// should exit).
+    pub fn open() -> bool {
+        let desktop = std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if std::env::var_os(MARK).is_some() || !desktop || std::io::stdin().is_terminal() || std::io::stderr().is_terminal() {
+            return false;
+        }
+        let Ok(exe) = std::env::current_exe() else { return false };
+        let mut line = quote(&exe.to_string_lossy());
+        for a in std::env::args_os().skip(1) {
+            line.push(' ');
+            line.push_str(&quote(&a.to_string_lossy()));
+        }
+        // The window stays open after the Pillar stops, so its last words
+        // can be read.
+        let script = format!("{line}; s=$?; echo; echo \"The Pillar has stopped (exit code $s). Press Enter to close this window.\"; read _");
+        let shell = format!("sh -c {}", quote(&script));
+        // (terminal, arguments before the command, true: takes the command
+        // as separate words; false: as one line)
+        let terminals: [(&str, &[&str], bool); 13] = [
+            ("x-terminal-emulator", &["-e"], false),
+            ("gnome-terminal", &["--title=Sentinel Pillar", "--"], true),
+            ("kgx", &["--"], true),
+            ("ptyxis", &["--"], true),
+            ("konsole", &["-e"], true),
+            ("xfce4-terminal", &["--title=Sentinel Pillar", "-x"], true),
+            ("mate-terminal", &["-x"], true),
+            ("lxterminal", &["--title=Sentinel Pillar", "-e"], false),
+            ("tilix", &["-e"], false),
+            ("alacritty", &["--title", "Sentinel Pillar", "-e"], true),
+            ("kitty", &["--title", "Sentinel Pillar"], true),
+            ("foot", &["--title=Sentinel Pillar"], true),
+            ("xterm", &["-T", "Sentinel Pillar", "-e"], true),
+        ];
+        for (term, pre, words) in terminals {
+            let mut c = Command::new(term);
+            c.args(pre);
+            if words {
+                c.args(["sh", "-c", &script]);
+            } else {
+                c.arg(&shell);
+            }
+            c.env(MARK, "1").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            if c.spawn().is_ok() {
+                return true;
+            }
+        }
+        false
+    }
 }
