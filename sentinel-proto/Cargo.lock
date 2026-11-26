@@ -4814,7 +4814,7 @@ dependencies = [
 
 [[package]]
 name = "pillar"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arti-client",
@@ -5987,7 +5987,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arti-client",
@@ -6008,7 +6008,7 @@ dependencies = [
 
 [[package]]
 name = "sentinel-app"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arti-client",
