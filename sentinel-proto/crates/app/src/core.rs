@@ -272,6 +272,9 @@ pub struct Conversation {
     /// Cards of each of their devices learned from their messages.
     #[serde(default)]
     pub cards: Vec<sentinel_core::social::ContactCard>,
+    /// Their profile picture, as their messages last gave it.
+    #[serde(default)]
+    pub avatar: Option<sentinel_core::media::MediaRef>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2223,7 +2226,7 @@ impl Core {
     }
 
     async fn publish_profile(&self) -> Result<()> {
-        let (key, store) = self.unlocked()?;
+        let (_, store) = self.unlocked()?;
         if store.profile_published || store.pillar.is_none() {
             return Ok(());
         }
@@ -2238,6 +2241,8 @@ impl Core {
             }
             self.upload_profile_chunks(&store.profile_chunks, &uniq).await?;
         }
+        // (Re-read: the upload may have narrowed the pictures' hosts.)
+        let (key, store) = self.unlocked()?;
         let feed_key = store.feed_key.context("no feed key")?;
         let body = social::ProfileBody {
             name: store.name.clone(),

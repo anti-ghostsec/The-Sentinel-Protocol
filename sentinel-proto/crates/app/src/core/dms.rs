@@ -27,6 +27,8 @@ pub struct ConversationView {
     pub last: Option<String>,
     pub minute: u64,
     pub can_message: bool,
+    /// They have a profile picture (load via `profile_image`).
+    pub avatar: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -264,6 +266,7 @@ impl Core {
                 last: c.messages.iter().rev().find(|m| !m.text.is_empty()).map(|m| m.text.clone()),
                 minute: c.messages.last().map(|m| m.minute).unwrap_or(0),
                 can_message: true,
+                avatar: c.avatar.is_some() || store.following.iter().any(|f| f.author == c.author && f.avatar.is_some()),
             })
             .collect();
         // People I follow who published a card can be messaged too.
@@ -276,6 +279,7 @@ impl Core {
                     last: None,
                     minute: 0,
                     can_message: f.card.is_some(),
+                    avatar: f.avatar.is_some(),
                 });
             }
         }
@@ -391,6 +395,7 @@ impl Core {
                     None => dm::DeviceSync::Sent { peer: peer_key },
                 }),
                 delete: if own { None } else { delete.clone() },
+                avatar: if own { None } else { store.avatar.clone() },
             };
             let mut ratchet = st.pq.get(&peer).cloned().unwrap_or_default();
             let Some(blob) = dm::encrypt_with(&account, &mut session, &mut ratchet, &payload, to) else { continue };
@@ -433,6 +438,7 @@ impl Core {
                         messages: Vec::new(),
                         introduced: false,
                         cards: targets.clone(),
+                        avatar: None,
                     });
                     s.conversations.len() - 1
                 }
@@ -580,6 +586,7 @@ impl Core {
                 circle: None,
                 sync: Some(what.clone()),
                 delete: None,
+                avatar: None,
             };
             let mut ratchet = st.pq.get(&peer).cloned().unwrap_or_default();
             let Some(blob) = dm::encrypt_with(&account, &mut session, &mut ratchet, &payload, to) else { continue };
@@ -661,6 +668,7 @@ impl Core {
                                 messages: vec![Message { mine: true, text: payload.text.clone(), minute: payload.minute, sent: true, blob: None, expire_days: payload.expire_days, out: Vec::new() }],
                                 introduced: true,
                                 cards: Vec::new(),
+                                avatar: None,
                             });
                         }
                     }
@@ -673,7 +681,7 @@ impl Core {
                                     c.messages.push(m);
                                 }
                             }
-                            None => s.conversations.push(Conversation { author: from, name: name.chars().take(social::MAX_NAME_CHARS).collect(), card: None, messages: vec![m], introduced: false, cards: Vec::new() }),
+                            None => s.conversations.push(Conversation { author: from, name: name.chars().take(social::MAX_NAME_CHARS).collect(), card: None, messages: vec![m], introduced: false, cards: Vec::new(), avatar: None }),
                         }
                     }
                     Some(other) => s.incoming_sync.push(other),
@@ -703,6 +711,7 @@ impl Core {
                         messages: Vec::new(),
                         introduced: false,
                         cards: Vec::new(),
+                        avatar: None,
                     });
                     s.conversations.len() - 1
                 }
@@ -725,6 +734,12 @@ impl Core {
                 }
             }
             c.introduced = true; // they replied, so they have my card
+            // Their picture comes with each message (only small images are
+            // kept; a message without one doesn't erase it, since apps from
+            // before this field never send it).
+            if let Some(a) = payload.avatar.clone().filter(|m| m.validate() && m.inline() && m.kind == "image") {
+                c.avatar = Some(a);
+            }
             // Payments and grants are handled on the next sync (they need
             // the network: tokens are swapped at the mint at once).
             if !payload.credits.is_empty() || payload.purchase.is_some() {

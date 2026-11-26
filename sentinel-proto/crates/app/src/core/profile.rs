@@ -87,7 +87,7 @@ impl Core {
             name: f.and_then(|f| f.name.clone()).or_else(|| conv.map(|c| c.name.clone())).unwrap_or_else(|| handle_of(author)),
             handle: handle_of(author),
             bio: f.map(|f| f.bio.clone()).unwrap_or_default(),
-            avatar: f.is_some_and(|f| f.avatar.is_some()),
+            avatar: f.is_some_and(|f| f.avatar.is_some()) || conv.is_some_and(|c| c.avatar.is_some()),
             banner: f.is_some_and(|f| f.banner.is_some()),
             mine: false,
             following: f.is_some(),
@@ -218,14 +218,39 @@ impl Core {
     pub(super) async fn upload_profile_chunks(&self, chunks: &[String], hosts: &[String]) -> Result<()> {
         let local = self.local()?;
         let net = self.with(|i| i.net.clone()).context("not connected")?;
+        // One host that's offline mustn't hold the profile back forever
+        // (followers would never see the picture, nor a new name): the
+        // picture keeps the hosts that stored it.
+        let mut stored: Vec<String> = Vec::new();
         for host in hosts {
-            let mut s = net.connect_hedged(host).await?;
-            for name in chunks {
-                let addr: [u8; 32] = data_encoding::HEXLOWER.decode(name.as_bytes())?.try_into().map_err(|_| anyhow!("bad chunk"))?;
-                // Chunks of a replaced picture may be gone: skip them.
-                let Some(data) = local.get(&addr) else { continue };
-                super::media_app::put_chunk_pub(&mut s, data).await?;
+            let ok = async {
+                let mut s = net.connect_hedged(host).await?;
+                for name in chunks {
+                    let addr: [u8; 32] = data_encoding::HEXLOWER.decode(name.as_bytes())?.try_into().map_err(|_| anyhow!("bad chunk"))?;
+                    // Chunks of a replaced picture may be gone: skip them.
+                    let Some(data) = local.get(&addr) else { continue };
+                    super::media_app::put_chunk_pub(&mut s, data).await?;
+                }
+                anyhow::Ok(())
             }
+            .await;
+            if ok.is_ok() {
+                stored.push(host.clone());
+            }
+        }
+        let pending: Vec<[u8; 32]> = chunks.iter().filter_map(|n| <[u8; 32]>::try_from(data_encoding::HEXLOWER.decode(n.as_bytes()).unwrap_or_default()).ok()).collect();
+        let waiting = |r: &MediaRef| r.chunks.iter().any(|c| pending.contains(c));
+        if stored.is_empty() {
+            // None took it: try other hosts next time.
+            let fresh = self.media_hosts()?;
+            self.update(|s| {
+                for r in s.avatar.iter_mut().chain(s.banner.iter_mut()) {
+                    if waiting(r) {
+                        r.archives = fresh.clone();
+                    }
+                }
+            })?;
+            bail!("no host could store the profile picture");
         }
         for name in chunks {
             if let Ok(addr) = <[u8; 32]>::try_from(data_encoding::HEXLOWER.decode(name.as_bytes()).unwrap_or_default()) {
@@ -236,7 +261,14 @@ impl Core {
             }
         }
         let done: Vec<String> = chunks.to_vec();
-        self.update(|s| s.profile_chunks.retain(|c| !done.contains(c)))
+        self.update(|s| {
+            s.profile_chunks.retain(|c| !done.contains(c));
+            for r in s.avatar.iter_mut().chain(s.banner.iter_mut()) {
+                if waiting(r) {
+                    r.archives.retain(|h| stored.contains(h));
+                }
+            }
+        })
     }
 
     /// The picture reference for `author` ("me" or an author key).
@@ -250,12 +282,24 @@ impl Core {
             };
             return Ok((r.context("no picture")?, store.pillar.clone()));
         }
-        let f = store.following.iter().find(|f| f.author == author).context("unknown account")?;
-        let r = match shape {
-            Shape::Avatar => f.avatar.clone(),
-            Shape::Banner => f.banner.clone(),
+        let f = store.following.iter().find(|f| f.author == author);
+        let r = match (f, shape) {
+            (Some(f), Shape::Avatar) => f.avatar.clone(),
+            (Some(f), Shape::Banner) => f.banner.clone(),
+            (None, _) => None,
         };
-        Ok((r.context("no picture")?, Some(f.pillar.clone())))
+        if let (Some(r), Some(f)) = (r, f) {
+            return Ok((r, Some(f.pillar.clone())));
+        }
+        // Not followed (or no picture in their profile yet): the picture
+        // their messages carry, fetched from their own Pillar.
+        let c = store.conversations.iter().find(|c| c.author == author);
+        let r = match shape {
+            Shape::Avatar => c.and_then(|c| c.avatar.clone()),
+            Shape::Banner => None,
+        };
+        let pillar = c.and_then(|c| c.card.as_ref().map(|k| k.pillar.clone())).or_else(|| f.map(|f| f.pillar.clone()));
+        Ok((r.context("no picture")?, pillar))
     }
 
     /// Safety number for me and `author`: the same 60 digits on both

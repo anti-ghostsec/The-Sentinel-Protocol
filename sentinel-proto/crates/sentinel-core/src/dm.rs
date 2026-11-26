@@ -235,6 +235,10 @@ pub struct DmPayload {
     /// (`text` is then empty and nothing is shown).
     #[serde(default)]
     pub delete: Option<DeleteRequest>,
+    /// The sender's profile picture, so people who talk to them see it
+    /// without following them. (Left out when there is none.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<crate::media::MediaRef>,
 }
 
 /// Messages to delete: all of a conversation, or these ones (by
@@ -713,6 +717,7 @@ mod tests {
             circle: None,
             sync: None,
             delete: None,
+            avatar: None,
         }
     }
 
@@ -783,7 +788,7 @@ mod tests {
         assert_eq!(Some(bob_forgery), got.card_mac);
 
         // Bob replies using the card from Alice's first message.
-        let reply = DmPayload { from: [0; 32], name: "Bob".into(), text: "hey alice".into(), minute: 2, card: None, card_mac: None, reply: None, expire_days: None, credits: Vec::new(), purchase: None, grant: None, circle: None, sync: None, delete: None };
+        let reply = DmPayload { from: [0; 32], name: "Bob".into(), text: "hey alice".into(), minute: 2, card: None, card_mac: None, reply: None, expire_days: None, credits: Vec::new(), purchase: None, grant: None, circle: None, sync: None, delete: None, avatar: None };
         let blob2 = encrypt(&b_acc, &mut b_sess, &reply, &a_card_seen).unwrap();
         // Alice can't unseal with the wrong inbox secret...
         assert!(unseal(&b_inbox, &fetch_of(&b_inbox), &blob2).is_none());

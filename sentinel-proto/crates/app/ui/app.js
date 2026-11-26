@@ -1424,6 +1424,7 @@ async function loadConversations() {
       b.setAttribute("role", "listitem");
       b.disabled = !c.canMessage;
       const av = el("span", "avatar", initial(c.name));
+      if (c.avatar) setPicture(av, c.author, "avatar");
       const text = el("span", "conv-text");
       const top = el("span", "conv-top");
       top.append(el("span", "strong", c.name), el("span", "muted small mono", minuteLabel(c.minute)));
@@ -1446,6 +1447,7 @@ async function openThread(c) {
   $("dm-empty").hidden = true;
   $("dm-thread").hidden = false;
   $("thread-avatar").textContent = initial(c.name);
+  if (c.avatar) setPicture($("thread-avatar"), c.author, "avatar");
   $("thread-name").textContent = c.name;
   $("thread-handle").textContent = "@" + c.handle;
   setError("dm-error", "");
