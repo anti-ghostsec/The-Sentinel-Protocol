@@ -785,6 +785,7 @@ async fn msg_bench(pillar: &str, messages: usize, bits: u8) -> Result<()> {
             circle: None,
             sync: None,
             delete: None,
+            avatar: None,
         };
         let blob = dm::encrypt(&a_acc, &mut a_sess, &payload, &b_card).context("encrypt")?;
         seal_t.push(ms(start.elapsed()));
